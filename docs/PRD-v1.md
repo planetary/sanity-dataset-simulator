@@ -2,6 +2,7 @@
 
 **Status:** Revised feasibility specification  
 **Date:** 2026-08-03  
+**Revision:** v1.1 (2026-08-03) — errata pass: defined `OverlayMutation` (§13.7) and the checksum algorithm (§13.2); added `OVERLAY_SAME_PATH_CHANGED` to the conflict union (§13.11) and completed the severity table (§17.4); made `transactionId` server-assigned with `idempotencyKey` as the deduplication authority (§5.3, §13.10, §25.5); clarified rebase ancestor semantics (§13.3); reconciled Gate D with Spike C and aligned the §36.3 pass criteria to the same launch-critical vocabulary (§0.3, §36.3); defined launch-critical (§6); fixed D01 timing and D13 continuation (§39.3); conditioned the §38.4 branch-asset upload line on D01; extended Spike B to Gate F lifecycle, clarified the Spike A attempt budget, and fixed the Spike E and Spike F scheduling rules (§36); added the `[M-LOCAL]` minimal Studio and query slice, minimal Blob export, and exit evidence policy (§37); enumerated required property-based tests (§35.1); mandated schema-artifact injection for core validation (§10.1, §20.1); added `GROQ_EVALUATION_FAILED` to the required error codes (§25.14)  
 **Primary use case:** Branch-local Sanity schema and content editing for local development, coding agents, pull requests, and Vercel Preview Deployments  
 **Production stance:** Production and shared staging continue to use Sanity Content Lake directly  
 **Source policy:** Product claims and platform constraints are cited with source IDs such as `[S01]`; full links are in [Sources](#40-sources)
@@ -39,7 +40,7 @@ The project does not enter full implementation until all six gates pass:
 - [ ] **Gate A: Studio data-plane interception.** Run two implementation tracks in parallel: Strategy A uses `unstable_clientFactory`; Strategy B uses an HTTP API host proxy. Each track must cover document fetches, mutations, actions, raw requests, client cloning, Studio authentication flows, and all network calls needed for core editing. `unstable_clientFactory` is a hidden beta hook and has no stability guarantee, so it cannot be the only investigated path. [S08] [S35] [S42]
 - [ ] **Gate B: Listener and editor-state protocol.** The selected strategy must reproduce the observable behavior Studio requires for save indicators, form state, document panes, references, Portable Text, reconnects, and unsubscription. Spike instrumentation must capture the actual event shapes used by the pinned Studio version. Current Sanity APIs require `includeAllVersions=true` to observe drafts and release versions on API versions from 2025-02-19. [S38] [S41]
 - [ ] **Gate C: Blob concurrency.** A private Blob manifest can be read without stale cache, conditionally replaced with `ifMatch`, retried after a precondition failure, and recovered after partial writes without blindly replaying unsafe operations. [S02] [S03] [S04] [S05]
-- [ ] **Gate D: Query parity.** Every audited frontend and required Studio query returns the same result as native Sanity when no overlay is present, and the expected virtual result when overlays are present.
+- [ ] **Gate D: Query parity.** Every launch-critical frontend and required Studio query is classified Tier A or accepted Tier B (section 22.3) and returns the same result as native Sanity when no overlay is present, and the expected virtual result when overlays are present. Remaining Tier C queries stay below the section 0.6 abort threshold, and no launch-critical query is Tier C. The Spike C pass criteria (section 36.3) are the closing standard for this gate.
 - [ ] **Gate E: Safety and trust boundary.** Preview and local environments cannot mutate staging. Fork previews receive no overlay secrets. The trust model for same-repository PR code is explicitly approved.
 - [ ] **Gate F: Lifecycle.** Blob state survives preview redeployments, keys to the PR or branch rather than the deployment URL, exports to Git, reports base drift, and cleans up safely after PR closure. Vercel exposes Git and pull request metadata through system environment variables. [S06]
 
@@ -290,7 +291,7 @@ The branch must support:
 
 ### 5.3 Reliability success
 
-- [ ] Mutation requests are idempotent by transaction ID.
+- [ ] Mutation requests are idempotent by idempotency key; a retried request with the same key returns the original transaction result.
 - [ ] Conditional Blob conflicts retry safely and never overwrite a newer manifest.
 - [ ] Partial Blob writes produce only unreachable orphan objects that can be garbage collected.
 - [ ] File writes are atomic by temporary file plus rename.
@@ -349,6 +350,7 @@ Cold mutation acknowledgement includes function startup, uncached private Blob m
 | Promotion | Apply approved overlay changes to a real Sanity dataset. |
 | Candidate set | Complete set of documents required to evaluate a specific GROQ query exactly. |
 | Query registry | Version-controlled list of allowed or audited application and Studio query patterns. |
+| Launch-critical | A query, plugin, or asset workflow required for the first production-ready preview release. The launch-critical lists are produced during the Phase 0 audit and approved jointly by the product owner and technical owner, with the content operations owner co-approving the asset list (sections 37 and 39.3, D01). |
 
 ---
 
@@ -554,6 +556,7 @@ apps or project source/
 ### 10.1 Package requirements
 
 - [MUST] Core package has no Next.js or Vercel dependency.
+- [MUST] Core package consumes the branch schema as an injected, serialized schema artifact and never imports Sanity Studio code.
 - [MUST] Store adapters implement the same contract.
 - [MUST] Query package can run in Node.js without browser globals.
 - [MUST] Studio package pins compatible Sanity versions.
@@ -824,6 +827,8 @@ export interface OverlayDocumentHead {
 }
 ```
 
+All `checksum` fields in this data model (`OverlayDocumentHead.checksum`, `BaseDocumentVersion.checksum`, `OverlayTransactionRecord.resultChecksums`, and checkpoint checksums) are computed as SHA-256 over the canonical JSON serialization defined by the section 14.3 determinism rules, hex encoded. The `documentChecksumPrefix` used in synthetic revisions (section 13.9) is the first 12 hex characters of that checksum.
+
 ### 13.3 Overlay document
 
 ```ts
@@ -858,6 +863,8 @@ export interface OverlayDocumentRecord {
   updatedBy?: OverlayActor
 }
 ```
+
+The `base` block holds the current merge ancestor. It is captured at first touch and replaced only by an explicit or automatic rebase (sections 28.4 and 28.5), which updates the stored snapshots, revisions, and `lastObserved*` fields in one transaction. `firstTouchedAt` is never modified after capture.
 
 ### 13.4 Base document version
 
@@ -909,7 +916,7 @@ Examples:
 
 Numeric array indexes are allowed only when the array has no `_key` support and the entire array is treated as touched. Sanity uses targeted patches and keyed array paths to support structured mutations. [S14]
 
-### 13.7 Overlay operation
+### 13.7 Overlay operations and mutations
 
 ```ts
 export type OverlayOperation =
@@ -924,6 +931,19 @@ export type OverlayOperation =
 ```
 
 Sanity supports targeted patch operations including `set`, `setIfMissing`, `unset`, `insert`, `inc`, `dec`, and `diffMatchPatch`. [S12] [S14]
+
+Document-level mutations wrap these operations:
+
+```ts
+export type OverlayMutation =
+  | {type: 'create'; document: SanityDocument}
+  | {type: 'createIfNotExists'; document: SanityDocument}
+  | {type: 'createOrReplace'; document: SanityDocument}
+  | {type: 'delete'; id: string}
+  | {type: 'patch'; id: string; ifRevision?: string; operations: OverlayOperation[]}
+```
+
+`OverlayMutation` is the unit carried by transaction records (section 13.10), mutation requests (section 25.5), and migration files (section 20.4). The variants match the supported mutation primitives in section 25.6, with `ifRevision` expressing the revision precondition. Multi-document transactions group multiple mutations in one request and commit atomically through one manifest replacement.
 
 ### 13.8 Actor
 
@@ -980,6 +1000,10 @@ export interface OverlayTransactionRecord {
 }
 ```
 
+`idempotencyKey` is the deduplication authority: one idempotency key maps to one immutable transaction result (section 34, invariant 6). A retried request carrying the same key returns the original result, including its `transactionId`, without reapplying mutations. `transactionId` names the committed transaction record and orders the transaction log; it is never used for deduplication.
+
+- [MUST] The server generates `transactionId`. It must be unique within the overlay and lexicographically ordered by commit time (for example a ULID), so that `transactions/<transaction-id>.json` (section 15.1) is a collision-free immutable path and the transaction log orders correctly. A client-supplied transaction ID is advisory correlation metadata only and must never be used as a storage key.
+
 ### 13.11 Conflict record
 
 ```ts
@@ -989,6 +1013,7 @@ export interface OverlayConflict {
   severity: 'soft' | 'hard'
   type:
     | 'SAME_PATH_CHANGED'
+    | 'OVERLAY_SAME_PATH_CHANGED'
     | 'PARENT_SHAPE_CHANGED'
     | 'BASE_DOCUMENT_DELETED'
     | 'BASE_DRAFT_DELETED'
@@ -1397,6 +1422,13 @@ For each local touched path:
 | Reference target deleted | Soft for weak, hard for strong | Show missing target or local target | Block strong reference publish |
 | Schema validation warning | Soft | Allow configured behavior | Review |
 | Schema validation error | Hard | Allow draft editing with errors visible | Block branch publish and promotion |
+| Base draft deleted upstream while a local draft exists (`BASE_DRAFT_DELETED`) | Soft | Local draft wins; fallback follows section 18.2 | Requires acknowledgement or resolution |
+| Base `_type` changed on a touched document (`BASE_TYPE_CHANGED`) | Hard | Use recovery output with error banner or block document | Block |
+| Duplicate `_key` introduced by concurrent inserts (`ARRAY_KEY_COLLISION`) | Hard | Reject the colliding local insert or block the affected item | Block |
+| Schema migration cannot be applied (`UNSUPPORTED_SCHEMA_MIGRATION`) | Hard | Allow draft editing with errors visible | Block branch publish and promotion |
+| Same path changed by both overlay heads (`OVERLAY_SAME_PATH_CHANGED`) | Soft | Local head wins after the client is returned the current head, requested intent, and conflict path (section 17.11) | Requires acknowledgement or resolution |
+
+Every `OverlayConflict['type']` value in section 13.11 maps to a row above. `OVERLAY_SAME_PATH_CHANGED` is an overlay-vs-overlay race first surfaced to the writing client at commit time (section 17.11); it is persisted on the document only when it remains unresolved after the structured conflict response, and a persisted instance is recorded with `severity: 'soft'` and counted in `conflictSummary.soft` (section 13.1).
 
 ### 17.5 Unset behavior
 
@@ -1651,6 +1683,7 @@ Sanity Content Lake is schemaless and Studio validation is client-side. Differen
 ### 20.1 Schema source
 
 - [MUST] Branch schema code is the only schema source in local and preview Studio.
+- [MUST] Extract a serialized schema artifact from branch schema code so server-side and core validation (sections 9.1 and 17.3) run without importing Studio.
 - [MUST] Store schema commit SHA in the overlay manifest.
 - [MUST] Invalidate validation results when schema commit changes.
 - [MUST] Keep schema deployment separate from content promotion.
@@ -2506,7 +2539,7 @@ All endpoints are server-only application routes. Endpoint paths may be namespac
 
 - [MUST] Authenticate every Blob-mode request.
 - [MUST] Derive overlay ID on the server.
-- [MUST] Do not trust client-supplied project, dataset, branch, or PR identity.
+- [MUST] Do not trust client-supplied project, dataset, branch, PR, or transaction identity.
 - [MUST] Require CSRF protection for state-changing browser requests.
 - [MUST] Support request IDs.
 - [MUST] Support idempotency keys on mutations and actions.
@@ -2566,7 +2599,7 @@ Request:
 
 ```ts
 interface OverlayMutationRequest {
-  transactionId: string
+  clientTransactionId?: string
   idempotencyKey: string
   expectedOverlayRevision?: number
   expectedDocumentRevisions?: Record<string, string>
@@ -2723,6 +2756,7 @@ INVALID_GROQ
 QUERY_NOT_REGISTERED
 QUERY_CHANGED
 UNSUPPORTED_GROQ
+GROQ_EVALUATION_FAILED
 CANDIDATE_LIMIT_EXCEEDED
 REFERENCE_DEPTH_EXCEEDED
 OVERLAY_WRITE_CONFLICT
@@ -3667,6 +3701,19 @@ The following invariants must be checked in code and tests:
 | Upgrade compatibility | Validate pinned and candidate Sanity versions | Yes |
 | Performance | Validate stated preview budgets | Yes |
 
+Required property-based test properties. The property-based layer must cover at least the following, generated over arbitrary valid documents, paths, and operation sequences:
+
+- [ ] Canonical serialization is a fixpoint: `serialize(parse(serialize(x)))` equals `serialize(x)` for arbitrary documents and key orders.
+- [ ] Document ID and `OverlayPath` encoding round-trips, including `_key` segments, dots, and `drafts.` prefixes.
+- [ ] Merge identity: with no touched paths and current base equal to ancestor, resolution returns the current base unchanged.
+- [ ] Untouched inheritance: base changes on paths disjoint from touched paths always appear in the resolved output (section 34, invariant 12).
+- [ ] Touched precedence: local values on touched paths survive arbitrary base changes, and a conflict is recorded when the base changed the same path (invariant 13).
+- [ ] Unset suppression: an unset path never inherits any later base value until the unset is removed (invariant 11).
+- [ ] Keyed array merge: resolved arrays contain no duplicate `_key`, and independent insertions from both sides are all present.
+- [ ] Idempotent replay: applying a transaction twice under one idempotency key produces the state and result of one application (invariant 6).
+- [ ] Rebase idempotence: automatic rebase against the same current base is idempotent.
+- [ ] Checksum integrity: stored checksums match recomputed checksums after any generated sequence of valid operations (invariant 4).
+
 ### 35.2 Core merge unit tests
 
 - [ ] Untouched scalar inherits current base.
@@ -3989,12 +4036,12 @@ No monetary estimate is required. Track agent implementation attempts, automated
 
 | Spike | Default implementation bound | Required evidence |
 |---|---|---|
-| A: Studio interception and listener | Two focused agent attempts per strategy, then one targeted repair pass | E2E video or trace, network log, client method inventory, event-shape inventory, test report |
-| B: Blob transaction | One implementation pass and one failure-injection repair pass | Store contract report, ETag conflict trace, orphan recovery trace |
+| A: Studio interception and listener | Two focused agent attempts per strategy, then at most one targeted repair pass. The repair pass is not a third attempt: per section 0.6 it must target one observed failure without broadening scope; further work requires an architecture review | E2E video or trace, network log, client method inventory, event-shape inventory, test report |
+| B: Blob transaction | One implementation pass and one failure-injection repair pass | Store contract report, ETag conflict trace, orphan recovery trace, lifecycle and export trace |
 | C: GROQ corpus | One inventory pass, one planner pass, one parity repair pass | Query registry, parity report, candidate counts, Tier C list |
 | D: Schema compatibility | One fixture pass and one migration repair pass | Compatibility matrix and validation report |
-| E: Assets | Run only when branch uploads are launch-critical | Upload, preview, checkpoint, and promotion trace |
-| F: Safety boundary | One attack pass after topology is selected | Secret scan, network trace, fork test, native-write test |
+| E: Assets | Run only when D01, decided during the Phase 0 audit before spike scheduling completes, classifies branch uploads as launch-critical | Upload, preview, checkpoint, and promotion trace |
+| F: Safety boundary | One attack pass after a provisional topology is selected (section 36.6 ordering rule) | Secret scan, network trace, fork test, native-write test |
 
 Cross-spike stop rules are in section 0.6.
 
@@ -4032,6 +4079,7 @@ Cross-spike stop rules are in section 0.6.
 - [ ] Test two panes and two tabs.
 - [ ] Verify no Sanity mutation request occurs.
 - [ ] Inventory all methods, endpoints, event fields, and auth calls used.
+- [ ] If D09 requires Presentation click-to-edit for launch, extend instrumentation to Presentation Tool preview loading and overlay edit-intent routing (section 23.4); otherwise record iframe-only preview as the validated scope.
 
 Pass criteria:
 
@@ -4069,6 +4117,10 @@ Tasks:
 - [ ] Run orphan cleanup.
 - [ ] Verify state across Vercel redeployment.
 - [ ] Verify separate PR isolation.
+- [ ] Verify overlay identity keys to PR or branch metadata, never the deployment URL.
+- [ ] Export overlay state to canonical `.sanity-overlay/` files and verify a minimal round-trip import.
+- [ ] Detect and report base drift for an idle overlay.
+- [ ] Run the closed-overlay retention and cleanup path.
 
 Pass criteria:
 
@@ -4077,6 +4129,7 @@ Pass criteria:
 - Retry reruns conflict detection and preserves idempotency.
 - Partial writes do not expose partial logical state.
 - Same PR resolves the same overlay after redeployment.
+- Gate F lifecycle behaviors are demonstrated: PR-keyed identity, export to canonical files, base drift reporting, and safe cleanup after closure.
 
 ### 36.3 Spike C: GROQ query corpus
 
@@ -4096,9 +4149,10 @@ Tasks:
 
 Pass criteria:
 
-- All critical page and Studio queries are Tier A or accepted Tier B.
-- Tier C count stays below the section 0.6 threshold.
-- No critical page depends on silent approximation.
+- Every launch-critical frontend and required Studio query is Tier A or accepted Tier B (section 22.3).
+- No launch-critical query is Tier C.
+- Remaining Tier C queries stay below the section 0.6 abort threshold.
+- No launch-critical query depends on silent approximation.
 - Preview latency stays within budget on representative data.
 
 ### 36.4 Spike D: schema branch compatibility
@@ -4149,6 +4203,8 @@ Pass criteria:
 
 **Goal:** Prove overlay mode cannot write staging or expose credentials outside the approved trust class.
 
+Ordering rule: Gate E and this spike are not circular. Select the provisional trust topology first (the D14 default: trusted-repository with no fork secrets), run the attack pass against it, and close Gate E on that evidence. If the spike fails, switch topology or disable writable preview editing for the failing trust class per section 0.6, then rerun the attack pass before Gate E closes.
+
 Tasks:
 
 - [ ] Remove write token from preview environment.
@@ -4198,7 +4254,7 @@ Pass criteria:
 - [ ] Complete Spike B.
 - [ ] Complete Spike C.
 - [ ] Complete Spike D.
-- [ ] Complete Spike E if branch uploads are launch-critical.
+- [ ] Complete Spike E if D01 classifies branch uploads as launch-critical (D01 is decided during the audit, before spike scheduling completes).
 - [ ] Complete Spike F.
 
 #### Decisions
@@ -4206,11 +4262,12 @@ Pass criteria:
 - [ ] Approve client interception strategy from parallel Strategy A and B evidence.
 - [ ] Approve listener compatibility contract.
 - [ ] Approve preview trust mode and fork policy.
-- [ ] Approve V1 query registry.
+- [ ] Approve the V1 query registry contents from Spike C: the audited query list, tier classification, and candidate plans. Registry implementation and enforcement (codemod, lint rule, CI checks) remain Phase 5 work (section 22.5).
+- [ ] Approve the launch-critical query, plugin, and asset lists (PO and TO jointly; the asset list also requires CMS per D01, section 6).
 - [ ] Approve Blob physical layout.
 - [ ] Approve auth model.
 - [ ] Approve launch feature degradation list.
-- [ ] Decide whether branch assets are launch-critical or Phase 4.
+- [ ] Decide whether branch assets are launch-critical or deferred to Phase 7 (D01).
 
 ### Phase 1: core domain and memory adapter
 
@@ -4316,6 +4373,14 @@ Pass criteria:
 - [ ] File parse error UI.
 - [ ] Reset actions.
 
+#### Minimal Studio and query slice `[M-LOCAL]`
+
+The section 1.3 default milestone map places core Studio editing (section 21) and ID and slug queries (section 22) at `[M-LOCAL]`, and section 38.1 accepts against them. Phase 2 therefore pulls these minimal slices forward. Per section 1.4 they do not mark Phase 4 or Phase 5 requirements complete.
+
+- [ ] Core Studio editing through the Gate A strategy: scalar, object, keyed array, Portable Text, slug, and reference fields; create, edit, publish, unpublish, discard, delete, and duplicate actions. The full parity and compatibility matrix remains Phase 4.
+- [ ] Reduced query registry containing the ID and slug lookup entries with parity fixtures. The full registry, codemod, and lint enforcement remain Phase 5.
+- [ ] ID and slug candidate planners evaluated through pinned `groq-js`. The remaining planners remain Phase 5.
+
 #### Phase 2 acceptance
 
 - [ ] Local agent modifies schema and content.
@@ -4340,6 +4405,7 @@ Pass criteria:
 - [ ] Retry and reapply logic.
 - [ ] Orphan revision cleanup.
 - [ ] Retention metadata.
+- [ ] Minimal checkpoint export: dump current Blob overlay state to canonical `.sanity-overlay/` files through the CLI, satisfying section 38.2. The full checkpoint workflow, confirmation, and import remain Phase 6.
 
 #### Identity
 
@@ -4588,6 +4654,10 @@ Pass criteria:
 - [ ] Versioned package release.
 - [ ] Sanity upgrade compatibility process.
 
+### Exit evidence policy
+
+Phases 2 through 5 close against their own acceptance checklists above. Phases 6 through 8 close against the section 38.3 and 38.4 release checklists; the section 39.5 definition of done is evidence for the production-ready preview release (section 38.3). Phase 9 closes against its own task list plus the section 5.4 performance targets and the section 5.5 quality targets.
+
 ---
 
 ## 38. Acceptance criteria by release
@@ -4634,7 +4704,7 @@ Pass criteria:
 - [ ] Promotion plan is deterministic.
 - [ ] Current staging revision conflicts are detected.
 - [ ] Target schema validation passes.
-- [ ] Branch assets upload to Sanity.
+- [ ] Branch assets upload to Sanity (waived when D01 defers branch asset uploads; existing Sanity assets need no upload).
 - [ ] Operations apply in safe order.
 - [ ] Apply is permission-gated.
 - [ ] Final target is verified.
@@ -4694,7 +4764,7 @@ Owner codes:
 
 | ID | Decision | Owner | Deadline or gate | Default when unanswered |
 |---|---|---|---|---|
-| D01 | Are branch asset uploads required for initial launch? | PO, CMS | Phase 0 exit | Existing Sanity assets only; branch uploads deferred |
+| D01 | Are branch asset uploads required for initial launch? | PO, CMS | Phase 0 audit, before spike scheduling completes | Existing Sanity assets only; branch uploads deferred |
 | D02 | Can reviewers checkpoint directly from Studio? | PO | Before Phase 6 | Agent and CLI checkpoint only |
 | D03 | Which identity provider controls preview edit versus read-only access? | SEC | Gate E | Vercel Authentication plus application role mapping |
 | D04 | Are soft conflicts allowed at branch publish without acknowledgement? | PO, TO | Before Phase 4 | Require acknowledgement |
@@ -4706,7 +4776,7 @@ Owner codes:
 | D10 | Which target dataset receives first promotion support? | PO, CMS | Before Phase 8 | Staging only |
 | D11 | Must promotion support deletes in the first release? | PO, CMS | Before Phase 8 | Defer deletes or require manual approval workflow |
 | D12 | Should base webhook invalidation ship at launch? | TO | Before Phase 3 | Scheduled drift scan only |
-| D13 | Which Studio interception strategy is selected? | TO | Gate A | No default; project stops if neither passes |
+| D13 | Which Studio interception strategy is selected? | TO | Gate A | No default. If neither passes, PO and TO jointly issue a written pivot decision per section 0.6, choosing the custom document tool (section 0.5) or a hosted alternative |
 | D14 | Which preview trust topology is selected? | SEC | Gate E | Trusted-repository with no fork secrets |
 | D15 | What timestamp policy applies to each `_updatedAt` or `_createdAt` query? | TO, CMS | Spike C | Unsupported until registered explicitly |
 
