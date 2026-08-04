@@ -10,7 +10,12 @@ const OUT = join(dirname(fileURLToPath(import.meta.url)), 'dataset.ndjson')
 const BIG = process.argv.includes('--big')
 
 const docs = []
-const ts = (n) => `2026-01-${String((n % 28) + 1).padStart(2, '0')}T12:00:00Z`
+// Strictly monotonic in n (no modulo wrap): n=1..28 -> Jan, 29..56 -> Feb, ...
+const ts = (n) => {
+  const month = Math.floor((n - 1) / 28) + 1
+  const day = ((n - 1) % 28) + 1
+  return `2026-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T12:00:00Z`
+}
 const rev = (id) => `fixture-rev-${id}`
 const base = (id, type, n) => ({_id: id, _type: type, _createdAt: ts(n), _updatedAt: ts(n), _rev: rev(id)})
 

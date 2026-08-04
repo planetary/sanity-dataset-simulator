@@ -9,6 +9,48 @@
 
 **Primary PRD sections:** [§0](../PRD-v1.md) (gates, alternatives, stop criteria), [§36](../PRD-v1.md) (spikes), [§37 Phase 0](../PRD-v1.md) (task breakdown), [§39](../PRD-v1.md) (risks and open decisions).
 
+## 0. Progress
+
+**2026-08-03 — phase started; harness scaffolding complete** (build order per [testing-strategy §4](testing-strategy.md)):
+
+- [x] Workspace scaffold: pnpm monorepo, exact version pins (decision PRE-2).
+- [x] Kitchen-sink schema at `examples/kitchen-sink/` — the audit/spike target for this greenfield repo (decision PRE-1).
+- [x] Deterministic fixture dataset: `packages/sanity-overlay-testkit/fixtures/` (41 docs; generator with `--big` flag).
+- [x] Testkit skeleton + offline groq-js parity tests (`packages/sanity-overlay-testkit/`) — not yet executed: dependency installs are permission-blocked in the agent environment.
+- [x] Evidence scaffolding seeded: [decisions.md](evidence/phase-1/decisions.md) (PRE-1..3 recorded), [gate-review.md](evidence/phase-1/gate-review.md).
+
+**2026-08-03 (later) — hosted loop live:**
+
+- [x] Dependencies installed; offline suite green (11 tests). Harness caught and fixed a fixture-generator date-monotonicity bug.
+- [x] Sanity test project `b1n03q3z` created (org Valdis Barrett); datasets `parity` (seeded, 41 docs) + `scratch`; viewer token in gitignored `.env`.
+- [x] Hosted empty-overlay parity green: 9 cases, published + drafts perspectives, pinned `groq-js` 2.0.0 vs Content Lake API `v2025-02-19` — first Gate D groundwork ([gate-review.md](evidence/phase-1/gate-review.md)).
+
+**2026-08-03 (later still) — sequencing decision + audit complete:**
+
+- [x] **Sequencing (PRE-5, user decision):** local track first; Spike B, Spike F deployment clauses, and all Vercel/`[M-PREVIEW]` work deferred to the end. Gates C and F stay open meanwhile — no dependent phase may be recorded complete until they close (§0.3, §1.4, §5.2 overlap allowance).
+- [x] §2 audit workstream answered against the kitchen-sink target: [audit/repository-audit.md](evidence/phase-1/audit/repository-audit.md). Greenfield caveat recorded — re-audit required for any real adopting codebase.
+
+**2026-08-03 (evening) — Spike C complete:**
+
+- [x] **Spike C PASS** for the greenfield corpus ([report](evidence/phase-1/spike-c-groq-corpus/report.md)): 18-query registry (16 Tier A / 1 Tier B / 1 unsupported), prototype ids/slug/types/top-K planners, 102 planner-vs-oracle parity checks across 6 overlay fixtures (filter, sort/slice, branch-create, tombstone, ref-target), 13 hosted empty-overlay cases, structured `UNSUPPORTED_GROQ` proven, mutation check confirms the suite detects candidate-incompleteness. 135/135 tests green. Open: representative-scale latency criterion + one human validation (§0.6).
+
+**2026-08-03 (late) — Spike D complete:**
+
+- [x] **Spike D PASS** ([report](evidence/phase-1/spike-d-schema-compatibility/report.md)): schema artifact extracted via `sanity schema extract --enforce-required-fields` (validating the v1.1 §10.1/§20.1 injection mandate with the real toolchain), scanner prototype produces §20.3 findings, all eight §36.4 changes behave per the §20.2 matrix, rename migration is explicit (§20.4 + §13.7 shapes) with a byte-identical no-base-data-loss proof. 145/145 tests green.
+
+**Local order of work:** Spike A (Studio interception, both tracks) → gates A/B/D review → Phase 2 core domain under the §5.2 allowance. Vercel track (Spike B, Spike F, Phase 4) last.
+
+**2026-08-04 — Spike A Track A proven viable:**
+
+- [x] `unstable_clientFactory` confirmed working in sanity 6.8.0 — every Studio client intercepted, including `withConfig` chains. Boot → login → open → scalar edit → publish, all through the instrumented facade; save state settles.
+- [x] **Design rule discovered (targeted repair):** facade wrappers must be identity-stable — naive per-access Proxy wrappers put Studio into an infinite resubscribe loop (~40k calls, black screen). Fixed with memoized wrappers.
+- [x] Actions API is the primary write path (`/data/actions`, `document.commit`); `mutate` never called in the core loop. Listener observed live with `includeAllVersions=true&visibility=transaction`. Full endpoint + method inventory in [spike-a report](evidence/phase-1/spike-a-studio-interception/report.md).
+- [x] Dataset re-seeded after the observation run; 145/145 tests green.
+
+**Blocked on:** D01/D09 decisions (defaults assumed meanwhile: assets deferred, iframe-only preview).
+
+**Remaining in Spike A:** Track B proxy, listener event-shape capture, PT/array/reference field matrix, remaining document actions, auth-failure flows, write-blocking facade. **Not started:** Spikes B/E/F, §4 decisions besides PRE-1..5.
+
 ---
 
 ## 1. Purpose and exit condition
@@ -52,6 +94,8 @@ Gate letters (§0.3) and spike letters (§36) **do not correspond one-to-one**. 
 ---
 
 ## 2. Workstream 1 — Repository and platform audit
+
+> **Status: complete for the kitchen-sink target (2026-08-03)** — findings in [audit/repository-audit.md](evidence/phase-1/audit/repository-audit.md), greenfield caveat included. Checkboxes below are left as the normative PRD list; the evidence doc answers each.
 
 Every checkbox below is reproduced from the PRD §37 Phase 0 "Audit" block. Grouping is **plan-level guidance**; the items and their wording are normative.
 

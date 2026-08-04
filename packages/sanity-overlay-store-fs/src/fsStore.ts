@@ -1,0 +1,1865 @@
+/**
+ * `FsOverlayStore` — the filesystem overlay store adapter (PRD §14, §37 Phase 2
+ * "Filesystem store tasks").
+ *
+ * ## Durability model
+ *
+ * Two rules give the store crash safety without a lock file or a journal.
+ *
+ * 1. **Every write is temp-file + rename** (§14.3 MUST). A reader therefore never
+ *    observes a partially written file; it sees either the old bytes or the new
+ *    ones.
+ * 2. **The manifest is the commit point.** Immutable, content-addressed artifacts
+ *    (base snapshots, document revisions, transaction records) are written first
+ *    and are unreachable until a manifest head names them; the manifest rename
+ *    publishes the whole set at once. Derived projections (`intent.json`,
+ *    `.runtime/materialized/`) are written last because they are regenerable.
+ *
+ *    A crash therefore lands in one of three states, none of them corrupt:
+ *    before the manifest write → unreachable artifacts only, reclaimed by
+ *    {@link FsOverlayStore.collectOrphans} (§15.3, §34.8); after the manifest
+ *    write but before the projections → stale `intent.json`, rebuilt by
+ *    {@link FsOverlayStore.revalidate}; after everything → committed.
+ *
+ * ## Direct edits
+ *
+ * §14.3 requires the store to tolerate an agent or a Git merge rewriting
+ * `intent.json` underneath it: refuse malformed JSON, retain the last valid
+ * in-memory state, write a `.broken` diagnostic copy, revalidate before serving,
+ * and treat a stale checksum on a semantically valid file as repairable metadata.
+ * {@link FsOverlayStore.revalidate} and {@link FsOverlayStore.repairChecksums}
+ * implement the §14.4 workflow; a live `fs.watch` is a thin trigger on top and is
+ * deliberately not part of the store, so the behaviour stays testable.
+ *
+ * ## Determinism
+ *
+ * Every file is written through core's canonical serializer (sorted keys, two
+ * space indent, trailing newline) so a Git diff shows semantic change only
+ * (§14.3, §34.17), and the clock is injected (`now`) so no wall-clock read hides
+ * inside the store.
+ */
+import {randomUUID} from 'node:crypto'
+import {mkdir, open, readFile, readdir, rename, rm, stat, writeFile} from 'node:fs/promises'
+import {dirname, join} from 'node:path'
+import {
+  OVERLAY_FORMAT_VERSION,
+  assertFormatVersion,
+  checksum as canonicalChecksum,
+  canonicalize,
+  encodeOverlayPath,
+  isChecksum,
+  overlayIdFromIdentityInput,
+  parse,
+  serialize,
+  toPublishedId,
+} from '../../sanity-overlay-core/src/index'
+import type {
+  OverlayActor,
+  OverlayDocumentHead,
+  OverlayDocumentRecord,
+  OverlayManifest,
+  OverlayStatus,
+  OverlayTransactionRecord,
+  SanityDocument,
+} from '../../sanity-overlay-core/src/index'
+import {
+  DELETABLE_STATUSES,
+  WRITABLE_STATUSES,
+  defaultRetentionDays,
+  documentHeadFromRecord,
+} from './contract'
+import type {
+  CollectOrphansOptions,
+  CreateOverlayInput,
+  DeleteOverlayOptions,
+  DeleteOverlayResult,
+  ExportCanonicalOptions,
+  ImportCanonicalOptions,
+  ImportCanonicalResult,
+  ListChangedDocumentsOptions,
+  MarkClosedOptions,
+  OverlayCanonicalBundle,
+  OverlayCanonicalBundleDocument,
+  OverlayChecksumIssue,
+  OverlayChecksumReport,
+  OverlayClock,
+  OverlayCommitRequest,
+  OverlayCommitResult,
+  OverlayDirectEditStore,
+  OverlayDocumentReadResult,
+  OverlayDocumentWriteResult,
+  OverlayOrphanRef,
+  OverlayOrphanReport,
+  OverlayPromotionInput,
+  OverlayResetResult,
+  OverlayResettableStore,
+  OverlayRetentionPolicy,
+  OverlayRevalidationFailure,
+  OverlayRevalidationReport,
+  OverlayStore,
+  OverlayTransactionSelector,
+  PutDocumentRevisionOptions,
+  RepairChecksumsResult,
+  ResetOverlayOptions,
+  RevalidateOptions,
+  WriteManifestOptions,
+} from './contract'
+import {
+  OverlayAlreadyExistsError,
+  OverlayChecksumMismatchError,
+  OverlayClosedError,
+  OverlayDocumentRevisionConflictError,
+  OverlayIdentityMismatchError,
+  OverlayInvalidRequestError,
+  OverlayNotFoundError,
+  OverlayRetentionActiveError,
+  OverlayStoreCorruptError,
+  OverlayWriteConflictError,
+} from './errors'
+import {
+  baseSnapshotFrom,
+  intentChecksum,
+  intentFromRecord,
+  type CheckpointDocumentIntent,
+  type OverlayBaseSnapshot,
+  type OverlayIntentState,
+} from './intent'
+import {
+  BROKEN_SUFFIX,
+  GITATTRIBUTES_CONTENT,
+  GITATTRIBUTES_FILE,
+  GITIGNORE_CONTENT,
+  GITIGNORE_FILE,
+  OverlayLayout,
+  README_CONTENT,
+  README_FILE,
+  TEMP_PREFIX,
+  documentKey,
+} from './layout'
+
+/* ------------------------------------------------------------------ *
+ * Options
+ * ------------------------------------------------------------------ */
+
+export interface FsOverlayStoreHooks {
+  /**
+   * Called after the temporary file holds the complete new bytes and before it is
+   * renamed over the target. Exists so the §35.9 "Atomic temporary write and
+   * rename" case can observe the window directly; production code leaves it unset.
+   */
+  beforeRename?(info: {tempPath: string; targetPath: string}): void | Promise<void>
+}
+
+export interface FsOverlayStoreOptions {
+  /**
+   * Absolute path of the directory that *contains* `.sanity-overlay/` — normally
+   * the repository root (PRD §14.1).
+   */
+  root: string
+  /** Injected clock returning an ISO-8601 timestamp. Required: the store never reads a wall clock. */
+  now: OverlayClock
+  /**
+   * Transaction ID factory. Must be unique within the overlay and lexicographically
+   * ordered by commit time (PRD §13.10 MUST). The default derives one from the
+   * injected clock plus a per-store sequence, so it is deterministic.
+   */
+  newTransactionId?: (context: {overlayId: string; timestamp: string; sequence: number}) => string
+  hooks?: FsOverlayStoreHooks
+}
+
+/** Generated artifact written to `.runtime/materialized/<key>.json` (PRD §14.2, §14.4 step 6). */
+export interface MaterializedDocumentFile {
+  formatVersion: typeof OVERLAY_FORMAT_VERSION
+  logicalId: string
+  schemaType: string
+  runtimeRevision: string
+  generatedAt: string
+  draft: SanityDocument | null
+  published: SanityDocument | null
+}
+
+interface ImmutableWrite {
+  logicalId: string
+  record: OverlayDocumentRecord
+  storageRef: string
+  checksum: string
+  snapshotRef?: string
+  head: OverlayDocumentHead
+}
+
+interface SoftRead<T> {
+  ok: boolean
+  value?: T
+  raw?: string
+  error?: {code: string; message: string}
+  missing: boolean
+}
+
+/* ------------------------------------------------------------------ *
+ * Store
+ * ------------------------------------------------------------------ */
+
+export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, OverlayResettableStore {
+  readonly layout: OverlayLayout
+
+  readonly #now: OverlayClock
+  readonly #hooks: FsOverlayStoreHooks
+  readonly #newTransactionId: NonNullable<FsOverlayStoreOptions['newTransactionId']>
+
+  /** Last valid parse of each canonical file, retained across malformed edits (§14.3). */
+  #lastValidManifest: OverlayManifest | null = null
+  #lastValidManifestBytes: string | null = null
+  readonly #lastValidIntents = new Map<string, {intent: CheckpointDocumentIntent; bytes: string}>()
+  /** Unresolved conflict counts per logical ID, for `manifest.conflictSummary` (§13.1). */
+  readonly #conflictCounts = new Map<string, {hard: number; soft: number}>()
+  /** `<path>\0<sha256>` of content already copied to `.broken`, so a poll loop writes it once. */
+  readonly #diagnosed = new Set<string>()
+  #sequence = 0
+
+  constructor(options: FsOverlayStoreOptions) {
+    if (typeof options?.now !== 'function') {
+      throw new OverlayInvalidRequestError('FsOverlayStore requires an injected `now` clock')
+    }
+    this.layout = new OverlayLayout(options.root)
+    this.#now = options.now
+    this.#hooks = options.hooks ?? {}
+    this.#newTransactionId = options.newTransactionId ?? defaultTransactionId
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Create overlay"
+   * ---------------------------------------------------------------- */
+
+  async createOverlay(input: CreateOverlayInput): Promise<OverlayManifest> {
+    const existing = await this.#readManifestFile()
+    if (!existing.missing) {
+      const stored = existing.value
+      if (input.ifNotExists && stored) {
+        this.#cacheManifest(stored, existing.raw ?? null)
+        return clone(stored)
+      }
+      throw new OverlayAlreadyExistsError(stored?.overlayId ?? '<unreadable>', {
+        root: this.layout.root,
+      })
+    }
+
+    const overlayId =
+      input.overlayId ??
+      (input.identity === undefined ? undefined : overlayIdFromIdentityInput(input.identity))
+    if (typeof overlayId !== 'string' || overlayId.length === 0) {
+      throw new OverlayInvalidRequestError(
+        'createOverlay requires `overlayId` or `identity` to derive one (PRD §12.1)',
+      )
+    }
+
+    const timestamp = this.#now()
+    const manifest: OverlayManifest = {
+      formatVersion: OVERLAY_FORMAT_VERSION,
+      overlayId,
+      status: input.status ?? 'active',
+      base: {...input.base},
+      source: {...input.source},
+      revision: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      documentHeads: {},
+      conflictSummary: {total: 0, hard: 0, soft: 0},
+    }
+    if (input.actor !== undefined) {
+      manifest.createdBy = input.actor
+      manifest.updatedBy = input.actor
+    }
+    if (input.expiresAt !== undefined) manifest.expiresAt = input.expiresAt
+
+    await this.#scaffold()
+    await this.#writeManifest(manifest)
+    return clone(manifest)
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Read empty overlay"
+   * ---------------------------------------------------------------- */
+
+  async readManifest(overlayId: string): Promise<OverlayManifest> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+    return clone(manifest)
+  }
+
+  /** Read the manifest without an identity assertion — useful for `inspect` tooling (§14.5). */
+  async inspect(): Promise<OverlayManifest> {
+    return clone(await this.#loadManifest())
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Conditional manifest write" / "Concurrent stale write rejection"
+   * ---------------------------------------------------------------- */
+
+  async writeManifestConditional(
+    overlayId: string,
+    next: OverlayManifest,
+    expectedRevision: number,
+    options: WriteManifestOptions = {},
+  ): Promise<OverlayManifest> {
+    const current = await this.#loadManifest()
+    this.#assertIdentity(overlayId, current)
+
+    if (current.revision !== expectedRevision) {
+      throw new OverlayWriteConflictError(overlayId, expectedRevision, current.revision)
+    }
+    if (next.overlayId !== current.overlayId) {
+      throw new OverlayIdentityMismatchError(next.overlayId, current.overlayId)
+    }
+    if (next.revision !== expectedRevision + 1) {
+      throw new OverlayInvalidRequestError(
+        `A conditional manifest write is the overlay's revision increment (PRD §34.5): expected revision ${
+          expectedRevision + 1
+        }, received ${next.revision}`,
+        {expectedRevision, receivedRevision: next.revision},
+      )
+    }
+
+    const written: OverlayManifest = {...clone(next), updatedAt: this.#now()}
+    if (options.actor !== undefined) written.updatedBy = options.actor
+    await this.#writeManifest(written)
+    return clone(written)
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Store and read document revision"
+   * ---------------------------------------------------------------- */
+
+  async putDocumentRevision(
+    overlayId: string,
+    record: OverlayDocumentRecord,
+    options: PutDocumentRevisionOptions = {},
+  ): Promise<OverlayDocumentWriteResult> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+    this.#assertWritable(manifest)
+
+    if (
+      options.expectedOverlayRevision !== undefined &&
+      manifest.revision !== options.expectedOverlayRevision
+    ) {
+      throw new OverlayWriteConflictError(
+        overlayId,
+        options.expectedOverlayRevision,
+        manifest.revision,
+      )
+    }
+
+    const logicalId = toPublishedId(record.logicalId)
+    if (options.expectedDocumentRevision !== undefined) {
+      const actual = manifest.documentHeads[logicalId]?.runtimeRevision ?? null
+      if (actual !== options.expectedDocumentRevision) {
+        throw new OverlayDocumentRevisionConflictError(
+          logicalId,
+          options.expectedDocumentRevision,
+          actual,
+        )
+      }
+    }
+
+    const write = await this.#writeImmutable(overlayId, record)
+
+    const next = clone(manifest)
+    next.revision = manifest.revision + 1
+    next.updatedAt = this.#now()
+    next.documentHeads = {...manifest.documentHeads, [logicalId]: write.head}
+    if (options.actor !== undefined) next.updatedBy = options.actor
+    await this.#applyConflictSummary(next, [write.record])
+    await this.#writeManifest(next)
+
+    await this.#writeProjections(write)
+
+    const result: OverlayDocumentWriteResult = {
+      head: clone(write.head),
+      manifest: clone(next),
+      storageRef: write.storageRef,
+      checksum: write.checksum,
+    }
+    if (write.snapshotRef !== undefined) result.snapshotRef = write.snapshotRef
+    return result
+  }
+
+  async getDocumentRevision(
+    overlayId: string,
+    storageRef: string,
+  ): Promise<OverlayDocumentRecord | null> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+    return this.#readRecordByRef(storageRef)
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Commit multi-document transaction" / "Idempotent transaction replay"
+   * ---------------------------------------------------------------- */
+
+  async commitTransaction(
+    overlayId: string,
+    request: OverlayCommitRequest,
+  ): Promise<OverlayCommitResult> {
+    if (typeof request?.idempotencyKey !== 'string' || request.idempotencyKey.length === 0) {
+      throw new OverlayInvalidRequestError(
+        'commitTransaction requires a non-empty idempotencyKey (PRD §13.10, §34.6)',
+      )
+    }
+    if (!Array.isArray(request.records)) {
+      throw new OverlayInvalidRequestError('commitTransaction requires a `records` array')
+    }
+    if (request.actor === undefined) {
+      throw new OverlayInvalidRequestError('commitTransaction requires an actor (PRD §13.10)')
+    }
+
+    /* §34.6 — one idempotency key maps to one immutable transaction result. */
+    const replayed = await this.getTransaction(overlayId, {
+      idempotencyKey: request.idempotencyKey,
+    })
+    if (replayed !== null) {
+      const manifest = await this.#loadManifest()
+      return {
+        transaction: replayed,
+        manifest: clone(manifest),
+        heads: replayed.affectedDocumentIds
+          .map((id) => manifest.documentHeads[toPublishedId(id)])
+          .filter((head): head is OverlayDocumentHead => head !== undefined)
+          .map(clone),
+        replayed: true,
+      }
+    }
+
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+    this.#assertWritable(manifest)
+
+    if (
+      request.expectedOverlayRevision !== undefined &&
+      manifest.revision !== request.expectedOverlayRevision
+    ) {
+      throw new OverlayWriteConflictError(
+        overlayId,
+        request.expectedOverlayRevision,
+        manifest.revision,
+      )
+    }
+    for (const [documentId, expected] of Object.entries(request.expectedDocumentRevisions ?? {})) {
+      const actual = manifest.documentHeads[toPublishedId(documentId)]?.runtimeRevision ?? null
+      if (actual !== expected) {
+        throw new OverlayDocumentRevisionConflictError(toPublishedId(documentId), expected, actual)
+      }
+    }
+
+    const removed = (request.removedDocumentIds ?? []).map(toPublishedId)
+
+    /* Step 1 — immutable artifacts. Unreachable until the manifest names them. */
+    const writes: ImmutableWrite[] = []
+    for (const record of request.records) {
+      writes.push(await this.#writeImmutable(overlayId, record))
+    }
+
+    /* Step 2 — the immutable transaction record (PRD §13.10). */
+    const revisionBefore = manifest.revision
+    const revisionAfter = revisionBefore + 1
+    const committedAt = this.#now()
+    const transactionId = await this.#allocateTransactionId(overlayId, committedAt)
+
+    const affected = [...new Set([...writes.map((write) => write.logicalId), ...removed])].sort()
+    const resultChecksums: Record<string, string> = {}
+    for (const write of writes) resultChecksums[write.logicalId] = write.checksum
+
+    const transaction: OverlayTransactionRecord = {
+      formatVersion: OVERLAY_FORMAT_VERSION,
+      transactionId,
+      overlayId,
+      overlayRevisionBefore: revisionBefore,
+      overlayRevisionAfter: revisionAfter,
+      actor: request.actor,
+      requestedAt: request.requestedAt ?? committedAt,
+      committedAt,
+      mutations: request.mutations ?? [],
+      affectedDocumentIds: affected,
+      resultChecksums,
+      idempotencyKey: request.idempotencyKey,
+    }
+    if (request.requestId !== undefined) transaction.requestId = request.requestId
+    await this.#writeJson(this.layout.transactionPath(transactionId), transaction)
+
+    /* Step 3 — the commit point. One atomic rename publishes every artifact. */
+    const next = clone(manifest)
+    next.revision = revisionAfter
+    next.updatedAt = committedAt
+    next.updatedBy = request.actor
+    next.transactionHead = transactionId
+    const heads = {...manifest.documentHeads}
+    for (const write of writes) heads[write.logicalId] = write.head
+    for (const id of removed) delete heads[id]
+    next.documentHeads = heads
+    for (const id of removed) this.#conflictCounts.delete(id)
+    await this.#applyConflictSummary(
+      next,
+      writes.map((write) => write.record),
+    )
+    await this.#writeManifest(next)
+
+    /* Step 4 — the idempotency pointer. Written after the commit so it can never
+     * name an uncommitted transaction; the crash window between the two costs at
+     * most one replayed apply of byte-identical content-addressed artifacts. */
+    await this.#writeJson(this.layout.idempotencyPath(request.idempotencyKey), {
+      formatVersion: OVERLAY_FORMAT_VERSION,
+      idempotencyKey: request.idempotencyKey,
+      transactionId,
+      committedAt,
+    })
+
+    /* Step 5 — regenerable projections. */
+    for (const write of writes) await this.#writeProjections(write)
+    for (const id of removed) await this.#removeDocumentArtifacts(id)
+
+    return {
+      transaction: clone(transaction),
+      manifest: clone(next),
+      heads: writes.map((write) => clone(write.head)),
+      replayed: false,
+    }
+  }
+
+  async getTransaction(
+    overlayId: string,
+    selector: OverlayTransactionSelector,
+  ): Promise<OverlayTransactionRecord | null> {
+    let transactionId: string
+    if ('transactionId' in selector) {
+      transactionId = selector.transactionId
+    } else {
+      const pointer = await this.#readJsonSoft<{transactionId?: unknown}>(
+        this.layout.idempotencyPath(selector.idempotencyKey),
+      )
+      if (pointer.missing || typeof pointer.value?.transactionId !== 'string') return null
+      transactionId = pointer.value.transactionId
+    }
+
+    const path = this.layout.transactionPath(transactionId)
+    const read = await this.#readJsonSoft<OverlayTransactionRecord>(path)
+    if (read.missing) return null
+    if (!read.ok || read.value === undefined) {
+      throw new OverlayStoreCorruptError(
+        this.layout.relative(path),
+        read.error?.message ?? 'unreadable transaction record',
+      )
+    }
+    assertFormatVersion(read.value.formatVersion)
+    if (read.value.overlayId !== overlayId) {
+      throw new OverlayIdentityMismatchError(overlayId, read.value.overlayId)
+    }
+    return read.value
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "List changed documents" / "Read by logical ID"
+   * ---------------------------------------------------------------- */
+
+  async listChangedDocuments(
+    overlayId: string,
+    options: ListChangedDocumentsOptions = {},
+  ): Promise<OverlayDocumentHead[]> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+    const heads = Object.values(manifest.documentHeads).filter((head) => {
+      if (options.states !== undefined) return options.states.includes(head.state)
+      return options.includeUnchanged === true || head.state !== 'unchanged'
+    })
+    return heads
+      .sort((a, b) => (a.logicalId < b.logicalId ? -1 : a.logicalId > b.logicalId ? 1 : 0))
+      .map(clone)
+  }
+
+  async readDocumentByLogicalId(
+    overlayId: string,
+    logicalId: string,
+  ): Promise<OverlayDocumentReadResult | null> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const normalized = toPublishedId(logicalId)
+    const head = manifest.documentHeads[normalized]
+    if (head === undefined) return null
+
+    const record = await this.#readRecordByRef(head.storageRef)
+    const intent = await this.#loadIntent(normalized)
+    const snapshotRef = intent?.base.snapshotRef
+    const baseSnapshot =
+      snapshotRef === undefined ? null : await this.#readSnapshot(snapshotRef)
+
+    return {
+      head: clone(head),
+      record,
+      intent: intent === null ? null : clone(intent),
+      baseSnapshot,
+      storageRef: head.storageRef,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Export canonical state" / "Import canonical state"
+   * ---------------------------------------------------------------- */
+
+  async exportCanonical(
+    overlayId: string,
+    options: ExportCanonicalOptions = {},
+  ): Promise<OverlayCanonicalBundle> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const documents: OverlayCanonicalBundleDocument[] = []
+    const snapshots: Record<string, OverlayBaseSnapshot> = {}
+
+    for (const logicalId of Object.keys(manifest.documentHeads).sort()) {
+      const head = manifest.documentHeads[logicalId]!
+      const intent = await this.#loadIntent(logicalId)
+      if (intent === null) {
+        throw new OverlayStoreCorruptError(
+          this.layout.relative(this.layout.intentPath(logicalId)),
+          'manifest head has no readable intent file (PRD §34.3)',
+        )
+      }
+      documents.push({
+        intent: clone(intent),
+        record: await this.#readRecordByRef(head.storageRef),
+        storageRef: head.storageRef,
+      })
+      const ref = intent.base.snapshotRef
+      if (ref !== undefined && snapshots[ref] === undefined) {
+        const snapshot = await this.#readSnapshot(ref)
+        if (snapshot === null) {
+          throw new OverlayStoreCorruptError(
+            this.layout.relative(this.layout.snapshotPath(ref)),
+            'intent references a base snapshot that is not stored',
+          )
+        }
+        snapshots[ref] = snapshot
+      }
+    }
+
+    const transactions =
+      options.includeTransactions === false ? [] : await this.#readAllTransactions()
+
+    const bundle: OverlayCanonicalBundle = {
+      formatVersion: OVERLAY_FORMAT_VERSION,
+      overlayId,
+      exportedAt: this.#now(),
+      manifest: clone(manifest),
+      documents,
+      snapshots,
+      transactions,
+      checksum: '',
+    }
+    bundle.checksum = bundleChecksum(bundle)
+    return bundle
+  }
+
+  async importCanonical(
+    bundle: OverlayCanonicalBundle,
+    options: ImportCanonicalOptions = {},
+  ): Promise<ImportCanonicalResult> {
+    assertFormatVersion(bundle?.formatVersion)
+    if (options.verifyChecksum !== false) {
+      const actual = bundleChecksum(bundle)
+      if (actual !== bundle.checksum) {
+        throw new OverlayChecksumMismatchError(
+          `bundle:${bundle.overlayId}`,
+          bundle.checksum,
+          actual,
+          {repairable: false},
+        )
+      }
+    }
+
+    const existing = await this.#readManifestFile()
+    if (!existing.missing) {
+      if (options.overwrite !== true) {
+        throw new OverlayAlreadyExistsError(existing.value?.overlayId ?? '<unreadable>', {
+          hint: 'pass {overwrite: true} to replace the stored overlay (PRD §29.7)',
+        })
+      }
+      await rm(this.layout.root, {recursive: true, force: true})
+      this.#resetCaches()
+    }
+
+    await this.#scaffold()
+
+    for (const [ref, snapshot] of Object.entries(bundle.snapshots)) {
+      await this.#writeJson(this.layout.snapshotPath(ref), snapshot)
+    }
+
+    for (const document of bundle.documents) {
+      const logicalId = toPublishedId(document.intent.logicalId)
+      await this.#writeJson(this.layout.intentPath(logicalId), document.intent)
+      if (document.record !== null) {
+        const recordChecksum = canonicalChecksum(document.record)
+        await this.#writeJson(this.layout.revisionPath(logicalId, recordChecksum), document.record)
+        await this.#writeMaterialized(document.record)
+      }
+    }
+
+    for (const transaction of bundle.transactions) {
+      await this.#writeJson(this.layout.transactionPath(transaction.transactionId), transaction)
+      await this.#writeJson(this.layout.idempotencyPath(transaction.idempotencyKey), {
+        formatVersion: OVERLAY_FORMAT_VERSION,
+        idempotencyKey: transaction.idempotencyKey,
+        transactionId: transaction.transactionId,
+        committedAt: transaction.committedAt,
+      })
+    }
+
+    await this.#writeManifest(clone(bundle.manifest))
+
+    return {
+      manifest: clone(bundle.manifest),
+      importedDocuments: bundle.documents.length,
+      importedSnapshots: Object.keys(bundle.snapshots).length,
+      importedTransactions: bundle.transactions.length,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 lifecycle: "Mark closed" / "Mark promoted" / "Retention metadata" /
+   * "Delete overlay"
+   * ---------------------------------------------------------------- */
+
+  async markClosed(overlayId: string, options: MarkClosedOptions = {}): Promise<OverlayManifest> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const next = clone(manifest)
+    next.status = 'closed'
+    next.revision = manifest.revision + 1
+    next.updatedAt = this.#now()
+    if (options.actor !== undefined) next.updatedBy = options.actor
+
+    const retention =
+      options.retention ?? ({ttlDays: defaultRetentionDays(next) ?? undefined} as OverlayRetentionPolicy)
+    this.#applyRetention(next, retention)
+
+    await this.#writeManifest(next)
+    return clone(next)
+  }
+
+  async markPromoted(
+    overlayId: string,
+    promotion: OverlayPromotionInput,
+  ): Promise<OverlayManifest> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    /* PRD §12.3: the only edge into `promoted` is from `closed`. */
+    if (manifest.status !== 'closed' && manifest.status !== 'promoted') {
+      throw new OverlayInvalidRequestError(
+        `Overlay ${JSON.stringify(overlayId)} must be closed before promotion, current status is ${manifest.status} (PRD §12.3)`,
+        {overlayId, status: manifest.status},
+      )
+    }
+
+    const next = clone(manifest)
+    next.status = 'promoted'
+    next.revision = manifest.revision + 1
+    next.updatedAt = this.#now()
+    if (promotion.actor !== undefined) next.updatedBy = promotion.actor
+
+    const block: NonNullable<OverlayManifest['promotion']> = {}
+    if (promotion.planId !== undefined) block.planId = promotion.planId
+    if (promotion.targetDataset !== undefined) block.targetDataset = promotion.targetDataset
+    block.promotedAt = promotion.promotedAt ?? next.updatedAt
+    if (promotion.resultingTransactionId !== undefined) {
+      block.resultingTransactionId = promotion.resultingTransactionId
+    }
+    next.promotion = block
+
+    this.#applyRetention(
+      next,
+      promotion.retention ??
+        ({ttlDays: defaultRetentionDays(next) ?? undefined} as OverlayRetentionPolicy),
+    )
+
+    await this.#writeManifest(next)
+    return clone(next)
+  }
+
+  async setRetention(
+    overlayId: string,
+    retention: OverlayRetentionPolicy,
+  ): Promise<OverlayManifest> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const next = clone(manifest)
+    next.revision = manifest.revision + 1
+    next.updatedAt = this.#now()
+    this.#applyRetention(next, retention)
+
+    await this.#writeManifest(next)
+    return clone(next)
+  }
+
+  async deleteOverlay(
+    overlayId: string,
+    options: DeleteOverlayOptions = {},
+  ): Promise<DeleteOverlayResult> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    if (options.force !== true) {
+      /* PRD §15.7 "Mark overlay closed before deletion". */
+      if (!DELETABLE_STATUSES.includes(manifest.status)) {
+        throw new OverlayRetentionActiveError(
+          overlayId,
+          `overlay must be closed, promoted or expired before deletion, current status is ${manifest.status}`,
+          {status: manifest.status},
+        )
+      }
+      /* PRD §15.7 "Never delete an overlay with an active promotion". */
+      if (manifest.promotion !== undefined && manifest.promotion.promotedAt === undefined) {
+        throw new OverlayRetentionActiveError(overlayId, 'a promotion is in flight', {
+          promotion: manifest.promotion,
+        })
+      }
+    }
+
+    const removedRefs = (await readdirSafe(this.layout.root))
+      .map((entry) => entry.name)
+      .sort()
+    await rm(this.layout.root, {recursive: true, force: true})
+    this.#resetCaches()
+
+    return {overlayId, deleted: true, removedRefs}
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Orphan revision cleanup"
+   * ---------------------------------------------------------------- */
+
+  async collectOrphans(
+    overlayId: string,
+    options: CollectOrphansOptions = {},
+  ): Promise<OverlayOrphanReport> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const heads = Object.values(manifest.documentHeads)
+    const reachableRevisions = new Set(heads.map((head) => head.storageRef))
+    const reachableKeys = new Set(heads.map((head) => documentKey(head.logicalId)))
+    const reachableSnapshots = new Set<string>()
+    for (const head of heads) {
+      const intent = await this.#loadIntent(head.logicalId)
+      if (intent?.base.snapshotRef !== undefined) reachableSnapshots.add(intent.base.snapshotRef)
+    }
+
+    const orphans: OverlayOrphanRef[] = []
+    let scanned = 0
+
+    /* Immutable document revisions — the §34.8 "orphan revision" case proper. */
+    for (const dir of await readdirSafe(this.layout.revisionsDir)) {
+      if (!dir.isDirectory()) continue
+      const revisionDir = join(this.layout.revisionsDir, dir.name)
+      for (const file of await readdirSafe(revisionDir)) {
+        if (!file.isFile() || !file.name.endsWith('.json')) continue
+        scanned += 1
+        const ref = this.layout.relative(join(revisionDir, file.name))
+        if (reachableRevisions.has(ref)) continue
+        orphans.push({
+          kind: 'revision',
+          ref,
+          reason: 'no manifest head references this revision',
+        })
+      }
+    }
+
+    if (options.includeSnapshots !== false) {
+      for (const file of await readdirSafe(this.layout.snapshotsDir)) {
+        if (!file.isFile() || !file.name.endsWith('.json')) continue
+        scanned += 1
+        const ref = file.name.slice(0, -'.json'.length)
+        if (reachableSnapshots.has(ref)) continue
+        orphans.push({
+          kind: 'snapshot',
+          ref: this.layout.relative(this.layout.snapshotPath(ref)),
+          reason: 'no intent references this base snapshot',
+        })
+      }
+    }
+
+    if (options.includeDocuments !== false) {
+      for (const dir of await readdirSafe(this.layout.documentsDir)) {
+        if (!dir.isDirectory()) continue
+        scanned += 1
+        if (reachableKeys.has(dir.name)) continue
+        orphans.push({
+          kind: 'document',
+          ref: this.layout.relative(join(this.layout.documentsDir, dir.name)),
+          reason: 'no manifest head references this document directory',
+        })
+      }
+      for (const file of await readdirSafe(this.layout.materializedDir)) {
+        if (!file.isFile() || !file.name.endsWith('.json')) continue
+        scanned += 1
+        if (reachableKeys.has(file.name.slice(0, -'.json'.length))) continue
+        orphans.push({
+          kind: 'materialized',
+          ref: this.layout.relative(join(this.layout.materializedDir, file.name)),
+          reason: 'no manifest head references this materialized document',
+        })
+      }
+    }
+
+    const deleted: OverlayOrphanRef[] = []
+    const failures: Array<{ref: string; reason: string}> = []
+    if (options.dryRun !== true) {
+      for (const orphan of orphans) {
+        try {
+          await rm(this.layout.resolve(orphan.ref), {recursive: true, force: true})
+          deleted.push(orphan)
+        } catch (error) {
+          failures.push({ref: orphan.ref, reason: (error as Error).message})
+        }
+      }
+    }
+
+    return {
+      overlayId,
+      dryRun: options.dryRun === true,
+      scanned,
+      orphans,
+      deleted,
+      failures,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Checksum corruption detection"
+   * ---------------------------------------------------------------- */
+
+  async verifyChecksums(overlayId: string): Promise<OverlayChecksumReport> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const issues: OverlayChecksumIssue[] = []
+    const missing: OverlayOrphanRef[] = []
+    let checked = 0
+
+    for (const logicalId of Object.keys(manifest.documentHeads).sort()) {
+      const head = manifest.documentHeads[logicalId]!
+
+      /* Content-addressed revision: filename and head checksum must both match. */
+      const revisionPath = this.layout.resolve(head.storageRef)
+      const revision = await this.#readJsonSoft<OverlayDocumentRecord>(revisionPath)
+      let revisionPresent = false
+      if (!revision.missing) {
+        revisionPresent = true
+        checked += 1
+        if (!revision.ok || revision.value === undefined) {
+          issues.push({
+            kind: 'revision',
+            ref: head.storageRef,
+            logicalId,
+            expected: head.checksum,
+            actual: '<unparseable>',
+            repairable: false,
+          })
+        } else {
+          const actual = canonicalChecksum(revision.value)
+          if (actual !== head.checksum) {
+            issues.push({
+              kind: 'revision',
+              ref: head.storageRef,
+              logicalId,
+              expected: head.checksum,
+              actual,
+              repairable: false,
+            })
+          }
+        }
+      }
+
+      /* Review-facing intent: a stale checksum here is repairable metadata (§14.3). */
+      const intentPath = this.layout.intentPath(logicalId)
+      const intentRead = await this.#readJsonSoft<CheckpointDocumentIntent>(intentPath)
+      if (!intentRead.missing) {
+        checked += 1
+        if (!intentRead.ok || intentRead.value === undefined) {
+          issues.push({
+            kind: 'intent',
+            ref: this.layout.relative(intentPath),
+            logicalId,
+            expected: head.checksum,
+            actual: '<unparseable>',
+            repairable: false,
+          })
+        } else {
+          const actual = intentChecksum(intentRead.value)
+          if (actual !== intentRead.value.checksum) {
+            issues.push({
+              kind: 'intent',
+              ref: this.layout.relative(intentPath),
+              logicalId,
+              expected: intentRead.value.checksum,
+              actual,
+              repairable: true,
+            })
+          }
+        }
+      } else if (!revisionPresent) {
+        /* §34.3 — a head must reach an immutable revision *or* a valid canonical
+         * filesystem record. Both are gone. */
+        missing.push({
+          kind: 'manifest-head',
+          ref: head.storageRef,
+          logicalId,
+          reason: 'neither the immutable revision nor the canonical intent file exists',
+        })
+      }
+    }
+
+    /* Content-addressed base snapshots: the filename is the identity. */
+    for (const file of await readdirSafe(this.layout.snapshotsDir)) {
+      if (!file.isFile() || !file.name.endsWith('.json')) continue
+      checked += 1
+      const ref = file.name.slice(0, -'.json'.length)
+      const path = join(this.layout.snapshotsDir, file.name)
+      const read = await this.#readJsonSoft<OverlayBaseSnapshot>(path)
+      if (!read.ok || read.value === undefined) {
+        issues.push({
+          kind: 'snapshot',
+          ref,
+          expected: ref,
+          actual: '<unparseable>',
+          repairable: false,
+        })
+        continue
+      }
+      const actual = canonicalChecksum(read.value)
+      if (actual !== ref) {
+        issues.push({kind: 'snapshot', ref, expected: ref, actual, repairable: false})
+      }
+    }
+
+    return {
+      overlayId,
+      ok: issues.length === 0 && missing.length === 0,
+      checked,
+      issues,
+      missing,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Direct edits — PRD §14.3, §14.4, §35.9
+   * ---------------------------------------------------------------- */
+
+  async revalidate(
+    overlayId: string,
+    options: RevalidateOptions = {},
+  ): Promise<OverlayRevalidationReport> {
+    const invalid: OverlayRevalidationFailure[] = []
+    const changed: string[] = []
+    const repairedChecksums: string[] = []
+
+    /* Step 2-3 for the manifest itself. */
+    const manifestRead = await this.#readManifestFile()
+    let manifestChanged = false
+    if (manifestRead.missing) {
+      throw new OverlayNotFoundError(`Overlay ${JSON.stringify(overlayId)}`, {
+        root: this.layout.root,
+      })
+    }
+    if (!manifestRead.ok || manifestRead.value === undefined) {
+      const brokenCopyRef = await this.#writeBrokenCopy(
+        this.layout.manifestPath,
+        manifestRead.raw ?? '',
+      )
+      const failure: OverlayRevalidationFailure = {
+        kind: 'manifest',
+        ref: this.layout.relative(this.layout.manifestPath),
+        code: manifestRead.error?.code ?? 'OVERLAY_STORE_CORRUPT',
+        message: manifestRead.error?.message ?? 'manifest is not valid JSON',
+      }
+      if (brokenCopyRef !== null) failure.brokenCopyRef = brokenCopyRef
+      invalid.push(failure)
+    } else {
+      manifestChanged = manifestRead.raw !== this.#lastValidManifestBytes
+      this.#cacheManifest(manifestRead.value, manifestRead.raw ?? null)
+    }
+
+    const manifest = this.#lastValidManifest
+    if (manifest === null) {
+      return {
+        overlayId,
+        ok: false,
+        checked: 0,
+        changed,
+        repairedChecksums,
+        invalid,
+        manifestChanged,
+      }
+    }
+    this.#assertIdentity(overlayId, manifest)
+
+    const logicalIds =
+      options.logicalIds !== undefined
+        ? [...options.logicalIds].map(toPublishedId)
+        : Object.keys(manifest.documentHeads).sort()
+
+    let checked = 0
+    for (const logicalId of logicalIds) {
+      const path = this.layout.intentPath(logicalId)
+      const read = await this.#readJsonSoft<CheckpointDocumentIntent>(path)
+      if (read.missing) {
+        invalid.push({
+          kind: 'intent',
+          ref: this.layout.relative(path),
+          logicalId,
+          code: 'OVERLAY_NOT_FOUND',
+          message: 'manifest head has no intent file (PRD §34.3)',
+        })
+        continue
+      }
+      checked += 1
+
+      if (!read.ok || read.value === undefined) {
+        /* §14.3 — refuse, retain the last valid in-memory state, write `.broken`. */
+        const brokenCopyRef = await this.#writeBrokenCopy(path, read.raw ?? '')
+        const failure: OverlayRevalidationFailure = {
+          kind: 'intent',
+          ref: this.layout.relative(path),
+          logicalId,
+          code: read.error?.code ?? 'OVERLAY_STORE_CORRUPT',
+          message: read.error?.message ?? 'intent.json is not valid JSON',
+        }
+        if (brokenCopyRef !== null) failure.brokenCopyRef = brokenCopyRef
+        invalid.push(failure)
+        continue
+      }
+
+      /* Step 3-4 — structural validation, including the snapshot reference. */
+      const problem = await this.#validateIntent(read.value, logicalId)
+      if (problem !== null) {
+        invalid.push({
+          kind: 'intent',
+          ref: this.layout.relative(path),
+          logicalId,
+          code: 'OVERLAY_STORE_CORRUPT',
+          message: problem,
+        })
+        continue
+      }
+
+      if (read.raw !== this.#lastValidIntents.get(logicalId)?.bytes) changed.push(logicalId)
+
+      /* Step 7 — recompute checksums (§14.3 MUST; stale is repairable, not fatal). */
+      let intent = read.value
+      const recomputed = intentChecksum(intent)
+      if (recomputed !== intent.checksum && options.repairChecksums !== false) {
+        intent = {...intent, checksum: recomputed}
+        await this.#writeJson(path, intent)
+        repairedChecksums.push(this.layout.relative(path))
+      }
+      this.#lastValidIntents.set(logicalId, {intent, bytes: serialize(intent)})
+      this.#conflictCounts.set(logicalId, countConflicts(intent))
+    }
+
+    return {
+      overlayId,
+      ok: invalid.length === 0,
+      checked,
+      changed,
+      repairedChecksums,
+      invalid,
+      manifestChanged,
+    }
+  }
+
+  async repairChecksums(overlayId: string): Promise<RepairChecksumsResult> {
+    const report = await this.verifyChecksums(overlayId)
+    const repaired: string[] = []
+    const unrepairable: OverlayChecksumIssue[] = []
+
+    for (const issue of report.issues) {
+      if (!issue.repairable || issue.kind !== 'intent' || issue.logicalId === undefined) {
+        unrepairable.push(issue)
+        continue
+      }
+      const path = this.layout.intentPath(issue.logicalId)
+      const read = await this.#readJsonSoft<CheckpointDocumentIntent>(path)
+      if (!read.ok || read.value === undefined) {
+        unrepairable.push(issue)
+        continue
+      }
+      const problem = await this.#validateIntent(read.value, issue.logicalId)
+      if (problem !== null) {
+        /* §14.3 only makes a *semantically valid* file's checksum repairable. */
+        unrepairable.push(issue)
+        continue
+      }
+      const intent = {...read.value, checksum: intentChecksum(read.value)}
+      await this.#writeJson(path, intent)
+      this.#lastValidIntents.set(issue.logicalId, {intent, bytes: serialize(intent)})
+      repaired.push(this.layout.relative(path))
+    }
+
+    return {overlayId, repaired, unrepairable}
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Reset — PRD §29.8, §14.5 `sanity-overlay reset [documentId]`
+   * ---------------------------------------------------------------- */
+
+  async resetDocument(
+    overlayId: string,
+    logicalId: string,
+    options: {actor?: OverlayActor} = {},
+  ): Promise<OverlayResetResult> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+    this.#assertWritable(manifest)
+
+    const normalized = toPublishedId(logicalId)
+    if (manifest.documentHeads[normalized] === undefined) {
+      throw new OverlayNotFoundError(`Document ${JSON.stringify(normalized)}`, {overlayId})
+    }
+
+    const next = clone(manifest)
+    next.revision = manifest.revision + 1
+    next.updatedAt = this.#now()
+    if (options.actor !== undefined) next.updatedBy = options.actor
+    const heads = {...manifest.documentHeads}
+    delete heads[normalized]
+    next.documentHeads = heads
+    this.#conflictCounts.delete(normalized)
+    this.#lastValidIntents.delete(normalized)
+    await this.#applyConflictSummary(next, [])
+    await this.#writeManifest(next)
+
+    const removedRefs = await this.#removeDocumentArtifacts(normalized)
+    return {manifest: clone(next), removedDocumentIds: [normalized], removedRefs}
+  }
+
+  async resetOverlay(
+    overlayId: string,
+    options: ResetOverlayOptions,
+  ): Promise<OverlayResetResult> {
+    if (options?.confirm !== true) {
+      throw new OverlayInvalidRequestError(
+        'resetOverlay requires {confirm: true} (PRD §29.8 "Reset all documents after confirmation")',
+      )
+    }
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+    this.#assertWritable(manifest)
+
+    const removedDocumentIds = Object.keys(manifest.documentHeads).sort()
+
+    const next = clone(manifest)
+    next.revision = manifest.revision + 1
+    next.updatedAt = this.#now()
+    if (options.actor !== undefined) next.updatedBy = options.actor
+    next.documentHeads = {}
+    next.conflictSummary = {total: 0, hard: 0, soft: 0}
+    await this.#writeManifest(next)
+
+    /* The transaction log and idempotency index survive: §34.6 keeps one key
+     * bound to one immutable result even across a reset. */
+    const removedRefs: string[] = []
+    for (const dir of [
+      this.layout.documentsDir,
+      this.layout.snapshotsDir,
+      this.layout.materializedDir,
+      this.layout.revisionsDir,
+    ]) {
+      removedRefs.push(this.layout.relative(dir))
+      await rm(dir, {recursive: true, force: true})
+      await mkdir(dir, {recursive: true})
+    }
+    this.#conflictCounts.clear()
+    this.#lastValidIntents.clear()
+
+    return {manifest: clone(next), removedDocumentIds, removedRefs}
+  }
+
+  /* ================================================================ *
+   * Internals
+   * ================================================================ */
+
+  #assertIdentity(requested: string, manifest: OverlayManifest): void {
+    if (manifest.overlayId !== requested) {
+      throw new OverlayIdentityMismatchError(requested, manifest.overlayId)
+    }
+  }
+
+  #assertWritable(manifest: OverlayManifest): void {
+    if (!WRITABLE_STATUSES.includes(manifest.status as OverlayStatus)) {
+      throw new OverlayClosedError(manifest.overlayId, manifest.status)
+    }
+  }
+
+  #resetCaches(): void {
+    this.#lastValidManifest = null
+    this.#lastValidManifestBytes = null
+    this.#lastValidIntents.clear()
+    this.#conflictCounts.clear()
+    this.#diagnosed.clear()
+  }
+
+  #cacheManifest(manifest: OverlayManifest, bytes: string | null): void {
+    this.#lastValidManifest = manifest
+    this.#lastValidManifestBytes = bytes
+  }
+
+  async #scaffold(): Promise<void> {
+    for (const dir of [
+      this.layout.root,
+      this.layout.documentsDir,
+      this.layout.snapshotsDir,
+      this.layout.runtimeDir,
+      this.layout.materializedDir,
+      this.layout.transactionsDir,
+      this.layout.revisionsDir,
+      this.layout.indexesDir,
+    ]) {
+      await mkdir(dir, {recursive: true})
+    }
+    await this.#writeIfAbsent(this.layout.resolve(GITATTRIBUTES_FILE), GITATTRIBUTES_CONTENT)
+    await this.#writeIfAbsent(this.layout.resolve(GITIGNORE_FILE), GITIGNORE_CONTENT)
+    await this.#writeIfAbsent(this.layout.resolve(README_FILE), README_CONTENT)
+  }
+
+  async #writeIfAbsent(path: string, contents: string): Promise<void> {
+    if (await exists(path)) return
+    await this.#writeText(path, contents)
+  }
+
+  /**
+   * The one write primitive: temp file, fsync, rename (PRD §14.3 MUST).
+   *
+   * The temporary name is random so two processes writing the same target cannot
+   * clobber each other's staging file; the rename itself is the atomic step. On
+   * any failure the temporary file is removed, so a failed write leaves neither a
+   * partial target nor litter.
+   */
+  async #writeText(targetPath: string, contents: string): Promise<void> {
+    const dir = dirname(targetPath)
+    await mkdir(dir, {recursive: true})
+    const tempPath = join(dir, `${TEMP_PREFIX}${randomUUID()}`)
+    try {
+      const handle = await open(tempPath, 'wx', 0o644)
+      try {
+        await handle.writeFile(contents, 'utf8')
+        try {
+          await handle.sync()
+        } catch {
+          /* Some filesystems reject fsync on a regular file; the rename still
+           * gives atomicity, only the durability guarantee weakens. */
+        }
+      } finally {
+        await handle.close()
+      }
+      if (this.#hooks.beforeRename !== undefined) {
+        await this.#hooks.beforeRename({tempPath, targetPath})
+      }
+      await rename(tempPath, targetPath)
+    } catch (error) {
+      await rm(tempPath, {force: true}).catch(() => undefined)
+      throw error
+    }
+  }
+
+  /** Canonical JSON write (PRD §14.3 determinism rules) through the atomic primitive. */
+  async #writeJson(targetPath: string, value: unknown): Promise<string> {
+    const text = serialize(value)
+    await this.#writeText(targetPath, text)
+    return text
+  }
+
+  async #writeManifest(manifest: OverlayManifest): Promise<void> {
+    const text = serialize(manifest)
+    await this.#writeText(this.layout.manifestPath, text)
+    this.#cacheManifest(clone(manifest), text)
+  }
+
+  async #readManifestFile(): Promise<SoftRead<OverlayManifest>> {
+    const read = await this.#readJsonSoft<OverlayManifest>(this.layout.manifestPath)
+    if (read.missing || !read.ok || read.value === undefined) return read
+    const problem = validateManifestShape(read.value)
+    if (problem !== null) {
+      return {
+        ok: false,
+        missing: false,
+        raw: read.raw,
+        error: {code: 'OVERLAY_STORE_CORRUPT', message: problem},
+      }
+    }
+    return read
+  }
+
+  /**
+   * Load the manifest, honouring §14.3 "Refuse malformed JSON and retain the last
+   * valid in-memory state": a malformed file never becomes current state, and the
+   * last valid parse keeps serving reads while the diagnostic copy is written.
+   */
+  async #loadManifest(): Promise<OverlayManifest> {
+    const read = await this.#readManifestFile()
+    if (read.missing) {
+      this.#resetCaches()
+      throw new OverlayNotFoundError('Overlay manifest', {path: this.layout.manifestPath})
+    }
+    if (!read.ok || read.value === undefined) {
+      await this.#writeBrokenCopy(this.layout.manifestPath, read.raw ?? '')
+      if (this.#lastValidManifest !== null) return this.#lastValidManifest
+      throw new OverlayStoreCorruptError(
+        this.layout.relative(this.layout.manifestPath),
+        read.error?.message ?? 'manifest is not valid JSON',
+      )
+    }
+    this.#cacheManifest(read.value, read.raw ?? null)
+    return read.value
+  }
+
+  /** Same last-valid-state rule for the review-facing intent files. */
+  async #loadIntent(logicalId: string): Promise<CheckpointDocumentIntent | null> {
+    const normalized = toPublishedId(logicalId)
+    const path = this.layout.intentPath(normalized)
+    const read = await this.#readJsonSoft<CheckpointDocumentIntent>(path)
+    if (read.missing) return this.#lastValidIntents.get(normalized)?.intent ?? null
+    if (!read.ok || read.value === undefined) {
+      await this.#writeBrokenCopy(path, read.raw ?? '')
+      return this.#lastValidIntents.get(normalized)?.intent ?? null
+    }
+    assertFormatVersion(read.value.formatVersion)
+    this.#lastValidIntents.set(normalized, {intent: read.value, bytes: read.raw ?? ''})
+    this.#conflictCounts.set(normalized, countConflicts(read.value))
+    return read.value
+  }
+
+  async #readSnapshot(ref: string): Promise<OverlayBaseSnapshot | null> {
+    const path = this.layout.snapshotPath(ref)
+    const read = await this.#readJsonSoft<OverlayBaseSnapshot>(path)
+    if (read.missing) return null
+    if (!read.ok || read.value === undefined) {
+      throw new OverlayStoreCorruptError(
+        this.layout.relative(path),
+        read.error?.message ?? 'snapshot is not valid JSON',
+      )
+    }
+    return read.value
+  }
+
+  async #readRecordByRef(storageRef: string): Promise<OverlayDocumentRecord | null> {
+    if (typeof storageRef !== 'string' || storageRef.length === 0) {
+      throw new OverlayInvalidRequestError('storageRef must be a non-empty string', {storageRef})
+    }
+    /* `resolve` asserts containment: a `..` in a storage ref never opens a file
+     * outside the overlay root (PRD §35.9). */
+    const path = this.layout.resolve(storageRef)
+    const read = await this.#readJsonSoft<OverlayDocumentRecord>(path)
+    if (read.missing) return null
+    if (!read.ok || read.value === undefined) {
+      throw new OverlayStoreCorruptError(
+        this.layout.relative(path),
+        read.error?.message ?? 'document revision is not valid JSON',
+      )
+    }
+    assertFormatVersion(read.value.formatVersion)
+    return read.value
+  }
+
+  async #readJsonSoft<T>(path: string): Promise<SoftRead<T>> {
+    let raw: string
+    try {
+      raw = await readFile(path, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {ok: false, missing: true}
+      throw error
+    }
+    try {
+      return {ok: true, missing: false, raw, value: parse(raw) as T}
+    } catch (error) {
+      return {
+        ok: false,
+        missing: false,
+        raw,
+        error: {
+          code: (error as {code?: string}).code ?? 'OVERLAY_CANONICAL_JSON_INVALID',
+          message: (error as Error).message,
+        },
+      }
+    }
+  }
+
+  /**
+   * PRD §14.3 SHOULD — "Write a `.broken` diagnostic copy when direct edits fail
+   * parsing." Written once per distinct broken content so a polling caller does
+   * not rewrite it on every read.
+   */
+  async #writeBrokenCopy(path: string, contents: string): Promise<string | null> {
+    const key = `${path}\0${canonicalChecksum(contents)}`
+    if (this.#diagnosed.has(key)) return `${this.layout.relative(path)}${BROKEN_SUFFIX}`
+    const brokenPath = `${path}${BROKEN_SUFFIX}`
+    try {
+      await writeFile(brokenPath, contents, 'utf8')
+      this.#diagnosed.add(key)
+      return `${this.layout.relative(path)}${BROKEN_SUFFIX}`
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Write the immutable artifacts for one record and derive its head.
+   *
+   * Nothing here is reachable until a manifest head names the returned
+   * `storageRef`, which is what makes the manifest rename the commit point.
+   */
+  async #writeImmutable(overlayId: string, record: OverlayDocumentRecord): Promise<ImmutableWrite> {
+    if (record?.logicalId === undefined || typeof record.logicalId !== 'string') {
+      throw new OverlayInvalidRequestError('Document record requires a logicalId (PRD §13.3)')
+    }
+    assertFormatVersion(record.formatVersion)
+    if (record.overlayId !== overlayId) {
+      throw new OverlayIdentityMismatchError(record.overlayId, overlayId)
+    }
+
+    const logicalId = toPublishedId(record.logicalId)
+    const normalized = clone({...record, logicalId})
+
+    let snapshotRef: string | undefined
+    const snapshot = baseSnapshotFrom(normalized)
+    if (snapshot !== null) {
+      snapshotRef = canonicalChecksum(snapshot)
+      const path = this.layout.snapshotPath(snapshotRef)
+      /* Content-addressed and therefore immutable: an existing file already holds
+       * identical bytes (PRD §14.3 "one immutable snapshot per captured base state"). */
+      if (!(await exists(path))) await this.#writeJson(path, snapshot)
+    }
+
+    const recordChecksum = canonicalChecksum(normalized)
+    const revisionPath = this.layout.revisionPath(logicalId, recordChecksum)
+    if (!(await exists(revisionPath))) await this.#writeJson(revisionPath, normalized)
+    const storageRef = this.layout.relative(revisionPath)
+
+    const head = documentHeadFromRecord(normalized, {storageRef, checksum: recordChecksum})
+
+    const write: ImmutableWrite = {
+      logicalId,
+      record: normalized,
+      storageRef,
+      checksum: recordChecksum,
+      head,
+    }
+    if (snapshotRef !== undefined) write.snapshotRef = snapshotRef
+    return write
+  }
+
+  /** Regenerable projections: the review-facing intent and the materialized document. */
+  async #writeProjections(write: ImmutableWrite): Promise<void> {
+    const options = write.snapshotRef === undefined ? {} : {snapshotRef: write.snapshotRef}
+    const intent = intentFromRecord(write.record, options)
+    const path = this.layout.intentPath(write.logicalId)
+    const bytes = await this.#writeJson(path, intent)
+    this.#lastValidIntents.set(write.logicalId, {intent, bytes})
+    this.#conflictCounts.set(write.logicalId, countConflicts(intent))
+    await this.#writeMaterialized(write.record)
+  }
+
+  async #writeMaterialized(record: OverlayDocumentRecord): Promise<void> {
+    const logicalId = toPublishedId(record.logicalId)
+    const file: MaterializedDocumentFile = {
+      formatVersion: OVERLAY_FORMAT_VERSION,
+      logicalId,
+      schemaType: record.schemaType,
+      runtimeRevision: record.runtimeRevision,
+      generatedAt: this.#now(),
+      draft: record.local.draftTombstone ? null : (record.local.draft?.materialized ?? null),
+      published: record.local.publishedTombstone
+        ? null
+        : (record.local.published?.materialized ?? null),
+    }
+    await this.#writeJson(this.layout.materializedPath(logicalId), file)
+  }
+
+  async #removeDocumentArtifacts(logicalId: string): Promise<string[]> {
+    const targets = [
+      this.layout.documentDir(logicalId),
+      this.layout.materializedPath(logicalId),
+      this.layout.revisionDir(logicalId),
+    ]
+    const removed: string[] = []
+    for (const target of targets) {
+      removed.push(this.layout.relative(target))
+      await rm(target, {recursive: true, force: true})
+    }
+    this.#lastValidIntents.delete(logicalId)
+    this.#conflictCounts.delete(logicalId)
+    return removed
+  }
+
+  /** Recompute `manifest.conflictSummary` from every current document (PRD §13.1). */
+  async #applyConflictSummary(
+    manifest: OverlayManifest,
+    updated: readonly OverlayDocumentRecord[],
+  ): Promise<void> {
+    for (const record of updated) {
+      const logicalId = toPublishedId(record.logicalId)
+      let hard = 0
+      let soft = 0
+      for (const conflict of record.conflicts) {
+        if (conflict.resolution !== undefined) continue
+        if (conflict.severity === 'hard') hard += 1
+        else soft += 1
+      }
+      this.#conflictCounts.set(logicalId, {hard, soft})
+    }
+
+    let hard = 0
+    let soft = 0
+    for (const logicalId of Object.keys(manifest.documentHeads)) {
+      let counts = this.#conflictCounts.get(logicalId)
+      if (counts === undefined) {
+        const intent = await this.#loadIntent(logicalId)
+        counts = intent === null ? {hard: 0, soft: 0} : countConflicts(intent)
+        this.#conflictCounts.set(logicalId, counts)
+      }
+      hard += counts.hard
+      soft += counts.soft
+    }
+    manifest.conflictSummary = {total: hard + soft, hard, soft}
+  }
+
+  #applyRetention(manifest: OverlayManifest, retention: OverlayRetentionPolicy): void {
+    if (retention.expiresAt === null) {
+      delete manifest.expiresAt
+      return
+    }
+    if (typeof retention.expiresAt === 'string') {
+      manifest.expiresAt = retention.expiresAt
+      return
+    }
+    if (typeof retention.ttlDays === 'number') {
+      manifest.expiresAt = addDays(manifest.updatedAt, retention.ttlDays)
+    }
+  }
+
+  async #allocateTransactionId(overlayId: string, timestamp: string): Promise<string> {
+    for (let attempt = 0; attempt < 1000; attempt += 1) {
+      const sequence = this.#sequence
+      this.#sequence += 1
+      const transactionId = this.#newTransactionId({overlayId, timestamp, sequence})
+      if (!(await exists(this.layout.transactionPath(transactionId)))) return transactionId
+    }
+    /* istanbul ignore next -- unreachable without a pathological ID factory. */
+    throw new OverlayInvalidRequestError('Could not allocate a unique transaction ID')
+  }
+
+  async #readAllTransactions(): Promise<OverlayTransactionRecord[]> {
+    const entries = await readdirSafe(this.layout.transactionsDir)
+    const transactions: OverlayTransactionRecord[] = []
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue
+      const read = await this.#readJsonSoft<OverlayTransactionRecord>(
+        join(this.layout.transactionsDir, entry.name),
+      )
+      if (read.ok && read.value !== undefined) transactions.push(read.value)
+    }
+    return transactions.sort((a, b) =>
+      a.transactionId < b.transactionId ? -1 : a.transactionId > b.transactionId ? 1 : 0,
+    )
+  }
+
+  /** PRD §14.4 step 3-4: validate IDs, type, paths, draft/published consistency, snapshot ref. */
+  async #validateIntent(
+    intent: CheckpointDocumentIntent,
+    expectedLogicalId: string,
+  ): Promise<string | null> {
+    if (intent.formatVersion !== OVERLAY_FORMAT_VERSION) {
+      return `unsupported formatVersion ${JSON.stringify(intent.formatVersion)}`
+    }
+    if (typeof intent.logicalId !== 'string' || intent.logicalId.length === 0) {
+      return 'logicalId must be a non-empty string'
+    }
+    if (toPublishedId(intent.logicalId) !== expectedLogicalId) {
+      return `logicalId ${JSON.stringify(intent.logicalId)} does not match its directory (${expectedLogicalId})`
+    }
+    if (typeof intent.type !== 'string' || intent.type.length === 0) {
+      return 'type must be a non-empty string'
+    }
+    if (
+      typeof intent.tombstones !== 'object' ||
+      intent.tombstones === null ||
+      typeof intent.tombstones.draft !== 'boolean' ||
+      typeof intent.tombstones.published !== 'boolean'
+    ) {
+      return 'tombstones must carry boolean `draft` and `published` flags'
+    }
+    if (!Array.isArray(intent.touchedPaths)) return 'touchedPaths must be an array'
+    for (const path of intent.touchedPaths) {
+      if (!Array.isArray(path)) return 'every touched path must be an array of segments'
+      try {
+        encodeOverlayPath(path)
+      } catch (error) {
+        return `invalid touched path: ${(error as Error).message}`
+      }
+    }
+    if (!Array.isArray(intent.conflicts)) return 'conflicts must be an array'
+    if (typeof intent.checksum !== 'string') return 'checksum must be a string'
+
+    /* §34.1 — at most one current local state per perspective, so a tombstone and
+     * a local state for the same perspective cannot both be present. */
+    if (intent.tombstones.draft && intent.draft !== undefined) {
+      return 'a draft tombstone cannot coexist with a local draft state'
+    }
+    if (intent.tombstones.published && intent.published !== undefined) {
+      return 'a published tombstone cannot coexist with a local published state'
+    }
+
+    for (const [perspective, state] of [
+      ['draft', intent.draft],
+      ['published', intent.published],
+    ] as Array<[string, OverlayIntentState | undefined]>) {
+      if (state === undefined) continue
+      if (state.mode !== 'patch' && state.mode !== 'replace') {
+        return `${perspective}.mode must be "patch" or "replace"`
+      }
+      if (state.mode === 'replace') {
+        const replacement = state.replacement
+        if (
+          typeof replacement !== 'object' ||
+          replacement === null ||
+          typeof replacement._type !== 'string'
+        ) {
+          return `${perspective} uses mode "replace" but carries no replacement document`
+        }
+      }
+      if (state.overrides !== undefined) {
+        if (!Array.isArray(state.overrides)) return `${perspective}.overrides must be an array`
+        for (const override of state.overrides) {
+          if (
+            typeof override !== 'object' ||
+            override === null ||
+            !Array.isArray((override as {path?: unknown}).path)
+          ) {
+            return `${perspective}.overrides entries must be {path, value}`
+          }
+        }
+      }
+      if (state.unsets !== undefined && !Array.isArray(state.unsets)) {
+        return `${perspective}.unsets must be an array`
+      }
+    }
+
+    if (intent.base.snapshotRef !== undefined) {
+      if (!isChecksum(intent.base.snapshotRef)) {
+        return `base.snapshotRef ${JSON.stringify(intent.base.snapshotRef)} is not a SHA-256 content address`
+      }
+      if (!(await exists(this.layout.snapshotPath(intent.base.snapshotRef)))) {
+        return `base.snapshotRef ${intent.base.snapshotRef} names a snapshot that is not stored`
+      }
+    }
+
+    return null
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Free helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Deep copy through the canonical serializer, so every value the store hands out
+ * is detached, canonically ordered and free of prototype-polluting keys.
+ */
+function clone<T>(value: T): T {
+  return canonicalize(value)
+}
+
+function countConflicts(intent: CheckpointDocumentIntent): {hard: number; soft: number} {
+  let hard = 0
+  let soft = 0
+  for (const conflict of intent.conflicts) {
+    if (conflict.resolved) continue
+    if (conflict.severity === 'hard') hard += 1
+    else soft += 1
+  }
+  return {hard, soft}
+}
+
+/** SHA-256 over the canonical bundle without its own `checksum` field. */
+export function bundleChecksum(bundle: OverlayCanonicalBundle): string {
+  const {checksum: _ignored, ...rest} = bundle
+  return canonicalChecksum(rest)
+}
+
+/** Add whole days to an ISO timestamp without reading a clock. */
+function addDays(isoTimestamp: string, days: number): string {
+  const base = Date.parse(isoTimestamp)
+  if (Number.isNaN(base)) {
+    throw new OverlayInvalidRequestError(
+      `Cannot apply a relative retention to the non-ISO timestamp ${JSON.stringify(isoTimestamp)}`,
+      {timestamp: isoTimestamp},
+    )
+  }
+  return new Date(base + days * 86_400_000).toISOString()
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+async function readdirSafe(
+  path: string,
+): Promise<Array<{name: string; isFile(): boolean; isDirectory(): boolean}>> {
+  try {
+    return await readdir(path, {withFileTypes: true})
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+}
+
+/**
+ * Default transaction ID: `tx-<compacted timestamp>-<sequence>-<digest>`.
+ *
+ * Lexicographically ordered by commit time and then by sequence, as PRD §13.10
+ * MUSTs, and derived only from the injected clock so it stays deterministic.
+ */
+function defaultTransactionId(context: {
+  overlayId: string
+  timestamp: string
+  sequence: number
+}): string {
+  const time = context.timestamp.replace(/[^0-9]/g, '').slice(0, 17).padEnd(17, '0')
+  const sequence = String(context.sequence).padStart(6, '0')
+  const digest = canonicalChecksum(context).slice(0, 8)
+  return `tx-${time}-${sequence}-${digest}`
+}
+
+function validateManifestShape(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null) return 'manifest must be an object'
+  const manifest = value as Partial<OverlayManifest>
+  if (manifest.formatVersion !== OVERLAY_FORMAT_VERSION) {
+    return `unsupported formatVersion ${JSON.stringify(manifest.formatVersion)}`
+  }
+  if (typeof manifest.overlayId !== 'string' || manifest.overlayId.length === 0) {
+    return 'overlayId must be a non-empty string'
+  }
+  if (typeof manifest.revision !== 'number' || !Number.isInteger(manifest.revision)) {
+    return 'revision must be an integer'
+  }
+  if (typeof manifest.documentHeads !== 'object' || manifest.documentHeads === null) {
+    return 'documentHeads must be an object'
+  }
+  if (typeof manifest.status !== 'string') return 'status must be a string'
+  return null
+}

@@ -193,7 +193,7 @@ Every plan document under `docs/plans/` must follow these rules.
 
 | Roadmap phase | Title | Status | Plan doc | Exit evidence location |
 |---|---|---|---|---|
-| 1 | Repository audit and feasibility gates | Not started | `phase-1-audit-and-feasibility.md` | TBD |
+| 1 | Repository audit and feasibility gates | In progress (harness scaffolding done, 2026-08-03) | `phase-1-audit-and-feasibility.md` | [evidence/phase-1/](evidence/phase-1/gate-review.md) |
 | 2 | Core domain engine and memory adapter | Not started | `phase-2-core-domain.md` | TBD |
 | 3 | Local filesystem mode | Not started | `phase-3-local-fs-mode.md` | TBD |
 | 4 | Blob preview persistence and identity | Not started | `phase-4-blob-preview.md` | TBD |
