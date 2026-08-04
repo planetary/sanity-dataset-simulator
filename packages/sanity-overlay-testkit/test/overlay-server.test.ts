@@ -1,0 +1,787 @@
+/**
+ * SPIKE A — persistence for the Studio write facade (PRD §36.1 Track A, §14).
+ *
+ * Two units are under test, and they are deliberately separate:
+ *
+ * 1. `overlayTranslate.ts` — the **pure** browser→store translation. It turns an
+ *    intercepted Studio write (Actions API payload or raw `mutate` body) into the
+ *    PRD §13.7 `OverlayMutation` shape. It touches no DOM, no network and no
+ *    filesystem, so it is unit-testable without a browser — which is the whole
+ *    point of extracting it out of `localEcho.ts`.
+ *
+ * 2. `overlayServer.mjs` — the minimal HTTP JSON API in front of
+ *    {@link FsOverlayStore}. Its job is the milestone: an edit typed in Studio
+ *    must exist on disk, and must come back after a reload *and* after a server
+ *    restart.
+ *
+ * Assertion discipline: every persistence claim is checked by reading the
+ * canonical file from disk with `node:fs`, never by trusting the server's own
+ * response body. A server that lied about what it wrote would pass the second
+ * kind of assertion and fail the first.
+ */
+import {mkdtemp, readFile, rm} from 'node:fs/promises'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
+import {afterEach, describe, expect, it} from 'vitest'
+import {parse} from '../../sanity-overlay-core/src/index'
+import type {CheckpointDocumentIntent} from '../../sanity-overlay-store-fs/src/index'
+import {
+  parseSanityPath,
+  translateInterceptedWrite,
+} from '../../../examples/kitchen-sink/spikeA/overlayTranslate'
+import {startOverlayServer} from '../../../examples/kitchen-sink/spikeA/overlayServer.mjs'
+
+const OVERLAY_ID = 'spike-a-overlay-000000000000000'
+const STUDIO_ORIGIN = 'http://localhost:3333'
+
+/* ------------------------------------------------------------------ *
+ * Harness
+ * ------------------------------------------------------------------ */
+
+const roots: string[] = []
+const running: Array<{close: () => Promise<void>}> = []
+
+afterEach(async () => {
+  for (const server of running.splice(0)) await server.close()
+  for (const root of roots.splice(0)) await rm(root, {recursive: true, force: true})
+})
+
+async function makeRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'spike-a-overlay-'))
+  roots.push(root)
+  return root
+}
+
+/** A monotonic injected clock — the store must never read a wall clock itself. */
+function makeClock(): () => string {
+  let tick = 0
+  return () => {
+    tick += 1
+    return new Date(Date.UTC(2026, 0, 1, 0, 0, tick)).toISOString()
+  }
+}
+
+interface Booted {
+  url: string
+  port: number
+  close(): Promise<void>
+}
+
+interface BeforeRenameHook {
+  beforeRename(info: {tempPath: string; targetPath: string}): void | Promise<void>
+}
+
+async function boot(root: string, hooks?: BeforeRenameHook): Promise<Booted> {
+  const server = (await startOverlayServer({
+    root,
+    port: 0,
+    overlayId: OVERLAY_ID,
+    now: makeClock(),
+    hooks,
+  })) as Booted
+  running.push(server)
+  return server
+}
+
+/** Resolve once `predicate` holds, so a test never sleeps on a guessed duration. */
+async function until(predicate: () => boolean, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 2000; attempt += 1) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  throw new Error(`timed out waiting for ${label}`)
+}
+
+/**
+ * Drain the microtask queue and a few macrotasks, so "still pending" means
+ * genuinely pending rather than "not scheduled yet".
+ */
+async function settle(): Promise<void> {
+  for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/** Track whether a promise has settled, without consuming its result. */
+function watch<T>(promise: Promise<T>): {settled: () => boolean; promise: Promise<T>} {
+  let settled = false
+  const tracked = promise.then(
+    (value) => {
+      settled = true
+      return value
+    },
+    (error) => {
+      settled = true
+      throw error
+    },
+  )
+  /* The caller may assert on `settled` long before it awaits `tracked`; without
+   * this no-op handler a rejection in between is an unhandled rejection of the
+   * test's own making. */
+  void tracked.catch(() => undefined)
+  return {settled: () => settled, promise: tracked}
+}
+
+/** The published document Studio already holds when the user starts typing. */
+const BASE_ARTICLE = {
+  _id: 'article-1',
+  _type: 'article',
+  _rev: 'lake-rev-1',
+  _createdAt: '2025-12-01T00:00:00.000Z',
+  _updatedAt: '2025-12-01T00:00:00.000Z',
+  title: 'Article 1',
+}
+
+/** Exactly the payload `client.observable.action(...)` carries for a field edit. */
+function editAction(title: string): unknown[] {
+  return [
+    {
+      actionType: 'sanity.action.document.edit',
+      draftId: 'drafts.article-1',
+      publishedId: 'article-1',
+      patch: {set: {title}},
+    },
+  ]
+}
+
+async function postCommit(
+  server: Booted,
+  body: Record<string, unknown>,
+): Promise<{status: number; json: Record<string, unknown>; headers: Headers}> {
+  const response = await fetch(`${server.url}/commit`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', origin: STUDIO_ORIGIN},
+    body: JSON.stringify(body),
+  })
+  return {
+    status: response.status,
+    json: (await response.json()) as Record<string, unknown>,
+    headers: response.headers,
+  }
+}
+
+async function getState(server: Booted): Promise<Record<string, any>> {
+  const response = await fetch(`${server.url}/state`, {headers: {origin: STUDIO_ORIGIN}})
+  expect(response.status).toBe(200)
+  return (await response.json()) as Record<string, any>
+}
+
+/** Read the canonical, review-facing intent straight off disk (PRD §14.2). */
+async function readIntent(root: string, logicalId: string): Promise<CheckpointDocumentIntent> {
+  const path = join(root, '.sanity-overlay', 'documents', logicalId, 'intent.json')
+  return parse(await readFile(path, 'utf8')) as CheckpointDocumentIntent
+}
+
+/* ------------------------------------------------------------------ *
+ * The pure translation (browser → PRD §13.7 mutations)
+ * ------------------------------------------------------------------ */
+
+describe('intercepted Studio write → overlay mutation translation', () => {
+  it('parses Sanity patch paths into PRD §13.6 overlay paths', () => {
+    expect(parseSanityPath('title')).toEqual(['title'])
+    expect(parseSanityPath('meta.seo.title')).toEqual(['meta', 'seo', 'title'])
+    expect(parseSanityPath('body[0]')).toEqual(['body', 0])
+    expect(parseSanityPath('body[_key=="abc"].text')).toEqual(['body', {_key: 'abc'}, 'text'])
+    expect(parseSanityPath("body[_key=='abc'].children[2].text")).toEqual([
+      'body',
+      {_key: 'abc'},
+      'children',
+      2,
+      'text',
+    ])
+  })
+
+  it('translates an edit action into a draft patch', () => {
+    const result = translateInterceptedWrite({kind: 'actions', payload: editAction('Edited')})
+
+    expect(result.unsupported).toEqual([])
+    expect(result.documentIds).toEqual(['drafts.article-1'])
+    expect(result.mutations).toEqual([
+      {
+        type: 'patch',
+        id: 'drafts.article-1',
+        operations: [{type: 'set', path: ['title'], value: 'Edited'}],
+      },
+    ])
+  })
+
+  it('drops the revision precondition — overlay revisions are synthetic (PRD §13.9)', () => {
+    const result = translateInterceptedWrite({
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.edit',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+          patch: {set: {title: 'x'}, ifRevisionID: 'lake-rev-1'},
+        },
+      ],
+    })
+
+    expect(result.mutations).toHaveLength(1)
+    expect(result.mutations[0]).not.toHaveProperty('ifRevision')
+  })
+
+  it("drops Studio's empty-action guard pseudo field and the patch's own id", () => {
+    const result = translateInterceptedWrite({
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.edit',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+          patch: {
+            id: 'drafts.article-1',
+            unset: ['_empty_action_guard_pseudo_field_'],
+            set: {title: 'Kept'},
+          },
+        },
+      ],
+    })
+
+    expect(result.mutations).toEqual([
+      {
+        type: 'patch',
+        id: 'drafts.article-1',
+        operations: [{type: 'set', path: ['title'], value: 'Kept'}],
+      },
+    ])
+  })
+
+  it('emits nothing for a patch that is only the guard field', () => {
+    const result = translateInterceptedWrite({
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.edit',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+          patch: {unset: ['_empty_action_guard_pseudo_field_']},
+        },
+      ],
+    })
+
+    expect(result.mutations).toEqual([])
+    expect(result.unsupported).toEqual([])
+  })
+
+  it('translates every raw mutate creation form', () => {
+    const document = {_id: 'article-9', _type: 'article', title: 'New'}
+    for (const key of ['create', 'createIfNotExists', 'createOrReplace'] as const) {
+      const result = translateInterceptedWrite({kind: 'mutations', payload: [{[key]: document}]})
+      expect(result.mutations).toEqual([{type: key, document}])
+      expect(result.documentIds).toEqual(['article-9'])
+    }
+  })
+
+  it('translates a raw delete mutation', () => {
+    const result = translateInterceptedWrite({
+      kind: 'mutations',
+      payload: [{delete: {id: 'article-9'}}],
+    })
+    expect(result.mutations).toEqual([{type: 'delete', id: 'article-9'}])
+  })
+
+  it('translates every patch operation kind in Content Lake apply order', () => {
+    const result = translateInterceptedWrite({
+      kind: 'mutations',
+      payload: [
+        {
+          patch: {
+            id: 'drafts.article-1',
+            diffMatchPatch: {'body[_key=="b1"].text': '@@ -1 +1 @@'},
+            inc: {views: 2},
+            dec: {stock: 1},
+            insert: {after: 'body[-1]', items: [{_key: 'b2', _type: 'block'}]},
+            set: {title: 'S'},
+            unset: ['subtitle'],
+            setIfMissing: {slug: {current: 'a'}},
+          },
+        },
+      ],
+    })
+
+    expect(result.unsupported).toEqual([])
+    expect(result.mutations).toEqual([
+      {
+        type: 'patch',
+        id: 'drafts.article-1',
+        operations: [
+          {type: 'setIfMissing', path: ['slug'], value: {current: 'a'}},
+          {type: 'unset', path: ['subtitle']},
+          {type: 'set', path: ['title'], value: 'S'},
+          {type: 'inc', path: ['views'], amount: 2},
+          {type: 'dec', path: ['stock'], amount: 1},
+          {
+            type: 'insert',
+            path: ['body', -1],
+            position: 'after',
+            items: [{_key: 'b2', _type: 'block'}],
+          },
+          {type: 'diffMatchPatch', path: ['body', {_key: 'b1'}, 'text'], patch: '@@ -1 +1 @@'},
+        ],
+      },
+    ])
+  })
+
+  it('translates a create action, honouring its ifExists mode', () => {
+    const attributes = {_id: 'drafts.article-9', _type: 'article', title: 'Fresh'}
+
+    expect(
+      translateInterceptedWrite({
+        kind: 'actions',
+        payload: [
+          {actionType: 'sanity.action.document.create', publishedId: 'article-9', attributes},
+        ],
+      }).mutations,
+    ).toEqual([{type: 'create', document: attributes}])
+
+    expect(
+      translateInterceptedWrite({
+        kind: 'actions',
+        payload: [
+          {
+            actionType: 'sanity.action.document.create',
+            publishedId: 'article-9',
+            attributes,
+            ifExists: 'ignore',
+          },
+        ],
+      }).mutations,
+    ).toEqual([{type: 'createIfNotExists', document: attributes}])
+  })
+
+  it('translates a delete action into a full delete of the logical document', () => {
+    const result = translateInterceptedWrite({
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.delete',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+        },
+      ],
+    })
+
+    /* PRD §18.8: a `delete` mutation tombstones both perspectives, so it is keyed
+     * on the published (logical) ID, not on the draft. */
+    expect(result.mutations).toEqual([{type: 'delete', id: 'article-1'}])
+  })
+
+  it('reports a draft discard as unsupported — it is an action, not a mutation (PRD §18.7)', () => {
+    const result = translateInterceptedWrite({
+      kind: 'actions',
+      payload: [
+        {actionType: 'sanity.action.document.discard', draftId: 'drafts.article-1'},
+      ],
+    })
+
+    expect(result.mutations).toEqual([])
+    expect(result.unsupported).toHaveLength(1)
+    expect(result.unsupported[0]).toContain('sanity.action.document.discard')
+  })
+
+  it('reports a publish-style action as unsupported instead of dropping it silently', () => {
+    const result = translateInterceptedWrite({
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.publish',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+        },
+      ],
+    })
+
+    expect(result.mutations).toEqual([])
+    expect(result.unsupported).toHaveLength(1)
+    expect(result.unsupported[0]).toContain('sanity.action.document.publish')
+  })
+
+  it('reports an unknown write shape as unsupported', () => {
+    expect(
+      translateInterceptedWrite({kind: 'mutations', payload: [{somethingNew: {id: 'x'}}]})
+        .unsupported,
+    ).toHaveLength(1)
+    expect(
+      translateInterceptedWrite({kind: 'actions', payload: [{actionType: 'sanity.action.made.up'}]})
+        .unsupported,
+    ).toHaveLength(1)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * The overlay server (HTTP → FsOverlayStore → disk)
+ * ------------------------------------------------------------------ */
+
+describe('spikeA overlay server', () => {
+  it('writes an intercepted edit to the canonical overlay file on disk', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+
+    const {status, json} = await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-1',
+      kind: 'actions',
+      payload: editAction('Edited in Studio'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(status).toBe(200)
+    expect(json).toMatchObject({ok: true, committed: true, replayed: false})
+
+    /* The claim under test is on the filesystem, not in the response body. */
+    const intent = await readIntent(root, 'article-1')
+    expect(intent.logicalId).toBe('article-1')
+    expect(intent.type).toBe('article')
+    expect(intent.draft?.overrides).toEqual([{path: ['title'], value: 'Edited in Studio'}])
+
+    const manifest = parse(
+      await readFile(join(root, '.sanity-overlay', 'manifest.json'), 'utf8'),
+    ) as {overlayId: string; revision: number; documentHeads: Record<string, unknown>}
+    expect(manifest.overlayId).toBe(OVERLAY_ID)
+    expect(manifest.revision).toBeGreaterThan(0)
+    expect(Object.keys(manifest.documentHeads)).toEqual(['article-1'])
+  })
+
+  it('serves a hydration payload the echo layer can replay after a reload', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+
+    await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-1',
+      kind: 'actions',
+      payload: editAction('Survives reload'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    const state = await getState(server)
+    expect(state.ok).toBe(true)
+    expect(state.overlayId).toBe(OVERLAY_ID)
+    expect(state.documents).toHaveLength(1)
+
+    const [document] = state.documents
+    expect(document.logicalId).toBe('article-1')
+    expect(document.schemaType).toBe('article')
+    expect(document.draftTombstone).toBe(false)
+    expect(document.published).toBeNull()
+    /* Materialized draft, addressed as Studio addresses it (PRD §13.9 `_id`). */
+    expect(document.draft._id).toBe('drafts.article-1')
+    expect(document.draft.title).toBe('Survives reload')
+    expect(typeof document.draft._rev).toBe('string')
+
+    /* Hydration and disk agree — no in-memory-only state. */
+    const intent = await readIntent(root, 'article-1')
+    expect(intent.draft?.overrides).toEqual([{path: ['title'], value: 'Survives reload'}])
+  })
+
+  it('answers a CORS preflight from the Studio origin', async () => {
+    const server = await boot(await makeRoot())
+
+    const preflight = await fetch(`${server.url}/commit`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: STUDIO_ORIGIN,
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'content-type',
+      },
+    })
+
+    expect(preflight.status).toBe(204)
+    expect(preflight.headers.get('access-control-allow-origin')).toBe(STUDIO_ORIGIN)
+    expect(preflight.headers.get('access-control-allow-methods')).toContain('POST')
+    expect(preflight.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
+      'content-type',
+    )
+
+    /* The actual request carries the header too, otherwise the browser drops the
+     * response after a successful preflight. */
+    const {headers} = await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-1',
+      kind: 'actions',
+      payload: editAction('CORS'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    expect(headers.get('access-control-allow-origin')).toBe(STUDIO_ORIGIN)
+  })
+
+  it('keeps overlay state across a server restart on the same root', async () => {
+    const root = await makeRoot()
+
+    const first = await boot(root)
+    await postCommit(first, {
+      idempotencyKey: 'session-a:local-echo-1',
+      kind: 'actions',
+      payload: editAction('Written before the restart'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    await first.close()
+    running.length = 0
+
+    const second = await boot(root)
+    const state = await getState(second)
+    expect(state.documents).toHaveLength(1)
+    expect(state.documents[0].draft.title).toBe('Written before the restart')
+
+    /* A restarted server keeps writing onto the same record rather than starting
+     * a second, parallel one. */
+    const {json} = await postCommit(second, {
+      idempotencyKey: 'session-b:local-echo-1',
+      kind: 'actions',
+      payload: editAction('Written after the restart'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    expect(json).toMatchObject({ok: true, committed: true})
+
+    const intent = await readIntent(root, 'article-1')
+    expect(intent.draft?.overrides).toEqual([
+      {path: ['title'], value: 'Written after the restart'},
+    ])
+    const after = await getState(second)
+    expect(after.documents).toHaveLength(1)
+    expect(after.documents[0].draft.title).toBe('Written after the restart')
+  })
+
+  it('replays a repeated idempotency key instead of committing twice (PRD §34.6)', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+
+    const body = {
+      idempotencyKey: 'session-a:local-echo-7',
+      kind: 'actions',
+      payload: editAction('Once'),
+      baseDocuments: [BASE_ARTICLE],
+    }
+
+    const first = await postCommit(server, body)
+    const second = await postCommit(server, body)
+
+    expect(first.json).toMatchObject({ok: true, committed: true, replayed: false})
+    expect(second.json).toMatchObject({ok: true, replayed: true})
+    expect(second.json.revision).toBe(first.json.revision)
+  })
+
+  it('reports an untranslatable write loudly rather than dropping it', async () => {
+    const server = await boot(await makeRoot())
+
+    const {status, json} = await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-2',
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.publish',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+        },
+      ],
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(status).toBe(200)
+    expect(json).toMatchObject({ok: true, committed: false})
+    expect(json.unsupported).toHaveLength(1)
+  })
+
+  it('rejects a malformed commit body with a structured error', async () => {
+    const server = await boot(await makeRoot())
+
+    const response = await fetch(`${server.url}/commit`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json', origin: STUDIO_ORIGIN},
+      body: '{not json',
+    })
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as {ok: boolean; error: {message: string}}
+    expect(body.ok).toBe(false)
+    expect(typeof body.error.message).toBe('string')
+
+    const missingKey = await postCommit(server, {
+      kind: 'actions',
+      payload: editAction('No key'),
+    })
+    expect(missingKey.status).toBe(400)
+    expect(missingKey.json.ok).toBe(false)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * Regression class — no store work may outlive the request that started it
+ * ------------------------------------------------------------------ *
+ *
+ * The bug these pin: the commit was issued as a detached promise
+ * (`void store.commitTransaction(...)`), so the server answered 200 while the
+ * write was still in flight. Two things follow, and both are silent:
+ *
+ *   - the browser is told an edit is durable before it is on disk, so a reload
+ *     (or a `SIGINT`) in that window loses it;
+ *   - the orphaned promise escapes every `try` in the server, so a failure
+ *     lands as an unhandled rejection rather than an HTTP error. In the test
+ *     suite it surfaced as `ENOENT` from `#writeText` *after* the temp root had
+ *     been removed — the store was still writing into a deleted directory.
+ *
+ * So the class is: every async path a request starts must be finished, or
+ * reported, before the thing that started it claims to be done. That is the
+ * response for `/commit`, and `close()` for the server as a whole. The gate is
+ * the store's own `beforeRename` hook, which holds a commit open at its commit
+ * point deterministically — no sleeping on a guessed duration.
+ */
+
+interface Gate {
+  hooks: BeforeRenameHook
+  arm(): void
+  reached(): boolean
+  release(): void
+}
+
+/** Hold the *commit point* (the manifest rename) open until `release()`. */
+function manifestGate(mode: 'hold' | 'throw' = 'hold'): Gate {
+  let armed = false
+  let reached = false
+  let release: () => void = () => undefined
+  const open = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return {
+    hooks: {
+      async beforeRename({targetPath}) {
+        /* Only the commit is gated: `createOverlay` writes this same file during
+         * boot, long before any request exists. */
+        if (!armed || !targetPath.endsWith('manifest.json')) return
+        if (mode === 'throw') {
+          /* One-shot, so a later request can prove the server recovered. */
+          armed = false
+          reached = true
+          throw new Error('the disk went away mid-commit')
+        }
+        reached = true
+        await open
+      },
+    },
+    arm: () => {
+      armed = true
+    },
+    reached: () => reached,
+    release: () => release(),
+  }
+}
+
+describe('spikeA overlay server — no store work outlives its request', () => {
+  it('does not answer a commit until the store has passed its commit point', async () => {
+    const root = await makeRoot()
+    const gate = manifestGate()
+    const server = await boot(root, gate.hooks)
+    gate.arm()
+
+    const response = watch(
+      postCommit(server, {
+        idempotencyKey: 'session-a:local-echo-1',
+        kind: 'actions',
+        payload: editAction('Durable before answered'),
+        baseDocuments: [BASE_ARTICLE],
+      }),
+    )
+
+    await until(gate.reached, 'the store to reach the manifest commit point')
+    await settle()
+
+    /* The whole point: a 200 here would be a lie about durability. */
+    expect(response.settled()).toBe(false)
+
+    gate.release()
+    const {status, json} = await response.promise
+    expect(status).toBe(200)
+    expect(json).toMatchObject({ok: true, committed: true})
+
+    /* And by the time it *is* answered, the claim is true on disk. */
+    const intent = await readIntent(root, 'article-1')
+    expect(intent.draft?.overrides).toEqual([{path: ['title'], value: 'Durable before answered'}])
+  })
+
+  it('does not resolve close() while a commit is still writing to disk', async () => {
+    const root = await makeRoot()
+    const gate = manifestGate()
+    const server = await boot(root, gate.hooks)
+    gate.arm()
+
+    /* Deliberately not awaited: this models the browser tab going away, or the
+     * dev server being stopped, mid-commit. */
+    const response = watch(
+      postCommit(server, {
+        idempotencyKey: 'session-a:local-echo-1',
+        kind: 'actions',
+        payload: editAction('Written while shutting down'),
+        baseDocuments: [BASE_ARTICLE],
+      }),
+    )
+
+    await until(gate.reached, 'the store to reach the manifest commit point')
+    const closing = watch(server.close())
+    await settle()
+
+    /* A `close()` that resolves here hands the caller a green light to delete
+     * the overlay root — which is exactly how the temp-dir teardown started
+     * racing a live `#writeText`. */
+    expect(closing.settled()).toBe(false)
+
+    gate.release()
+    await closing.promise
+    running.length = 0
+
+    /* Closed *and* consistent: the in-flight transaction reached its commit
+     * point rather than being abandoned half-written. */
+    const intent = await readIntent(root, 'article-1')
+    expect(intent.draft?.overrides).toEqual([
+      {path: ['title'], value: 'Written while shutting down'},
+    ])
+
+    /* The socket is gone with the server, so this request has no answer; it is
+     * awaited only so the test owns its outcome instead of leaking it. */
+    await response.promise.catch(() => undefined)
+  })
+
+  it('answers a commit that fails inside the store with an error, not a rejection', async () => {
+    const root = await makeRoot()
+    const gate = manifestGate('throw')
+    const server = await boot(root, gate.hooks)
+    gate.arm()
+
+    const {status, json} = await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-1',
+      kind: 'actions',
+      payload: editAction('Never lands'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(gate.reached()).toBe(true)
+    expect(status).toBe(500)
+    expect(json.ok).toBe(false)
+    expect(String((json.error as {message: string}).message)).toContain('the disk went away')
+
+    /* A failed commit must not be reported as overlay state. */
+    const state = await getState(server)
+    expect(state.documents).toEqual([])
+    expect(state.revision).toBe(0)
+  })
+
+  it('keeps serving after a failed commit, and the retry lands', async () => {
+    const root = await makeRoot()
+    const gate = manifestGate('throw')
+    const server = await boot(root, gate.hooks)
+    gate.arm()
+
+    const failed = await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-1',
+      kind: 'actions',
+      payload: editAction('Never lands'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    expect(failed.json.ok).toBe(false)
+
+    /* The commit queue must survive a rejected task — one poisoned write cannot
+     * be allowed to wedge every later autosave. */
+    const retry = await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-2',
+      kind: 'actions',
+      payload: editAction('Lands on retry'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    expect(retry.json).toMatchObject({ok: true, committed: true})
+  })
+})

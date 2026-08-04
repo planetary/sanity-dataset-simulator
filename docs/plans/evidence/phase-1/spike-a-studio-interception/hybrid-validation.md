@@ -24,7 +24,14 @@ This is the first end-to-end demonstration that **a client-side compromise canno
 ## Two findings from the run
 
 1. **The browser-side detector was blind again.** `performance.getEntriesByType('resource')` reported `actionRequests: 0` while the proxy log recorded the blocked POST. Same root cause as the retracted Spike F result (XHR + resource-timing buffer). **Server-side logs are the only trustworthy escape evidence** — recorded as a standing method rule.
-2. **`GET /v2022-06-30/socket/parity` 404s in a retry loop** through the proxy. Studio attempts a socket endpoint the proxy does not implement (WebSocket upgrade is unhandled). Harmless for editing — the data-plane listener uses fetch-streamed SSE, which works — but it should be either implemented or explicitly rejected to stop the retry storm.
+2. **BLOCKER: the proxy does not implement WebSocket upgrade.** Studio opens `ws://<projectId>.localhost:3999/v2022-06-30/socket/parity`; the proxy answers HTTP 404, so the handshake fails and Studio enters a reconnect loop:
+   ```
+   WebSocket connection ... failed: Unexpected response code: 404
+   Error: No activity within 45000 milliseconds. No response received. Reconnecting.
+   ```
+   **Observed effect: document panes hang on "Loading document…" indefinitely.** An earlier revision of this note called the 404 "harmless" — that was wrong; it was recorded before a pane was opened long enough to hit the 45 s timeout. Track B is therefore **not usable for interactive Studio work until WebSocket upgrade is proxied** (`server.on('upgrade')` → dial upstream `wss://`, pipe both sockets).
+
+   Note the earlier successful hybrid run (article-11) still stands for what it measured — boot, reads, and a blocked write all completed before the 45 s reconnect timeout fired.
 
 ## Consequence for D13
 

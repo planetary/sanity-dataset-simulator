@@ -123,3 +123,19 @@ export type {
   EditInput,
   RestoreInput,
 } from './actions/index'
+
+/* W3 — merge engine (PRD §17, §16.4, §28.4, §28.5). */
+export * from './merge/index'
+
+/* W3 — perspective resolution (PRD §18.1-§18.3). */
+export * from './perspectives/index'
+
+/* W3 — conflict creation and resolution (PRD §13.11, §17.4, §28.1-§28.6). */
+export * from './conflicts/index'
+
+/* W4 — references (PRD §19, §18.6, §18.8, §34.10). */
+export * from './references/index'
+
+/* W4 — injected schema-validation port (PRD §17.3 step 9, §20.1, §20.5). */
+export * from './validation/index'
+export * from './store/index'

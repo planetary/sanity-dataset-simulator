@@ -65,6 +65,7 @@ import type {
 import {
   DELETABLE_STATUSES,
   WRITABLE_STATUSES,
+  bundleChecksum,
   defaultRetentionDays,
   documentHeadFromRecord,
 } from './contract'
@@ -1806,11 +1807,13 @@ function countConflicts(intent: CheckpointDocumentIntent): {hard: number; soft: 
   return {hard, soft}
 }
 
-/** SHA-256 over the canonical bundle without its own `checksum` field. */
-export function bundleChecksum(bundle: OverlayCanonicalBundle): string {
-  const {checksum: _ignored, ...rest} = bundle
-  return canonicalChecksum(rest)
-}
+/**
+ * SHA-256 over the canonical bundle without its own `checksum` field.
+ *
+ * Re-exported, not redefined: the bundle checksum is part of the transfer format
+ * (PRD §35.7 export/import), so every adapter must compute it identically.
+ */
+export {bundleChecksum} from './contract'
 
 /** Add whole days to an ISO timestamp without reading a clock. */
 function addDays(isoTimestamp: string, days: number): string {

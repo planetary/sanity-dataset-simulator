@@ -16,12 +16,19 @@
 import {mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join, resolve, sep} from 'node:path'
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import {
+  MemoryOverlayStore,
   checksum,
   encodeLogicalId,
   parse,
   serialize,
+  OverlayNotFoundError as CoreOverlayNotFoundError,
+  OverlayStoreError as CoreOverlayStoreError,
+  bundleChecksum as coreBundleChecksum,
+  documentHeadFromRecord as coreDocumentHeadFromRecord,
+  intentFromRecord as coreIntentFromRecord,
+  isOverlayStoreError as coreIsOverlayStoreError,
 } from '../../sanity-overlay-core/src/index'
 import {
   FsOverlayStore,
@@ -30,6 +37,18 @@ import {
   documentKey,
   isOverlayStoreError,
 } from '../../sanity-overlay-store-fs/src/index'
+/* Imported from the shim modules themselves, not through the package index, so a
+ * shim that stopped re-exporting core is caught at its own boundary. */
+import {
+  OverlayNotFoundError as ShimOverlayNotFoundError,
+  OverlayStoreError as ShimOverlayStoreError,
+  isOverlayStoreError as shimIsOverlayStoreError,
+} from '../../sanity-overlay-store-fs/src/errors'
+import {
+  bundleChecksum as shimBundleChecksum,
+  documentHeadFromRecord as shimDocumentHeadFromRecord,
+} from '../../sanity-overlay-store-fs/src/contract'
+import {intentFromRecord as shimIntentFromRecord} from '../../sanity-overlay-store-fs/src/intent'
 import type {CheckpointDocumentIntent} from '../../sanity-overlay-store-fs/src/index'
 import {
   CONTRACT_ACTOR,
@@ -40,6 +59,17 @@ import {
   runStoreContractSuite,
   type StoreContractHarness,
 } from '../src/storeContract'
+
+/**
+ * Every case here is real filesystem I/O — `mkdtemp`, hundreds of atomic
+ * write+rename pairs, and full export/import round trips between two stores.
+ * "Import canonical state" has been measured at 5703 ms against vitest's 5000 ms
+ * default, i.e. it fails on machine load rather than on behaviour. The timeout is
+ * raised here, at the file level, because that case is defined inside the shared
+ * `runStoreContractSuite` (`../src/storeContract.ts`) and has no per-test lever.
+ * This buys headroom only — it does not slow a passing run.
+ */
+vi.setConfig({testTimeout: 15_000, hookTimeout: 15_000})
 
 const FIXED_NOW = '2026-01-01T00:00:00.000Z'
 
@@ -812,5 +842,111 @@ describe('filesystem layout (PRD §14.1)', () => {
     })
     expect(manifest.revision).toBe(0)
     expect(await exists(join(root, 'nested', '.sanity-overlay', 'manifest.json'))).toBe(true)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * Re-export shim identity — plan §8.1, PRD §10.1
+ *
+ * `sanity-overlay-store-fs/src/{contract,errors,intent}.ts` are now shims over
+ * `sanity-overlay-core/src/store/`, and each one's header claims it re-exports
+ * "the *same* declarations — so `instanceof` and `isOverlayStoreError` still
+ * hold across package boundaries".
+ *
+ * That claim needs its own coverage, because the failure mode is invisible
+ * everywhere else: a shim that drifted into a *re-declaration* would still
+ * type-check, and every behavioural case above would still pass, since each one
+ * catches errors raised by the same package it imported the class from. It would
+ * break only in production — where the core-resident `MemoryOverlayStore` raises
+ * an error that a `catch` written against the fs package fails to recognise, and
+ * a retryable write conflict silently becomes an unhandled exception.
+ * ------------------------------------------------------------------ */
+
+describe('store-fs re-export shim over core (plan §8.1, PRD §10.1)', () => {
+  it('re-exports the identical error declarations rather than copies', () => {
+    expect(ShimOverlayStoreError).toBe(CoreOverlayStoreError)
+    expect(ShimOverlayNotFoundError).toBe(CoreOverlayNotFoundError)
+    expect(shimIsOverlayStoreError).toBe(coreIsOverlayStoreError)
+  })
+
+  it('re-exports the identical contract and intent helpers', () => {
+    expect(shimBundleChecksum).toBe(coreBundleChecksum)
+    expect(shimDocumentHeadFromRecord).toBe(coreDocumentHeadFromRecord)
+    expect(shimIntentFromRecord).toBe(coreIntentFromRecord)
+  })
+
+  it('lets an error raised by the core adapter be caught through the fs package', async () => {
+    const store = new MemoryOverlayStore({now: () => FIXED_NOW})
+
+    let caught: unknown
+    try {
+      await store.readManifest(CONTRACT_OVERLAY_ID)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(ShimOverlayNotFoundError)
+    expect(caught).toBeInstanceOf(ShimOverlayStoreError)
+    expect(shimIsOverlayStoreError(caught, 'OVERLAY_NOT_FOUND')).toBe(true)
+    /* …and through the package index, which is how callers actually import it. */
+    expect(isOverlayStoreError(caught, 'OVERLAY_NOT_FOUND')).toBe(true)
+  })
+
+  it("lets an error raised by the fs adapter be caught with core's declarations", async () => {
+    const store = new FsOverlayStore({root: await makeRoot(), now: () => FIXED_NOW})
+
+    let caught: unknown
+    try {
+      await store.readManifest(CONTRACT_OVERLAY_ID)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(CoreOverlayNotFoundError)
+    expect(caught).toBeInstanceOf(CoreOverlayStoreError)
+    expect(coreIsOverlayStoreError(caught, 'OVERLAY_NOT_FOUND')).toBe(true)
+  })
+
+  it('agrees on the same structured failure for the same contract violation', async () => {
+    /* Both adapters raise the *same class* for the §35.7 "Concurrent stale write
+     * rejection" line, so an API layer can classify either without knowing which
+     * backend produced it (PRD §25.14). */
+    const memory = new MemoryOverlayStore({now: () => FIXED_NOW})
+    const fs = new FsOverlayStore({root: await makeRoot(), now: () => FIXED_NOW})
+
+    const create = {
+      overlayId: CONTRACT_OVERLAY_ID,
+      base: {...CONTRACT_BASE},
+      source: {...CONTRACT_SOURCE},
+      actor: CONTRACT_ACTOR,
+    }
+    await memory.createOverlay(create)
+    await fs.createOverlay(create)
+
+    const staleWrite = async (store: FsOverlayStore | MemoryOverlayStore): Promise<unknown> => {
+      const current = await store.readManifest(CONTRACT_OVERLAY_ID)
+      try {
+        await store.writeManifestConditional(
+          CONTRACT_OVERLAY_ID,
+          {...current, revision: 99},
+          98,
+        )
+      } catch (error) {
+        return error
+      }
+      throw new Error('expected a stale conditional write to be rejected')
+    }
+
+    const fromMemory = await staleWrite(memory)
+    const fromFs = await staleWrite(fs)
+
+    for (const error of [fromMemory, fromFs]) {
+      expect(shimIsOverlayStoreError(error, 'OVERLAY_WRITE_CONFLICT')).toBe(true)
+      expect(coreIsOverlayStoreError(error, 'OVERLAY_WRITE_CONFLICT')).toBe(true)
+      expect((error as InstanceType<typeof CoreOverlayStoreError>).retryable).toBe(true)
+    }
+    expect((fromMemory as {constructor: unknown}).constructor).toBe(
+      (fromFs as {constructor: unknown}).constructor,
+    )
   })
 })

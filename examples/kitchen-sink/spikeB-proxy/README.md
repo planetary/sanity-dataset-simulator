@@ -41,18 +41,45 @@ One JSONL line per request, written synchronously so a `SIGTERM` mid-run cannot 
 
 `path` excludes the query string (GROQ queries and tokens are not logged).
 
-## Write guard (`PROXY_BLOCK_WRITES=1`)
+## Write guard (`PROXY_BLOCK_WRITES=1`) — **default-deny**
 
-Rejects with `403` and body `{"error":{"code":"OVERLAY_WRITE_BLOCKED", ...}}`:
+Rejects with `403` and body `{"error":{"code":"OVERLAY_WRITE_BLOCKED", ...}}`.
 
-- `POST`/`PUT`/`PATCH`/`DELETE` to `/data/mutate*`, `/data/actions*`, `/assets*`
-- any non-`GET`/`HEAD` to `/data/*` — the catch-all for unknown write-capable data-plane endpoints (§36.1 "Reject unknown write-capable endpoints")
+The policy is inverted from the obvious one. An earlier version of this guard enumerated the
+*write* endpoints (`/data/mutate`, `/data/actions`, `/assets/*`, …) and passed everything else;
+Spike F showed that requires the author to have heard of every write endpoint Sanity ships, and
+they had not — `POST /projects/<p>/tokens`, `PUT /users/me/keyvalue/<k>`,
+`POST /schedules/<p>/<d>` and `POST /descriptors/claim` all sailed through, none of them under a
+guarded prefix. So the guard now asks **"is this one of the reads I know about?"** and blocks
+everything else. The classifier lives in [`writeGuard.mjs`](./writeGuard.mjs); its behaviour is
+pinned by `packages/sanity-overlay-testkit/src/writeGuardContract.ts`.
 
-Explicitly **allowed**: `POST /data/query` — GROQ over POST is a legal read and Studio uses it
-for long queries. The API-version segment (`/v2025-02-19/...`, `/vX/...`) is stripped before
-matching, so the rules are version-agnostic. Everything else — `/users/me`, `/projects/*`,
-`/features`, `/descriptors/claim`, `/ping`, `/help`, `/journey/*`, `/agent/*`, telemetry,
-auth endpoints — passes through untouched.
+**Allowed** (the whole list — anything not here is blocked):
+
+| Scope | Allowed |
+|---|---|
+| any path | `OPTIONS` (CORS preflight, so the browser can actually receive the 403 that follows) |
+| `/data/*` and `/projects/<p>/datasets/<d>/*`, `/canvases/<id>/*`, `/media-libraries/<id>/*`, `/dashboards/<id>/*` | `GET`/`HEAD` to `query`, `doc`, `listen`, `history`, `export`, `live/events`, `ping`; plus `POST /…/query` (the long-GROQ fallback Studio really uses) |
+| resource bases | `GET`/`HEAD` on the base itself, `/acl`, `/settings` |
+| root namespaces | `GET`/`HEAD` to `/ping`, `/help`, `/features`, `/journey`, `/intake/telemetry-status`, `/socket`, `/schedules`, `/users`, `/projects`, `/datasets`, `/assets`, and `/agent/<id>/bundles/…` |
+
+Consequences worth knowing before you debug a 403:
+
+- `/agent/action/{patch,generate,transform,translate,prompt}` is **blocked whatever the verb** —
+  those endpoints have no read semantics, so a `GET` probe is a write (Spike F gap 23).
+  Same for `/data/mutate`, `/data/actions` and `/…/upload`.
+- `GET`/`HEAD` are allowlist-only like everything else. A read endpoint nobody has observed yet
+  returns 403 until it is added — a loud, local failure, deliberately preferred over reinstating
+  the assumption Spike F destroyed.
+- A path containing `.` or `..` segments is **never** a read. The guard matches a canonical path
+  but the proxy forwards the raw request line, so `/data/mutate/<ds>/../../query/<ds>` would
+  otherwise be classified as a read while the bytes on the wire still say `mutate`.
+- The API-version segment (`/v2025-02-19/…`, `/vX/…`) is stripped, leading slashes are optional,
+  duplicate/trailing slashes collapse and percent-escapes are decoded before matching — the
+  request is classified by what it *means*, not how it was spelled.
+
+The guard is transport-independent: it runs on the `upgrade` path too (see below), because
+otherwise two extra request headers turn any write into an unguarded tunnel.
 
 ## Streaming (the load-bearing requirement)
 
@@ -71,6 +98,44 @@ not `EventSource`. The proxy therefore:
 
 Measured: welcome event through the proxy at **587 ms**, direct to Sanity at **783 ms** — the
 proxy adds no measurable buffering delay.
+
+## WebSocket upgrade (`/v<api>/socket/<dataset>`)
+
+Studio's listener is not only `/data/listen` SSE — it also performs an RFC 6455 upgrade to
+`/v2022-06-30/socket/<dataset>` (x38 in `proxy-log.jsonl`, the busiest non-data endpoint in the
+session). Without an `upgrade` handler Node clears `req.upgrade` and replays the request down the
+ordinary `request` path, where the hop-by-hop `Upgrade`/`Connection` headers are stripped — so
+Sanity answers a plain 404, Studio logs *"No activity within 45000 milliseconds. Reconnecting."*
+and every pane sits on *"Loading document…"*.
+
+The handler dials upstream raw (`net`/`tls`, `ALPNProtocols: ['http/1.1']` so ALPN can never pick
+h2), replays the request line and headers verbatim, writes any bytes the client pipelined behind
+its head, then relays byte-for-byte in both directions. Nothing parses the stream after the 101 —
+the 101 and the first frames routinely share one TCP segment. FIN on either leg ends the session
+(`http.Server` sockets are `allowHalfOpen` and Node stops managing them once `upgrade` fires, so
+nothing else would reap the pair).
+
+**The write guard runs here too, before the upstream socket is dialled.** `http.Server` routes a
+request to `upgrade` *instead of* `request` the moment it carries `Connection: Upgrade` +
+`Upgrade: <x>`, and the guard lives in the `request` handler — so without this, two extra request
+headers turn
+
+```
+POST /v2025-02-19/data/actions/<ds>
+Connection: Upgrade
+Upgrade: websocket
+
+{"actions":[…]}
+```
+
+into an unguarded tunnel to Content Lake: Node hands the body over as the `head` buffer, and the
+reply streams straight back. Every Spike F gap class is spellable that way. Blocked upgrades get
+the same `403 OVERLAY_WRITE_BLOCKED` body, serialised by hand onto the raw socket (there is no
+`ServerResponse` at that point in the lifecycle) with `Connection: close`, and are logged with
+`"blocked": true, "upgrade": true`.
+
+Pinned end-to-end by `packages/sanity-overlay-testkit/test/proxy-ws.test.ts` against a hand-rolled
+mock upstream — no websocket dependency, `node:net` and `node:crypto` only.
 
 ## Pointing the Studio at the proxy
 
@@ -187,8 +252,8 @@ now return exactly `cache-control: no-cache, no-transform`.
   here (Studio pins `useCdn: false`) but it changes read paths for any CDN-using client.
 - The login redirect flow (`/auth/login/<provider>?origin=...`) has not been exercised through
   the proxy; only token auth has.
-- WebSocket upgrade is not implemented (no `upgrade` handling). Nothing observed in Spike A
-  needs it, but it is a hard failure if some future endpoint does.
+- The `upgrade` path is verified against a hand-rolled mock upstream over plain HTTP; the
+  TLS leg (`tls.connect` to `<project>.api.sanity.io:443`) has not been exercised in a test.
 
 ## §36.1 Track B verification checklist → what the orchestrator should observe
 

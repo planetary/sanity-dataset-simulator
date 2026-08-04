@@ -8,28 +8,25 @@
  * by supplying a {@link StoreContractFactory} that produces an isolated, empty
  * store plus the four raw-access hooks the corruption cases need.
  *
- * The contract types are imported from `sanity-overlay-store-fs/src/contract`
- * only because that is where the contract temporarily lives; when it moves into
- * `sanity-overlay-core` (see the header of `contract.ts`), this import moves with
- * it and nothing else in this file changes.
+ * The contract types come from `sanity-overlay-core/src/store` — the contract's
+ * home (PRD §10.1, plan §8.1), so this runner depends on core alone and never on
+ * the adapter it happens to be pointed at.
  */
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {
   OVERLAY_FORMAT_VERSION,
   checksum,
+  isOverlayStoreError,
   syntheticRev,
 } from '../../sanity-overlay-core/src/index'
 import type {
   OverlayActor,
+  OverlayCanonicalBundle,
   OverlayConflict,
   OverlayDocumentRecord,
+  OverlayStore,
   SanityDocument,
 } from '../../sanity-overlay-core/src/index'
-import {isOverlayStoreError} from '../../sanity-overlay-store-fs/src/contract'
-import type {
-  OverlayCanonicalBundle,
-  OverlayStore,
-} from '../../sanity-overlay-store-fs/src/contract'
 
 /* ------------------------------------------------------------------ *
  * Harness

@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest'
-import {loadFixtureDataset, publishedPerspective} from '../src/fixtures'
-import {OVERLAY_FIXTURES} from '../spike-c/overlay'
+import {type FixtureDocument, loadFixtureDataset, publishedPerspective} from '../src/fixtures'
+import {OVERLAY_FIXTURES, type SpikeOverlay, emptyOverlay} from '../spike-c/overlay'
 import {UnsupportedGroqError, evaluateOracle, evaluateRegistered} from '../spike-c/planner'
 import {REGISTRY, byId} from '../spike-c/registry'
 
@@ -105,4 +105,55 @@ describe('Spike C: §35.11 behavioral assertions', () => {
     const {diagnostics: d} = await evaluateRegistered(byId('articles-ordered-sliced'), base, overlay)
     expect(d.candidateCount).toBeLessThan(d.fullDatasetCount)
   })
+})
+
+// ===========================================================================
+// CLASS REGRESSION — a branch record that CHANGES a document's `_type`.
+//
+// Found while tightening the §22.6 top-K plan (evidence review F6): every
+// candidate plan decides membership from a `_type`, and each one reads a
+// different copy of it. The top-K plan built its "affected" set from the
+// OVERLAY document's `_type` only, so an overlay record that moves a document
+// OUT of the candidate type left the base document occupying a slot in the
+// fetched top K which then vanished at resolution — returning K-1 results
+// where the oracle returns K.
+//
+// The class is "overlay `_type` differs from base `_type`", in both
+// directions, across every plan type — so it is swept over the whole registry.
+// ===========================================================================
+
+const retype = (id: string, type: string, extra: Record<string, unknown> = {}): SpikeOverlay => {
+  const o = emptyOverlay()
+  const src = base.find((d) => d._id === id)
+  if (!src) throw new Error(`fixture missing ${id}`)
+  o.documents.set(id, {...(JSON.parse(JSON.stringify(src)) as FixtureDocument), _type: type, ...extra})
+  return o
+}
+
+const TYPE_CHANGE_CASES: Array<[string, SpikeOverlay]> = [
+  // Leaves the article type — and it is the top of the publishedAt order, so
+  // it sits inside every top-K base fetch.
+  ['article-01 becomes a page (leaves the candidate type)', retype('article-01', 'page')],
+  // Leaves the article type from OUTSIDE the top-20 window.
+  ['article-25 becomes a page (outside the top-K window)', retype('article-25', 'page')],
+  // Enters the article type from another type.
+  ['page-about becomes an article', retype('page-about', 'article', {publishedAt: '2026-09-09T12:00:00Z'})],
+  // Enters via the slug plan: an author acquires the article type and a slug.
+  [
+    'author-4 becomes an article with a slug',
+    retype('author-4', 'article', {slug: {_type: 'slug', current: 'article-7'}, publishedAt: '2020-01-01T00:00:00Z'}),
+  ],
+]
+
+describe('Spike C: parity under overlay _type changes (class)', () => {
+  for (const [label, overlay] of TYPE_CHANGE_CASES) {
+    describe(label, () => {
+      it.each(supported.map((d) => [d.id, d] as const))('%s', async (_id, def) => {
+        const params = PARAMS[def.id] ?? {}
+        const oracle = await evaluateOracle(def, base, overlay, params)
+        const {result} = await evaluateRegistered(def, base, overlay, params)
+        expect(result).toEqual(oracle)
+      })
+    })
+  }
 })

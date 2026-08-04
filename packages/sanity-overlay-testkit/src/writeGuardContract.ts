@@ -28,6 +28,36 @@
  * plus the fail-closed default that turns "endpoint we have never seen" into
  * "blocked" rather than "allowed".
  *
+ * THE POLICY THIS CONTRACT ENCODES: DEFAULT-DENY
+ * ----------------------------------------------
+ * The first version of this contract was default-allow with fail-closed islands
+ * (`/data/*`, `/assets/*`, `/agent/*`, `/datasets/*`). That is the wrong shape:
+ * it requires the guard's author to have heard of every write endpoint Sanity
+ * ships, and Spike F's whole lesson is that they had not. `POST /projects/<p>/
+ * tokens` (mint a write-capable token), `PUT /users/me/keyvalue/<k>`,
+ * `POST /schedules/<p>/<d>` (deferred publish) and `POST /descriptors/claim`
+ * all sailed through, none of them under a guarded prefix.
+ *
+ * So the policy is inverted. A request is a READ only if it matches the
+ * explicit read allowlist below; **everything else is a write and is blocked**,
+ * including GET/HEAD to paths the allowlist has never heard of.
+ *
+ *   | class                                   | ruling                        |
+ *   |-----------------------------------------|-------------------------------|
+ *   | OPTIONS, any path                       | never a write (preflight)     |
+ *   | GET/HEAD on an allowlisted read endpoint| read                          |
+ *   | POST /data/query, <resource>/query      | read (long-GROQ fallback)     |
+ *   | GET/HEAD on an unknown path             | WRITE (blocked)               |
+ *   | any other method, any path              | WRITE (blocked)               |
+ *
+ * The read allowlist is derived from two independent sources, not from
+ * imagination: (a) `examples/kitchen-sink/spikeB-proxy/proxy-log.jsonl`, 422
+ * real request lines from a live Studio session against the Track B proxy, and
+ * (b) the `@sanity/client` URL-builder inventory below. Blocking a read the
+ * Studio actually performs breaks the Studio loudly and in one place; allowing
+ * a write we have never heard of corrupts staging silently. The allowlist is
+ * therefore the thing that gets extended, always with a log line to justify it.
+ *
  * HOW TO JOIN
  * -----------
  * Any implementation that can answer "is this request a write?" runs the whole
@@ -70,13 +100,15 @@
  */
 import {describe, expect, it} from 'vitest'
 
-/** The five classes of defect this contract covers. */
+/** The classes of defect this contract covers. */
 export type WriteGuardGroup =
   | 'url-normalisation'
   | 'write-endpoints'
   | 'read-passthrough'
   | 'methods'
   | 'fail-closed'
+  | 'default-deny'
+  | 'spike-f-attacks'
 
 export interface WriteGuardRequest {
   method: string
@@ -92,6 +124,12 @@ export interface WriteGuardCase extends WriteGuardRequest {
   why: string
   /** Spike F attack number this case is a regression witness for, if any. */
   gap?: number
+  /** Spike F attack number this case is the promoted request shape of, if any. */
+  attack?: number
+  /** `attackPass.ts` spec name, for traceability back to the suite. */
+  attackName?: string
+  /** The body shape the attack sends — recorded, not asserted on. */
+  body?: string
 }
 
 /** The predicate under test. */
@@ -135,6 +173,46 @@ const NORMALISATION: WriteGuardCase[] = (
       'fully-qualified URL rather than a request-line path',
     ],
     ['/data/mutate/' + DS + '%3Ffake=1', 'percent-encoded "?" must not hide the path'],
+
+    /* ---- dot segments that REDUCE a write to a read (gap 20, other half) ---
+     * Every `..` case above climbs *towards* the write endpoint, and any guard
+     * that resolves dot segments catches those for free. The dangerous
+     * direction is the opposite one: `..` climbing back *out* of a write
+     * segment so the canonical path is a read while the request line still
+     * says `/data/mutate`.
+     *
+     * That matters because the proxy forwards the RAW request line upstream —
+     * it does not send the canonical path it classified. So the guard and
+     * Content Lake are looking at two different strings, and the guard picked
+     * the harmless reading of it. Under default-deny the ruling is the reverse:
+     * a path that needs `.`/`..` resolved to become a read is not a read.
+     * Nothing @sanity/client builds contains a dot segment; against a proxy
+     * their only function is to make the two ends disagree.
+     */
+    [
+      '/data/mutate/' + DS + '/../../query/' + DS,
+      '".." climbing back OUT of the write path — canonically a read, on the wire still /data/mutate',
+    ],
+    ['/data/actions/' + DS + '/../../query/' + DS, 'the same reduction against the Actions API'],
+    [
+      '/data/mutate/' + DS + '/%2e%2e/%2e%2e/query/' + DS,
+      'percent-encoded dot segments reducing the write path — decoding must not launder it',
+    ],
+    [
+      '/data/query/' + DS + ';/../mutate/' + DS,
+      'a path parameter absorbed by ".." — the segment count hides the mutate that follows',
+      20,
+    ],
+    ['/data/mutate/' + DS + '/./../query/' + DS, 'a "." segment mixed into the reduction'],
+    [
+      '/assets/images/' + DS + '/../../data/query/' + DS,
+      'the same trick reducing an asset upload to a data-plane read',
+      21,
+    ],
+    [
+      '/data/mutate/' + DS + '/../../../../../../ping',
+      'enough ".." to land on an allowlisted root read — the generic form of the reduction',
+    ],
   ] as [string, string, number?][]
 ).map(([url, why, gap]) => ({
   group: 'url-normalisation' as const,
@@ -198,6 +276,12 @@ const WRITE_ENDPOINTS: WriteGuardCase[] = (
       'POST',
       'assets/images/' + DS,
       'the exact string `buildAssetUploadUrl()` returns — no leading slash',
+      21,
+    ],
+    [
+      'POST',
+      'assets/files/' + DS,
+      'the file-upload half of the same builder — /assets/* means BOTH forms of BOTH kinds',
       21,
     ],
     ['POST', '/agent/action/patch/' + DS, 'Agent Actions patch writes documents', 23],
@@ -270,6 +354,55 @@ const READ_PASSTHROUGH: WriteGuardCase[] = (
     ['GET', '/agent/action/bundles/mine/listen', 'agent bundle listener under /action is a read'],
     ['GET', '/v2025-02-19/ping', 'health check — observed in the Spike B proxy log'],
     ['HEAD', '/v2025-02-19/data/query/' + DS, 'HEAD on a read endpoint'],
+
+    /* ---- the allowlist, derived line-by-line from proxy-log.jsonl ---------
+     * 422 request lines from a live Studio session through the Track B proxy.
+     * Under default-deny every one of these would 403 unless it is named here,
+     * so each entry is a load-bearing "the Studio still boots" assertion. The
+     * count beside each is how many times the session issued it.
+     */
+    ['GET', '/v2025-02-19/data/ping/' + DS, 'dataset-scoped ping (x3 in the log)'],
+    [
+      'GET',
+      '/v2025-02-19/data/history/' + DS + '/events/documents/drafts.article-11',
+      'document-events history read (x4) — the real /data/history sub-shape',
+    ],
+    [
+      'GET',
+      '/v2025-02-19/data/history/' + DS + '/transactions/drafts.author-1',
+      'transaction history read (x3)',
+    ],
+    ['GET', '/v1/help', 'API help index (x2)'],
+    ['GET', '/v2025-02-19/features', 'feature flags (x3)'],
+    ['GET', '/v2023-12-11/journey/trial', 'journey/trial banner data (x9)'],
+    ['GET', '/v2024-09-19/journey/announcements', 'journey/announcements (x6)'],
+    ['GET', '/v2025-02-19/journey/scheduled-drafts', 'journey/scheduled-drafts (x7)'],
+    ['GET', '/v2023-12-18/intake/telemetry-status', 'telemetry opt-in status (x1)'],
+    [
+      'GET',
+      '/v2022-06-30/socket/' + DS,
+      'the presence WebSocket upgrade (x38) — a GET, and the busiest non-data endpoint in the log',
+    ],
+    ['GET', '/v2021-12-15/projects/' + PID, 'project metadata under an old API version (x8)'],
+    ['GET', '/v2025-02-19/projects/' + PID + '/datasets', 'dataset list under the project host (x6)'],
+    ['GET', '/v2025-02-19/projects/' + PID + '/grants', 'permission grants (x3)'],
+    ['GET', '/v2024-09-01/projects/' + PID + '/user-applications', 'user applications (x3)'],
+    [
+      'GET',
+      '/v2021-06-07/projects/' + PID + '/datasets/' + DS + '/acl',
+      'dataset ACL read (x3) — resource-scoped, and NOT a /data operation',
+    ],
+    ['GET', '/v2025-02-19/schedules/' + PID + '/' + DS, 'scheduled-publishing list (x3)'],
+    [
+      'GET',
+      '/v2025-02-19/users/me/keyvalue/studio.announcement.seen',
+      'Studio key-value preference read (x3) — the write side of this is PUT and is blocked',
+    ],
+    [
+      'GET',
+      '/v2025-02-19/agent/oTu7RImef/bundles/mine/listen',
+      'the real agent bundle listener shape (x3): /agent/<id>/bundles/mine/listen',
+    ],
   ] as [string, string, string][]
 ).map(([method, url, why]) => ({
   group: 'read-passthrough' as const,
@@ -428,17 +561,266 @@ const FAIL_CLOSED: WriteGuardCase[] = [
     group: 'fail-closed',
     method: 'POST',
     url: '/v2025-02-19/ping',
-    write: false,
-    why: 'fail-closed is scoped: the guard must not block everything it sees',
+    write: true,
+    why:
+      'POLICY CHANGE (default-deny): /ping is allowlisted for GET/HEAD only. ' +
+      'A POST to it is a verb nobody has documented, so it is a write',
   },
   {
     group: 'fail-closed',
     method: 'POST',
     url: '/v1/auth/logout',
-    write: false,
-    why: 'platform/auth endpoints outside the data plane still pass',
+    write: true,
+    why:
+      'POLICY CHANGE (default-deny): a POST outside the read allowlist is blocked even ' +
+      'outside the data plane. The preview holds no session to log out of',
   },
 ]
+
+/* ------------------------------------------------------------------ *
+ * 6. Default-deny — the policy itself: not-a-known-read means blocked
+ * ------------------------------------------------------------------ *
+ * Every case here was ALLOWED by the previous default-allow guard. They are
+ * the reason the policy was inverted: none of them lives under a `/data/*`,
+ * `/assets/*`, `/agent/*` or `/datasets/*` prefix, so no amount of extending
+ * the old island-shaped rule set would have caught the class — only the class's
+ * complement would.
+ */
+
+const DEFAULT_DENY: WriteGuardCase[] = (
+  [
+    /* ---- the project/console write plane (gap class 4) ------------------- */
+    ['POST', '/v2025-02-19/projects', 'creating a project is a write'],
+    ['PATCH', '/v2025-02-19/projects/' + PID, 'editing project metadata is a write'],
+    ['DELETE', '/v2025-02-19/projects/' + PID, 'deleting the project is the largest write there is'],
+    [
+      'POST',
+      '/v2025-02-19/projects/' + PID + '/tokens',
+      'minting a token — a write that also manufactures a credential the preview must not have',
+    ],
+    [
+      'DELETE',
+      '/v2025-02-19/projects/' + PID + '/tokens/tok-1',
+      'revoking a token is a write to the project plane',
+    ],
+    ['POST', '/v2025-02-19/projects/' + PID + '/members', 'inviting a member is a write'],
+    [
+      'PUT',
+      '/v2021-06-07/projects/' + PID + '/datasets/' + DS + '/acl',
+      'the write side of the ACL endpoint whose GET the Studio really uses',
+    ],
+    ['POST', '/v2025-02-19/projects/' + PID + '/datasets/' + DS + '/copy', 'dataset copy is a write'],
+
+    /* ---- endpoints the live Studio session actually POSTed --------------- */
+    [
+      'POST',
+      '/v2025-02-19/descriptors/claim',
+      'observed x3 in proxy-log.jsonl at HTTP 200 — a POST that claims server-side state, and was passed by the old guard',
+    ],
+    [
+      'POST',
+      '/v2023-12-18/intake/batch',
+      'observed x1 in proxy-log.jsonl — telemetry ingest; a preview must not post from a branch build either',
+    ],
+    [
+      'PUT',
+      '/v2025-02-19/users/me/keyvalue/studio.structure-tool.layout.article',
+      'the Studio persists pane layout with PUT /users/me/keyvalue — a real write, previously allowed',
+    ],
+    [
+      'DELETE',
+      '/v2025-02-19/users/me/keyvalue/studio.announcement.seen',
+      'the delete side of the same key-value store',
+    ],
+    ['POST', '/v2025-02-19/users/me', 'any non-GET on the user endpoint is a write'],
+    [
+      'POST',
+      '/v2025-02-19/schedules/' + PID + '/' + DS,
+      'scheduling a publish is a deferred document write, and it lives nowhere near /data',
+    ],
+    [
+      'DELETE',
+      '/v2025-02-19/schedules/' + PID + '/' + DS + '/sched-1',
+      'deleting a schedule is a write to the same plane',
+    ],
+    ['POST', '/v2022-06-30/socket/' + DS, 'the presence socket is a GET upgrade; a POST to it is not a read'],
+    ['POST', '/v2023-12-11/journey/trial', 'non-GET on a journey endpoint is not a read'],
+    ['POST', '/v2025-02-19/features', 'non-GET on the feature endpoint is not a read'],
+
+    /* ---- the complement: paths nobody has ever enumerated ---------------- */
+    ['PATCH', '/', 'the root path with a write verb is a write'],
+    ['POST', '/', 'the root path with a write verb is a write'],
+    ['PROPFIND', '/v2025-02-19/anything', 'an unrecognised verb on an unrecognised path is a write'],
+    [
+      'POST',
+      '/v2025-02-19/agent/oTu7RImef/bundles/mine/listen',
+      'the agent bundle listener is allowlisted for GET/HEAD only — a POST to it is a write',
+    ],
+    [
+      'POST',
+      'projects/' + PID + '/tokens',
+      'the whole normalisation class applies to default-deny too: no leading slash is the same endpoint',
+    ],
+
+    /* ---- GET/HEAD to unknown paths (the documented ruling) --------------- *
+     * RULING: GET/HEAD passthrough is allowlist-only. An unknown path is
+     * blocked whatever the verb. The tradeoff — a Sanity read endpoint nobody
+     * has observed yet returns 403 until it is added — is accepted: the
+     * failure is loud, local and one log line away from a fix, whereas the
+     * other direction (allow unknown GET) reinstates exactly the assumption
+     * Spike F destroyed, that we can recognise a writer by looking at it.
+     */
+    [
+      'GET',
+      '/v2025-02-19/data/frobnicate/' + DS,
+      'an unknown data-plane operation is blocked for GET too — /data is where writers live',
+    ],
+    ['HEAD', '/v2025-02-19/data/frobnicate/' + DS, 'HEAD on an unknown data-plane operation'],
+    ['GET', '/v2025-02-19/some/future/api', 'GET to a path outside the read allowlist'],
+    ['GET', '/nonexistent/endpoint', 'GET to a path nobody has ever observed'],
+    ['HEAD', '/v2025-02-19/telemetry/whatever', 'HEAD to a path outside the read allowlist'],
+    ['GET', '/', 'the API-host root is not a read endpoint of ours'],
+    [
+      'GET',
+      '/v2025-02-19/projects/' + PID + '/datasets/' + DS + '/frobnicate',
+      'an unknown resource-scoped operation is blocked even for GET',
+    ],
+  ] as [string, string, string][]
+).map(([method, url, why]) => ({
+  group: 'default-deny' as const,
+  method,
+  url,
+  write: true,
+  why,
+}))
+
+/**
+ * Gap class 6 in full: *every* mutating verb against paths the allowlist has
+ * never heard of. Written as a cross product rather than a handful of examples
+ * because the rule being pinned is "the verb does not matter and the path does
+ * not matter" — one POST and one PUT would leave a guard that special-cases
+ * DELETE looking perfectly healthy.
+ */
+const UNRECOGNISED_PATHS: [string, string][] = [
+  ['/v2025-02-19/some/future/api', 'an endpoint that does not exist yet'],
+  ['/nonexistent/endpoint', 'a path nobody has ever observed'],
+  ['/v2025-02-19/projects/' + PID + '/datasets/' + DS + '/frobnicate', 'an unknown resource-scoped op'],
+  ['/v2025-02-19/data/frobnicate/' + DS, 'an unknown data-plane op'],
+  ['/v2025-02-19/agent/some-future-surface', 'an unknown /agent/* surface'],
+  ['/v2025-02-19/assets/some-future-surface', 'an unknown /assets/* surface'],
+]
+
+const DEFAULT_DENY_VERB_MATRIX: WriteGuardCase[] = UNRECOGNISED_PATHS.flatMap(([url, what]) =>
+  WRITE_METHODS.map((method) => ({
+    group: 'default-deny' as const,
+    method,
+    url,
+    write: true,
+    why: `${method} to ${what} — default-deny applies to every mutating verb`,
+  })),
+)
+
+/* ------------------------------------------------------------------ *
+ * 7. Spike F attack shapes, promoted into permanent classifier vectors
+ * ------------------------------------------------------------------ *
+ * PRD §35.14 / Spike F follow-up: "promote attacks 18–27 into the permanent
+ * security suite so regressions re-surface." All 27 are here, not just the ten
+ * that escaped — the ones that were blocked are exactly the ones a future
+ * refactor could un-block without noticing.
+ *
+ * Each vector is the request line the attack puts on the wire (from
+ * `examples/kitchen-sink/spikeF/attackPass.ts` plus @sanity/client's URL
+ * builders), with the body shape recorded for traceability. Several attacks
+ * share a request line — that is the finding, not a duplicate: eight different
+ * client-side escape hatches all land on `POST /data/mutate`, which is why the
+ * network layer, not the facade, is where they are stopped.
+ */
+
+interface AttackVectorSpec {
+  attack: number
+  attackName: string
+  method: string
+  url: string
+  body: string
+  write: boolean
+  why: string
+  gap?: number
+}
+
+const ATTACK_VECTOR_SPECS: AttackVectorSpec[] = [
+  {attack: 1, attackName: '01.client.create', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true&returnDocuments=true&visibility=sync', body: '{"mutations":[{"create":{…}}]}', write: true, why: 'client.create()'},
+  {attack: 2, attackName: '02.client.createOrReplace', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true&visibility=sync', body: '{"mutations":[{"createOrReplace":{…}}]}', write: true, why: 'client.createOrReplace()'},
+  {attack: 3, attackName: '03.client.createIfNotExists', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true&returnDocuments=true', body: '{"mutations":[{"createIfNotExists":{…}}]}', write: true, why: 'client.createIfNotExists()'},
+  {attack: 4, attackName: '04.client.delete', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true', body: '{"mutations":[{"delete":{"id":"…"}}]}', write: true, why: 'client.delete() — a destructive write over the mutation endpoint'},
+  {attack: 5, attackName: '05.client.mutate.promise', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS, body: '{"mutations":[…]}', write: true, why: 'client.mutate(), promise flavour'},
+  {attack: 6, attackName: '06.client.observable.mutate', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?visibility=sync', body: '{"mutations":[…]}', write: true, why: 'client.observable.mutate() — a different object, the same request line'},
+  {attack: 7, attackName: '07.client.patch.commit', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true&returnDocuments=true', body: '{"mutations":[{"patch":{"id":"…","set":{…}}}]}', write: true, why: 'patch().commit()'},
+  {attack: 8, attackName: '08.client.transaction.commit', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnDocuments=false', body: '{"mutations":[…]}', write: true, why: 'transaction().commit()'},
+  {attack: 9, attackName: '09.client.action.publish', method: 'POST', url: '/v2025-02-19/data/actions/' + DS, body: '{"actions":[{"actionType":"sanity.action.document.publish",…}]}', write: true, why: 'client.action() — the Studio 4 publish path'},
+  {attack: 10, attackName: '10.client.withConfig.observable.action', method: 'POST', url: '/v2025-02-19/data/actions/' + DS, body: '{"actions":[{"actionType":"sanity.action.document.publish",…}]}', write: true, why: 'withConfig().observable.action() — a re-configured clone reaching the Actions API'},
+  {attack: 11, attackName: '11.client.request.dataMutate', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS, body: '{"mutations":[{"createOrReplace":{…}}]}', write: true, why: 'raw request({url:"/data/mutate/…"})'},
+  {attack: 12, attackName: '12.client.dataRequest.mutate', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true&returnDocuments=true&visibility=sync', body: '{"mutations":[…]}', write: true, why: "dataRequest('mutate') — one level below client.mutate()"},
+  {attack: 13, attackName: '13.client.dataRequest.actions', method: 'POST', url: '/v2025-02-19/data/actions/' + DS, body: '{"actions":[{"actionType":"sanity.action.document.create",…}]}', write: true, why: "dataRequest('actions')"},
+  {attack: 14, attackName: '14.client.withConfig.datasetOverride', method: 'POST', url: '/v2025-02-19/data/mutate/scratch', body: '{"mutations":[{"create":{…}}]}', write: true, why: 'a dataset-swapped clone writes to a DIFFERENT dataset — the rule is per-endpoint, not per-dataset (PRD §11.3)'},
+  {attack: 15, attackName: '15.client.withConfig.apiVersion.mutate', method: 'POST', url: '/v2021-03-25/data/mutate/' + DS, body: '{"mutations":[…]}', write: true, why: 'an old API version is still the mutation endpoint'},
+  {attack: 16, attackName: '16.client.clone.mutate', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?visibility=async', body: '{"mutations":[…]}', write: true, why: 'clone().mutate()'},
+  {attack: 17, attackName: '17.client.config.reconfigureEscape', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnDocuments=true', body: '{"mutations":[{"create":{…}}]}', write: true, why: 'config(newConfig) hands back the UNWRAPPED client — which still has to use this endpoint'},
+  {attack: 18, attackName: '18.patch.clone.commit', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true&returnDocuments=true&visibility=sync', body: '{"mutations":[{"patch":{…}}]}', write: true, why: 'Patch.clone() escaped the facade (Spike F gap 18) — the proxy is where it is stopped'},
+  {attack: 19, attackName: '19.transaction.clone.commit', method: 'POST', url: '/v2025-02-19/data/mutate/' + DS + '?returnIds=true&visibility=sync', body: '{"mutations":[{"createOrReplace":{…}}]}', write: true, why: 'Transaction.clone() escaped the facade (Spike F gap 19)'},
+  {attack: 20, attackName: '20.client.request.relativeUrlBypass', method: 'POST', url: 'data/mutate/' + DS, body: '{"mutations":[{"createOrReplace":{…}}]}', write: true, why: 'no leading slash — the exact string _getUrl() produces', gap: 20},
+  {attack: 21, attackName: '21.client.request.assetsEndpoint', method: 'POST', url: '/assets/images/' + DS + '?filename=spike-f-canary.txt', body: 'raw bytes (text/plain masquerading as image/png)', write: true, why: 'raw request() to the asset endpoint', gap: 21},
+  {attack: 22, attackName: '22.client.assets.upload', method: 'POST', url: 'assets/images/' + DS + '?filename=spike-f-canary.png', body: 'Blob (image/png)', write: true, why: 'client.assets.upload() — buildAssetUploadUrl() emits NO leading slash, so this is gaps 20 and 21 at once', gap: 21},
+  {attack: 23, attackName: '23.client.agent.action.patch', method: 'POST', url: '/v2025-02-19/agent/action/patch/' + DS, body: '{"schemaId":"…","documentId":"…","target":{"operation":"set",…}}', write: true, why: 'Agent Actions patch — the endpoint the old proxy allowlist explicitly passed', gap: 23},
+  {attack: 24, attackName: '24.client.datasets.reachable (probe)', method: 'GET', url: '/v2025-02-19/datasets', body: '(none)', write: false, why: 'the probe itself is datasets.list(), a read — recorded so the vector set matches the attack suite exactly'},
+  {attack: 24, attackName: '24.client.datasets.reachable (create)', method: 'PUT', url: '/v2025-02-19/datasets/spike-f-canary-ds', body: '{"aclMode":"private"}', write: true, why: 'what the reachable sub-client can actually do: datasets.create()', gap: 24},
+  {attack: 24, attackName: '24.client.datasets.reachable (delete)', method: 'DELETE', url: '/v2025-02-19/datasets/' + DS, body: '(none)', write: true, why: 'datasets.delete() — the whole dataset', gap: 24},
+  {attack: 24, attackName: '24.client.datasets.reachable (copy)', method: 'POST', url: '/v2025-02-19/datasets/' + DS + '/copy', body: '{"targetDataset":"…"}', write: true, why: 'datasets.copy() writes a new dataset'},
+  {attack: 25, attackName: '25.freshClient.create', method: 'POST', url: 'https://' + PID + '.api.sanity.io/v2025-02-19/data/mutate/' + DS, body: '{"mutations":[{"create":{…}}]}', write: true, why: 'a brand-new createClient() never touches the facade — but it still has to cross the proxy'},
+  {attack: 26, attackName: '26.rawFetch.dataMutate', method: 'POST', url: 'https://' + PID + '.api.sanity.io/v2025-02-19/data/mutate/' + DS + '?returnIds=true', body: '{"mutations":[{"createOrReplace":{…}}]}', write: true, why: 'raw fetch() with a stolen token — the architectural hole a network guard exists to close'},
+]
+
+const SPIKE_F_ATTACKS: WriteGuardCase[] = ATTACK_VECTOR_SPECS.map((spec) => ({
+  group: 'spike-f-attacks' as const,
+  method: spec.method,
+  url: spec.url,
+  write: spec.write,
+  why: spec.why,
+  attack: spec.attack,
+  attackName: spec.attackName,
+  body: spec.body,
+  ...(spec.gap === undefined ? {} : {gap: spec.gap}),
+}))
+
+/**
+ * Spike F attacks with no request shape to classify. Recorded explicitly so
+ * the coverage test can prove all 27 are accounted for rather than silently
+ * skipping the awkward one.
+ */
+export const SPIKE_F_UNCLASSIFIABLE_ATTACKS: readonly {
+  attack: number
+  attackName: string
+  why: string
+}[] = Object.freeze([
+  {
+    attack: 27,
+    attackName: '27.credentials.exfiltration',
+    why:
+      'Reading a write-capable token out of localStorage / client.config() puts NOTHING on the wire, ' +
+      'so no request classifier can see it. It is closed by §5.2 (no write-capable credential in the ' +
+      'preview environment) and by the CI token scan (§11.3), not by this guard. Its consequence — ' +
+      'the write the stolen token then performs — is attack 26, which IS classified above.',
+  },
+])
+
+/** Every Spike F attack number, 1..27. */
+export const SPIKE_F_ATTACK_NUMBERS: readonly number[] = Object.freeze(
+  Array.from({length: 27}, (_unused, index) => index + 1),
+)
+
+/** The promoted attack vectors, for callers that want just this group. */
+export function spikeFAttackVectors(): WriteGuardCase[] {
+  return SPIKE_F_ATTACKS.slice()
+}
 
 /** Every case in the contract, in group order. */
 export const WRITE_GUARD_CASES: readonly WriteGuardCase[] = Object.freeze([
@@ -448,6 +830,9 @@ export const WRITE_GUARD_CASES: readonly WriteGuardCase[] = Object.freeze([
   ...READ_PASSTHROUGH,
   ...METHODS,
   ...FAIL_CLOSED,
+  ...DEFAULT_DENY,
+  ...DEFAULT_DENY_VERB_MATRIX,
+  ...SPIKE_F_ATTACKS,
 ])
 
 const GROUP_ORDER: WriteGuardGroup[] = [
@@ -456,6 +841,8 @@ const GROUP_ORDER: WriteGuardGroup[] = [
   'read-passthrough',
   'methods',
   'fail-closed',
+  'default-deny',
+  'spike-f-attacks',
 ]
 
 const GROUP_TITLES: Record<WriteGuardGroup, string> = {
@@ -464,6 +851,8 @@ const GROUP_TITLES: Record<WriteGuardGroup, string> = {
   'read-passthrough': 'read passthrough class (blocking these breaks the Studio)',
   methods: 'method class',
   'fail-closed': 'fail-closed class',
+  'default-deny': 'default-deny class (unknown endpoint = blocked write)',
+  'spike-f-attacks': 'Spike F attack shapes, promoted (PRD §35.14)',
 }
 
 /** The six Spike F escapes this contract stands guard over. */
@@ -488,7 +877,8 @@ export function runWriteGuardContract(name: string, isWrite: WriteGuardPredicate
         for (const c of cases) {
           const verdict = c.write ? 'BLOCKS' : 'ALLOWS'
           const gap = c.gap === undefined ? '' : ` [Spike F gap ${c.gap}]`
-          it(`${verdict} ${c.method || '<no method>'} ${c.url} — ${c.why}${gap}`, () => {
+          const attack = c.attackName === undefined ? '' : `${c.attackName} · `
+          it(`${verdict} ${attack}${c.method || '<no method>'} ${c.url} — ${c.why}${gap}`, () => {
             expect(isWrite({method: c.method, url: c.url})).toBe(c.write)
           })
         }
@@ -497,16 +887,48 @@ export function runWriteGuardContract(name: string, isWrite: WriteGuardPredicate
 
     describe('contract integrity', () => {
       // A URL may legitimately appear in more than one group — the same request
-      // is asserted there for a different reason. Within a group it is noise.
+      // is asserted there for a different reason. Within a group it is noise,
+      // EXCEPT in the Spike F group: eight distinct client-side escape hatches
+      // put the identical request line on the wire, and recording each attack
+      // separately is the point of promoting them. There the key is the attack.
       it('has no duplicate cases inside a group', () => {
         const seen = new Set<string>()
         const dupes: string[] = []
         for (const c of WRITE_GUARD_CASES) {
-          const key = `${c.group} ${c.method} ${c.url}`
+          const key =
+            c.attack === undefined
+              ? `${c.group} ${c.method} ${c.url}`
+              : `${c.group} #${c.attack} ${c.method} ${c.url}`
           if (seen.has(key)) dupes.push(key)
           else seen.add(key)
         }
         expect(dupes).toEqual([])
+      })
+
+      it('carries a classifier vector for every one of the 27 Spike F attacks', () => {
+        const classified = new Set(SPIKE_F_ATTACKS.map((c) => c.attack))
+        const excused = new Set(SPIKE_F_UNCLASSIFIABLE_ATTACKS.map((a) => a.attack))
+        const missing = SPIKE_F_ATTACK_NUMBERS.filter(
+          (n) => !classified.has(n) && !excused.has(n),
+        )
+        expect(missing).toEqual([])
+      })
+
+      it('does not excuse an attack that has a request shape', () => {
+        // The escape hatch (SPIKE_F_UNCLASSIFIABLE_ATTACKS) must stay tiny and
+        // justified, or "promoted" degrades into "listed".
+        const excused = SPIKE_F_UNCLASSIFIABLE_ATTACKS.map((a) => a.attack)
+        expect(excused).toEqual([27])
+        for (const entry of SPIKE_F_UNCLASSIFIABLE_ATTACKS) {
+          expect(entry.why.length).toBeGreaterThan(80)
+        }
+      })
+
+      it('asserts BLOCKED for every Spike F attack that puts a write on the wire', () => {
+        // Attack 24's probe is a read (datasets.list()); everything else in the
+        // promoted set is a write and must be expected to block.
+        const notBlocked = SPIKE_F_ATTACKS.filter((c) => !c.write).map((c) => c.attackName)
+        expect(notBlocked).toEqual(['24.client.datasets.reachable (probe)'])
       })
 
       it('never expects two different answers for the same request', () => {

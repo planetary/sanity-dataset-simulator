@@ -9,6 +9,14 @@ import {applyOverlay, type SpikeOverlay} from './overlay'
 export type CandidatePlan =
   | {type: 'ids'; idsFromParams: string[]}
   | {type: 'ids-literal'; ids: string[]}
+  /**
+   * PRD §22.7 "exact slug-filtered pages plus all overlaid page documents":
+   * `filter` is the GROQ a real implementation issues to Sanity, so only the
+   * documents it RETURNS enter the candidate set. Exact only when the filter
+   * reads local fields of `types` — a predicate that traverses a reference can
+   * gain matches when the TARGET is edited, and needs §22.6 step 10 instead.
+   */
+  | {type: 'base-filter'; types: string[]; filter: string}
   | {type: 'slug'; docType: string}
   | {type: 'types'; types: string[]}
   | {type: 'top-k'; docType: string; orderField: string; sliceEnd: number}
@@ -80,22 +88,42 @@ export async function evaluateRegistered<T = unknown>(
     const ids = plan.type === 'ids' ? plan.idsFromParams.map((p) => String(params[p])) : plan.ids
     for (const id of ids) add(id)
     // an overlay doc may have been created at a requested id — covered by add()
+  } else if (plan.type === 'base-filter') {
+    // Server-side filtered fetch (§22.6 step 5). Only the returned documents
+    // are candidates: this is what makes the plan bounded rather than a scan.
+    const matched = await runGroq<Array<{_id: string}>>(plan.filter, base, params)
+    for (const d of matched) add(d._id)
+    // Step 6: any branch record of the candidate types can newly match.
+    for (const [id, d] of overlay.documents) {
+      if (plan.types.includes(d._type) || plan.types.includes(baseById.get(id)?._type ?? '')) {
+        add(id)
+      }
+    }
   } else if (plan.type === 'slug' || plan.type === 'types') {
     const types = plan.type === 'slug' ? [plan.docType] : plan.types
     for (const d of base) if (types.includes(d._type)) add(d._id)
     for (const [id, d] of overlay.documents) if (types.includes(d._type)) add(id)
   } else if (plan.type === 'top-k') {
-    // §22.6 bounded top-K: baseFetchCount = requestedEnd + affectedCount
+    // §22.6 bounded top-K. `affected` is every id whose membership or order in
+    // the candidate type can differ from base — including a branch record that
+    // moves a document OUT of the type, which the base `_type` reveals and the
+    // overlay `_type` hides.
     const affected = new Set<string>()
-    for (const [id, d] of overlay.documents) if (d._type === plan.docType) affected.add(id)
+    for (const [id, d] of overlay.documents) {
+      if (d._type === plan.docType || baseById.get(id)?._type === plan.docType) affected.add(id)
+    }
     for (const id of overlay.tombstones) {
       if (baseById.get(id)?._type === plan.docType) affected.add(id)
     }
-    const baseFetchCount = plan.sliceEnd + affected.size
+    // Fetch the top K of the UNTOUCHED base order, then union the affected
+    // records: an untouched base document with K untouched documents ordered
+    // above it keeps them all above it after resolution, so it cannot enter the
+    // requested slice. That makes `sliceEnd + affected.size` exact — fetching
+    // sliceEnd + affected and THEN adding affected on top over-fetches.
     const baseTop = base
-      .filter((d) => d._type === plan.docType)
+      .filter((d) => d._type === plan.docType && !affected.has(d._id))
       .sort((a, b) => String(b[plan.orderField]).localeCompare(String(a[plan.orderField])))
-      .slice(0, baseFetchCount)
+      .slice(0, plan.sliceEnd)
     for (const d of baseTop) add(d._id)
     for (const id of affected) add(id)
   }
@@ -119,7 +147,21 @@ export async function evaluateRegistered<T = unknown>(
     frontier = next
   }
 
-  const dataset = [...candidates.values()]
+  // Candidate sets are unordered, but GROQ document order is NOT: an unordered
+  // `*[...][0]` returns the first document in DATASET order. The candidate set
+  // must therefore be presented in the same order `applyOverlay` produces —
+  // base order first, then branch-created documents — or a plan that happens to
+  // discover matches in a different order silently returns a different document.
+  const baseIndex = new Map(base.map((d, i) => [d._id, i]))
+  const overlayIndex = new Map([...overlay.documents.keys()].map((id, i) => [id, i]))
+  const dataset = [...candidates.values()].sort((a, b) => {
+    const ai = baseIndex.get(a._id)
+    const bi = baseIndex.get(b._id)
+    if (ai !== undefined && bi !== undefined) return ai - bi
+    if (ai !== undefined) return -1
+    if (bi !== undefined) return 1
+    return (overlayIndex.get(a._id) ?? 0) - (overlayIndex.get(b._id) ?? 0)
+  })
   const result = await runGroq<T>(def.query, dataset, params)
   return {
     result,

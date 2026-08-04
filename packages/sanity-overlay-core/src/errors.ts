@@ -30,6 +30,9 @@ export type OverlayErrorCode =
   | 'OVERLAY_ID_CHANGE_NOT_ALLOWED'
   | 'OVERLAY_ACTION_BLOCKED'
   | 'OVERLAY_TRANSACTION_INVALID'
+  /* W4 — references (PRD §19.4 truncation, §19.5 integrity). */
+  | 'OVERLAY_REFERENCE_DEPTH_EXCEEDED'
+  | 'OVERLAY_REFERENCE_INTEGRITY'
 
 export interface OverlayErrorDetails {
   readonly [key: string]: unknown

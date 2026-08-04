@@ -58,7 +58,23 @@
 // capture the real rxjs `Observable` constructor off an observable produced by
 // the real client, so every synthetic stream we hand back to Studio is a
 // genuine rxjs Observable with working `pipe`/`lift`/interop.
+//
+// PROTOCOL / WIRING SPLIT (added with the §18.4-§18.9 document-action echo)
+// Everything that decides *what Studio is told* — the revision store, the
+// subscriber registry, the plan → frame builder and the intercepted-write
+// planner — now lives in `echoProtocol.ts`, which is pure and unit tested by
+// `packages/sanity-overlay-testkit/test/{action-echo,listener-matrix}.test.ts`.
+// This file is what is left once that is taken out: flags, logging, rxjs, the
+// identity-stable proxies, and the HTTP round-trip to the overlay server.
 import type {SanityClient} from '@sanity/client'
+import {
+  createEchoProtocol,
+  type EchoMutationEvent,
+  type EchoPlan,
+  type PlannedEvent,
+} from './echoProtocol'
+
+export type {EchoMutationEvent, PlannedEvent} from './echoProtocol'
 
 /* ------------------------------------------------------------------ types */
 
@@ -93,6 +109,23 @@ export interface EchoListenEntry {
   tag?: string
 }
 
+/** Disk-persistence counters, mirrored onto `window.__SPIKE_ECHO__.persist`. */
+export interface EchoPersistLog {
+  /** `localStorage.SPIKE_OVERLAY_PERSIST === '1'` */
+  enabled: boolean
+  url: string
+  /** null until the boot-time `GET /state` settles; false if it failed. */
+  hydrated: boolean | null
+  /** documents replayed out of the overlay into Studio's panes */
+  replayed: number
+  /** writes the server accepted and wrote to `.sanity-overlay/` */
+  committed: number
+  /** writes the server accepted but could not translate into overlay mutations */
+  unsupported: string[]
+  /** writes that did NOT reach disk — the failure mode this spike must never hide */
+  failed: number
+}
+
 export interface EchoLog {
   enabled: boolean
   blocked: EchoBlockedEntry[]
@@ -101,6 +134,7 @@ export interface EchoLog {
   /** documentId -> current (possibly synthetic) revision */
   revs: Record<string, string | undefined>
   errors: string[]
+  persist: EchoPersistLog
 }
 
 declare global {
@@ -129,24 +163,6 @@ type ObservableCtor = new <T>(
   onSubscribe: (subscriber: EchoSubscriber<T>) => Teardown,
 ) => MinimalObservable<T>
 
-/** Listener mutation event, matching the captured pair-listener shape. */
-export interface EchoMutationEvent {
-  type: 'mutation'
-  eventId: string
-  documentId: string
-  transactionId: string
-  transition: 'update' | 'appear' | 'disappear'
-  identity: string
-  mutations: Record<string, unknown>[]
-  previousRev?: string
-  resultRev: string
-  timestamp: string
-  visibility: 'transaction'
-  transactionCurrentEvent: number
-  transactionTotalEvents: number
-  projection: null
-}
-
 type Rec = Record<string, unknown>
 
 /* -------------------------------------------------------------- flag + log */
@@ -170,6 +186,44 @@ export function isEchoEnabled(): boolean {
   return value
 }
 
+/**
+ * `localStorage.SPIKE_OVERLAY_PERSIST === '1'` routes every intercepted write to
+ * the overlay server (`spikeA/runOverlayServer.mjs`) so it lands in
+ * `.sanity-overlay/` and survives a reload.
+ *
+ * Independent of `SPIKE_LOCAL_ECHO` on purpose: persistence is a strict addition
+ * to the echo, never a replacement. With this flag off — or with the server down
+ * — the facade behaves exactly as it did before, in memory only.
+ */
+let persistCache: boolean | undefined
+
+export function isPersistEnabled(): boolean {
+  if (persistCache !== undefined) return persistCache
+  let value = false
+  try {
+    value =
+      typeof window !== 'undefined' &&
+      window.localStorage.getItem('SPIKE_OVERLAY_PERSIST') === '1'
+  } catch {
+    value = false
+  }
+  persistCache = value
+  return value
+}
+
+const DEFAULT_OVERLAY_URL = 'http://localhost:3998'
+
+/** `localStorage.SPIKE_OVERLAY_URL` overrides the default port. */
+function overlayUrl(): string {
+  try {
+    const configured = window.localStorage.getItem('SPIKE_OVERLAY_URL')
+    if (configured) return configured.replace(/\/+$/, '')
+  } catch {
+    /* private mode / blocked storage — fall through to the default */
+  }
+  return DEFAULT_OVERLAY_URL
+}
+
 const MAX_ENTRIES = 2000
 
 function echoLog(): EchoLog | null {
@@ -181,8 +235,29 @@ function echoLog(): EchoLog | null {
     listens: [],
     revs: {},
     errors: [],
+    persist: {
+      enabled: false,
+      url: DEFAULT_OVERLAY_URL,
+      hydrated: null,
+      replayed: 0,
+      committed: 0,
+      unsupported: [],
+      failed: 0,
+    },
   }
   return window.__SPIKE_ECHO__
+}
+
+/**
+ * A persistence failure is the one thing this spike must never swallow: the user
+ * saw "saved" in Studio, so if the write did not reach disk they have to be told.
+ */
+function persistFailure(message: string, error?: unknown): void {
+  const detail = error === undefined ? message : `${message}: ${String(error)}`
+  const log = echoLog()
+  if (log) log.persist.failed += 1
+  noteError(`overlay persist: ${detail}`)
+  console.error(`[spike-a] overlay persistence FAILED — the edit is in memory only. ${detail}`)
 }
 
 function pushCapped<T>(arr: T[], entry: T): void {
@@ -246,69 +321,42 @@ function recordBlocked(
   })
 }
 
-/* ------------------------------------------------------- transaction ids */
-
-let txCounter = 0
-
-/** Deterministic, readable, collision-free-enough ids: `local-echo-<n>-<hash>`. */
-function nextTransactionId(): string {
-  txCounter += 1
-  // deterministic pseudo-random suffix derived from the counter (Knuth multiplicative)
-  const suffix = ((txCounter * 2654435761) % 4294967296).toString(36).padStart(6, '0').slice(-6)
-  return `local-echo-${txCounter}-${suffix}`
-}
-
-/* --------------------------------------------------------- revision store */
-
-interface DocState {
-  rev?: string
-  updatedAt?: string
-  /** last known full document, used to seed a synthetic draft create */
-  doc?: Rec
-  /** true once the revision chain for this doc is local-echo-owned */
-  synthetic?: boolean
-}
-
-const docs = new Map<string, DocState>()
-
-function setDocState(id: string, patch: DocState): void {
-  const current = docs.get(id) ?? {}
-  const next = {...current, ...patch}
-  docs.set(id, next)
-  const log = echoLog()
-  if (log) log.revs[id] = next.rev
-}
+/* --------------------------------------------------------- the protocol */
 
 /**
- * `authoritative` = this read is the thing Studio itself resets its base
- * revision from (the pair listener's `getDocuments` snapshot fetch).
- * A non-authoritative read (e.g. the preview store's `*[_id in $ids]` batch
- * fetch) still returns the STALE server revision once we start blocking writes;
- * letting it overwrite a synthetic revision would silently break the
- * previousRev -> resultRev chain and blow up 30s later in
- * sequentializeListenerEvents with a DeadlineExceededError.
+ * The single protocol instance for this page.
+ *
+ * All the state that used to be module-level here — the revision store, the
+ * listener registry, the transaction counter — is inside it, so it can be
+ * constructed fresh (and driven with an injected clock) in tests.
  */
-function seedFromDocument(value: unknown, authoritative: boolean): void {
-  if (!isRec(value)) return
-  const id = value._id
-  if (typeof id !== 'string') return
-  const current = docs.get(id)
-  if (!authoritative && current?.synthetic) return
-  setDocState(id, {
-    rev: typeof value._rev === 'string' ? value._rev : undefined,
-    updatedAt: typeof value._updatedAt === 'string' ? value._updatedAt : undefined,
-    doc: authoritative ? (value as Rec) : current?.doc,
-    synthetic: false,
-  })
+const protocol = createEchoProtocol({
+  onError: (message) => noteError(message),
+  onEmit: (event, delivered) => {
+    const log = echoLog()
+    if (!log) return
+    pushCapped(log.emitted, {
+      at: now(),
+      documentId: event.documentId,
+      transactionId: event.transactionId,
+      previousRev: event.previousRev,
+      resultRev: event.resultRev,
+      transition: event.transition,
+      mutationCount: event.mutations.length,
+      delivered,
+    })
+    log.revs[event.documentId] = event.transition === 'disappear' ? undefined : event.resultRev
+  },
+})
+
+function nextTransactionId(): string {
+  return protocol.nextTransactionId()
 }
 
-/** Seed revisions from any read result: a document, or an array of documents. */
 function seedFromResult(value: unknown, authoritative: boolean): void {
-  if (Array.isArray(value)) {
-    for (const item of value) seedFromDocument(item, authoritative)
-    return
-  }
-  seedFromDocument(value, authoritative)
+  protocol.seedFromResult(value, authoritative)
+  const log = echoLog()
+  if (log) Object.assign(log.revs, protocol.revisions())
 }
 
 /* ------------------------------------------------- rxjs Observable capture */
@@ -347,7 +395,15 @@ function probeObservableCtor(client: Rec): void {
  * against it, so hitting this path is itself a finding — check __SPIKE_ECHO__.errors.
  */
 class ShimObservable<T> implements MinimalObservable<T> {
-  constructor(private readonly onSubscribe: (subscriber: EchoSubscriber<T>) => Teardown) {}
+  /* Written out rather than declared as a constructor parameter property: those
+   * are not erasable syntax, so they break `node --experimental-strip-types`,
+   * which is how this module is loaded outside Vite. */
+  readonly #onSubscribe: (subscriber: EchoSubscriber<T>) => Teardown
+
+  constructor(onSubscribe: (subscriber: EchoSubscriber<T>) => Teardown) {
+    this.#onSubscribe = onSubscribe
+  }
+
   subscribe(observer: Partial<EchoSubscriber<T>>): EchoSubscription {
     let closed = false
     const subscriber: EchoSubscriber<T> = {
@@ -367,7 +423,7 @@ class ShimObservable<T> implements MinimalObservable<T> {
         }
       },
     }
-    const teardown = this.onSubscribe(subscriber)
+    const teardown = this.#onSubscribe(subscriber)
     return {
       unsubscribe: () => {
         closed = true
@@ -424,256 +480,311 @@ function mergeObservables<T>(sources: MinimalObservable<T>[]): MinimalObservable
 
 /* ---------------------------------------------------- local event emitter */
 
-type EchoListener = (event: EchoMutationEvent) => void
-const echoListeners = new Set<EchoListener>()
-
+/**
+ * A never-completing stream of the protocol's frames scoped to `ids` — one
+ * pair-listener subscription. Unsubscribing releases the protocol subscription
+ * too, which is §21.4.1 criterion 4.
+ */
 function localEvents(ids: string[]): MinimalObservable<EchoMutationEvent> {
   return makeObservable<EchoMutationEvent>((subscriber) => {
-    const listener: EchoListener = (event) => {
-      if (ids.includes(event.documentId)) subscriber.next(event)
-    }
-    echoListeners.add(listener)
-    // never completes — mirrors a live listen stream
-    return () => {
-      echoListeners.delete(listener)
-    }
+    const subscription = protocol.subscribe(ids, (event) => subscriber.next(event))
+    return () => subscription.unsubscribe()
   })
 }
 
-function deliver(event: EchoMutationEvent): number {
-  let delivered = 0
-  for (const listener of Array.from(echoListeners)) {
-    try {
-      listener(event)
-      delivered += 1
-    } catch (err) {
-      noteError(`echo listener threw: ${String(err)}`)
-    }
-  }
-  const log = echoLog()
-  if (log) {
-    pushCapped(log.emitted, {
-      at: now(),
-      documentId: event.documentId,
-      transactionId: event.transactionId,
-      previousRev: event.previousRev,
-      resultRev: event.resultRev,
-      transition: event.transition,
-      mutationCount: event.mutations.length,
-      delivered,
-    })
-  }
-  return delivered
-}
-
-/* ---------------------------------------------------------- event builder */
-
-const GUARD_FIELD = '_empty_action_guard_pseudo_field_'
-const IDENTITY = 'local-echo'
+/* -------------------------------------------------- plan -> delivery */
 
 /**
- * `Document.considerIncoming` drops incoming mutations whose timestamp predates
- * HEAD._updatedAt. Guard against local clock skew by always moving forward.
+ * Hand a planned transaction to the protocol on a macrotask.
+ *
+ * The delay is behaviour, not politeness: Studio's action-result handler pops
+ * the mutation off its "submitted" buffer, and it must run before the listener
+ * frame arrives - which is the ordering the real server produces, where the HTTP
+ * response precedes the event. The frames themselves (revision chaining,
+ * per-listener event counts, the guard patch, the create-first rule) are built
+ * inside `echoProtocol.emit`.
  */
-function nextTimestamp(state: DocState | undefined): string {
-  const wall = Date.now()
-  const known = state?.updatedAt ? Date.parse(state.updatedAt) : NaN
-  const ms = Number.isFinite(known) && known >= wall ? known + 1 : wall
-  return new Date(ms).toISOString()
-}
-
-interface PlannedEvent {
-  documentId: string
-  transition: 'update' | 'appear' | 'disappear'
-  /** patch body (without `id`) for edit actions */
-  patch?: Rec
-  /** pre-built mutations, used by the raw-mutate path */
-  mutations?: Rec[]
-  /** when creating a draft: id of the published document to clone from */
-  cloneFrom?: string
-}
-
-/**
- * Build the wire event at DELIVERY time (not call time) so the previousRev is
- * read from the freshest state — this keeps rapid consecutive edits chained.
- */
-function buildEvent(plan: PlannedEvent, transactionId: string): EchoMutationEvent | null {
-  const state = docs.get(plan.documentId)
-  const previousRev = state?.rev
-  const timestamp = nextTimestamp(state)
-
-  let mutations: Rec[]
-  let transition = plan.transition
-
-  if (plan.mutations) {
-    mutations = plan.mutations
-  } else if (previousRev) {
-    // Existing document: guard patch + real patch, exactly as captured from the
-    // live pair listener (the Actions API always prepends the guard unset).
-    mutations = [
-      {patch: {id: plan.documentId, unset: [GUARD_FIELD], unsetIsEmpty: false}},
-      {patch: {id: plan.documentId, unsetIsEmpty: false, ...(plan.patch ?? {})}},
-    ]
-  } else {
-    // Document not known / does not exist: the Actions API edit creates the
-    // draft from the current published version first. Reproduce that, otherwise
-    // @sanity/mutator refuses the event (appliesToMissingDocument === false).
-    const base = plan.cloneFrom ? docs.get(plan.cloneFrom)?.doc : undefined
-    if (!base) {
-      noteError(
-        `cannot echo ${plan.documentId}: no known revision and no published base to clone ` +
-          `(open the document pane first so the pair snapshot fetch can seed it)`,
-      )
-      return null
-    }
-    const seed: Rec = {...base, _id: plan.documentId}
-    delete seed._rev
-    mutations = [
-      {createIfNotExists: seed},
-      {patch: {id: plan.documentId, unsetIsEmpty: false, ...(plan.patch ?? {})}},
-    ]
-    transition = 'appear'
-  }
-
-  return {
-    type: 'mutation',
-    eventId: `${transactionId}#${plan.documentId}@local`,
-    documentId: plan.documentId,
-    transactionId,
-    transition,
-    identity: IDENTITY,
-    mutations,
-    // omitted entirely (not `undefined`-valued) when unknown: sequentializeListenerEvents
-    // compares `base.revision === chain[0].previousRev`, and a missing draft has base
-    // revision `undefined`.
-    ...(previousRev ? {previousRev} : {}),
-    resultRev: transactionId,
-    timestamp,
-    visibility: 'transaction',
-    // Always 1/1: the real server scopes transactionTotalEvents to the documents
-    // matching *that listener's* filter, and an edit action touches exactly one
-    // document per pair listener. Multi-document transactions (publish) would
-    // need per-listener counting — see the unhandled-actions note below.
-    transactionCurrentEvent: 1,
-    transactionTotalEvents: 1,
-    projection: null,
-    // `effects` deliberately omitted — see file header note 5.
-  }
-}
-
-function scheduleEcho(plans: PlannedEvent[], transactionId: string): void {
+function scheduleEcho(plans: readonly PlannedEvent[], transactionId: string): void {
   if (plans.length === 0) return
-  // Deliver on a macrotask so Studio's action-result handler (which pops the
-  // mutation off the "submitted" buffer) runs first, matching real ordering
-  // where the HTTP response precedes the listener frame.
   setTimeout(() => {
-    for (const plan of plans) {
-      const event = buildEvent(plan, transactionId)
-      if (!event) continue
-      deliver(event)
-      if (event.transition === 'disappear') {
-        setDocState(event.documentId, {
-          rev: undefined,
-          updatedAt: event.timestamp,
-          doc: undefined,
-          synthetic: true,
-        })
-      } else {
-        setDocState(event.documentId, {
-          rev: event.resultRev,
-          updatedAt: event.timestamp,
-          synthetic: true,
-        })
-      }
-    }
+    protocol.emit(plans, transactionId)
   }, 0)
 }
 
-/* ------------------------------------------------------- action -> plans */
 
-function toActionArray(arg: unknown): Rec[] {
-  if (Array.isArray(arg)) return arg.filter(isRec)
-  if (isRec(arg)) return [arg]
-  return []
+/* ------------------------------------------------------ overlay persistence */
+//
+// Everything below is inert unless `SPIKE_OVERLAY_PERSIST === '1'`.
+//
+// Two directions:
+//
+//   write  — every intercepted write is POSTed to `/commit` and AWAITED before
+//            Studio is handed its synthetic success. Studio must never be told
+//            an edit is saved before it is on disk; the server enforces the same
+//            rule on its side (it does not answer until `FsOverlayStore` has
+//            passed its commit point).
+//   read   — on boot, `GET /state` returns the materialized documents the
+//            overlay holds. Each one is replayed into the pane that asks for it
+//            as an ordinary listener frame, which is what makes an edit survive
+//            a reload: Studio's snapshot fetch still returns the untouched
+//            published document, and the overlay's version arrives on top of it.
+
+const PERSIST_ACTOR = {
+  type: 'user',
+  id: 'spike-a-studio',
+  displayName: 'Studio (spike A local echo)',
 }
 
-function planFromActions(actions: Rec[]): {plans: PlannedEvent[]; unhandled: string[]} {
-  const plans: PlannedEvent[] = []
-  const unhandled: string[] = []
-  for (const action of actions) {
-    const type = typeof action.actionType === 'string' ? action.actionType : '<unknown>'
-    const draftId = typeof action.draftId === 'string' ? action.draftId : undefined
-    const publishedId = typeof action.publishedId === 'string' ? action.publishedId : undefined
-    const versionId = typeof action.versionId === 'string' ? action.versionId : undefined
-    const targetId = versionId ?? draftId ?? publishedId
+let sessionCache: string | undefined
 
-    if (type === 'sanity.action.document.edit' || type === 'sanity.action.document.version.replace') {
-      if (!targetId) {
-        unhandled.push(`${type}: no target id`)
-        continue
-      }
-      const patch = isRec(action.patch) ? ({...action.patch} as Rec) : {}
-      delete patch.id
-      delete patch.ifRevisionID
-      plans.push({documentId: targetId, transition: 'update', patch, cloneFrom: publishedId})
-      continue
+/**
+ * A per-page-load identity for idempotency keys.
+ *
+ * `nextTransactionId()` restarts at `local-echo-1` on every reload, so an
+ * unprefixed key would make the FIRST write after a reload collide with the
+ * first write before it — and §34.6 replay would then silently DROP a genuinely
+ * new edit. The session prefix is what keeps "same key" meaning "same write".
+ */
+function sessionId(): string {
+  if (sessionCache !== undefined) return sessionCache
+  let random = Math.random().toString(36).slice(2, 10)
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      random = crypto.randomUUID().slice(0, 8)
+    }
+  } catch {
+    /* keep the Math.random fallback */
+  }
+  sessionCache = `${Date.now().toString(36)}-${random}`
+  return sessionCache
+}
+
+/** Materialized overlay documents, keyed the way Studio addresses them. */
+const overlayDocs = new Map<string, Rec>()
+/** Perspectives the overlay has deleted locally. */
+const overlayTombstones = new Set<string>()
+/** documentId -> base revision we last replayed from, so one snapshot replays once. */
+const replayedFrom = new Map<string, string>()
+
+let hydration: Promise<void> | null = null
+
+interface HydrationDocument {
+  logicalId: string
+  draft: Rec | null
+  published: Rec | null
+  draftTombstone: boolean
+  publishedTombstone: boolean
+}
+
+/**
+ * Adopt the overlay's materialized view of every document it holds.
+ *
+ * Called from boot hydration *and* from every `/commit` response, because the
+ * server is the only party that runs intercepted patches through core. A
+ * document action such as publish has to promote the body the user actually
+ * typed, and this is where the echo layer learns it (`echoProtocol.bodyFor`
+ * reads it back). Without this feed a publish would echo the pre-edit snapshot —
+ * `echoProtocol` says so out loud, but saying so is not fixing it.
+ */
+function absorbOverlayDocuments(documents: HydrationDocument[] | undefined): void {
+  if (!Array.isArray(documents)) return
+  for (const entry of documents) {
+    if (typeof entry?.logicalId !== 'string') continue
+    const draftId = `drafts.${entry.logicalId}`
+
+    if (entry.draftTombstone) {
+      overlayTombstones.add(draftId)
+      protocol.setOverlayDocument(draftId, null)
+    } else if (isRec(entry.draft)) {
+      overlayTombstones.delete(draftId)
+      overlayDocs.set(draftId, entry.draft)
+      protocol.setOverlayDocument(draftId, entry.draft)
     }
 
-    if (
-      type === 'sanity.action.document.discard' ||
-      type === 'sanity.action.document.version.discard' ||
-      type === 'sanity.action.document.delete'
-    ) {
-      if (!targetId) {
-        unhandled.push(`${type}: no target id`)
+    if (entry.publishedTombstone) {
+      overlayTombstones.add(entry.logicalId)
+      protocol.setOverlayDocument(entry.logicalId, null)
+    } else if (isRec(entry.published)) {
+      overlayTombstones.delete(entry.logicalId)
+      overlayDocs.set(entry.logicalId, entry.published)
+      protocol.setOverlayDocument(entry.logicalId, entry.published)
+    }
+  }
+}
+
+/** Boot-time read of the overlay. Runs at most once, and never rejects. */
+function hydrationReady(): Promise<void> {
+  hydration ??= (async () => {
+    const log = echoLog()
+    try {
+      const response = await fetch(`${overlayUrl()}/state`, {method: 'GET'})
+      if (!response.ok) throw new Error(`GET /state responded ${response.status}`)
+      const state = (await response.json()) as {ok?: boolean; documents?: HydrationDocument[]}
+      if (state?.ok !== true || !Array.isArray(state.documents)) {
+        throw new Error('GET /state did not return an overlay state')
+      }
+
+      absorbOverlayDocuments(state.documents)
+
+      if (log) log.persist.hydrated = true
+      console.info(
+        `[spike-a] overlay hydrated: ${overlayDocs.size} document(s) from ${overlayUrl()}`,
+      )
+    } catch (error) {
+      if (log) log.persist.hydrated = false
+      /* Not fatal: with no overlay to replay the facade is simply the in-memory
+       * echo it has always been. Loud, because a silent miss looks identical to
+       * "the edit was never saved". */
+      persistFailure(`could not hydrate from ${overlayUrl()}`, error)
+    }
+  })()
+  return hydration
+}
+
+/**
+ * Replay the overlay's version of `ids` into the panes that just fetched them.
+ *
+ * Called from the pair listener's snapshot read, which is the only moment the
+ * real base revision is known — `sequentializeListenerEvents` chains from that
+ * revision, so a frame emitted at any other time cannot be applied.
+ */
+function scheduleHydrationReplay(ids: string[]): void {
+  if (!isPersistEnabled() || ids.length === 0) return
+
+  void hydrationReady().then(() => {
+    const plans: PlannedEvent[] = []
+    for (const id of ids) {
+      const baseRev = protocol.revisionOf(id) ?? ''
+      /* One replay per (document, base revision): a pane re-opening reseeds from
+       * the server and legitimately needs the overlay applied again, but a
+       * duplicate snapshot fetch for the same revision does not. */
+      if (replayedFrom.get(id) === baseRev) continue
+
+      if (overlayTombstones.has(id)) {
+        replayedFrom.set(id, baseRev)
+        plans.push({documentId: id, transition: 'disappear', mutations: [{delete: {id}}]})
         continue
       }
+
+      const stored = overlayDocs.get(id)
+      if (stored === undefined) continue
+      replayedFrom.set(id, baseRev)
+
+      const seed: Rec = {...stored, _id: id}
+      delete seed._rev
+      delete seed._updatedAt
       plans.push({
-        documentId: targetId,
-        transition: 'disappear',
-        mutations: [{delete: {id: targetId}}],
+        documentId: id,
+        /* `appear` when the draft does not exist yet — which is the normal case,
+         * because the overlay holds a draft the Content Lake has never seen. */
+        transition: baseRev ? 'update' : 'appear',
+        /* `createOrReplace` is the only single mutation that both creates a
+         * missing document and overwrites an existing one, and @sanity/mutator
+         * requires a create-shaped FIRST mutation when the document is absent. */
+        mutations: [{createOrReplace: seed}],
       })
-      continue
     }
 
-    // publish / unpublish / create / release actions mutate two documents in one
-    // transaction (draft disappears, published appears). Emitting a correct pair
-    // requires per-listener transactionTotalEvents and the full draft body; out
-    // of scope for this spike — blocked and recorded, but not echoed.
-    unhandled.push(type)
-  }
-  return {plans, unhandled}
+    if (plans.length === 0) return
+    const log = echoLog()
+    if (log) log.persist.replayed += plans.length
+    scheduleEcho(plans, nextTransactionId())
+  })
 }
 
-function docIdFromMutation(mutation: Rec): string | undefined {
-  for (const key of ['patch', 'delete'] as const) {
-    const value = mutation[key]
-    if (isRec(value) && typeof value.id === 'string') return value.id
+/** Base documents this write can anchor a merge ancestor on (PRD §13.3, §13.4). */
+function baseDocumentsFor(plans: readonly PlannedEvent[]): Rec[] {
+  const seen = new Set<string>()
+  const documents: Rec[] = []
+  for (const plan of plans) {
+    for (const id of [plan.documentId, plan.cloneFrom, plan.copyFrom]) {
+      if (id === undefined || seen.has(id)) continue
+      seen.add(id)
+      const known = protocol.getDocState(id)
+      /* Only a real Content Lake revision can be an ancestor; a synthetic one is
+       * something this overlay itself produced. The server re-checks, but
+       * shipping them would be pure noise on the wire. */
+      if (known?.doc && known.synthetic !== true) documents.push(known.doc)
+    }
   }
-  for (const key of ['create', 'createOrReplace', 'createIfNotExists'] as const) {
-    const value = mutation[key]
-    if (isRec(value) && typeof value._id === 'string') return value._id
-  }
-  return undefined
+  return documents
 }
 
-/** Studio's live-edit path: `dataRequest('mutate', {mutations, transactionId})`. */
-function planFromMutations(body: unknown): PlannedEvent[] {
-  if (!isRec(body) || !Array.isArray(body.mutations)) return []
-  const byDoc = new Map<string, Rec[]>()
-  for (const mutation of body.mutations) {
-    if (!isRec(mutation)) continue
-    const id = docIdFromMutation(mutation)
-    if (!id) continue
-    const list = byDoc.get(id) ?? []
-    list.push(mutation)
-    byDoc.set(id, list)
+/**
+ * POST one `/commit` batch. Resolves when the server has it on disk; reports
+ * failure only through {@link persistFailure}, never to the caller — a
+ * persistence outage degrades to the in-memory echo rather than wedging the
+ * editor.
+ */
+async function postCommit(
+  kind: 'actions' | 'mutations' | 'documentActions',
+  payload: unknown,
+  idempotencyKey: string,
+  baseDocuments: Rec[],
+): Promise<void> {
+  try {
+    const response = await fetch(`${overlayUrl()}/commit`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({
+        idempotencyKey,
+        kind,
+        payload,
+        baseDocuments,
+        actor: PERSIST_ACTOR,
+      }),
+    })
+
+    const result = (await response.json().catch(() => null)) as {
+      ok?: boolean
+      committed?: boolean
+      unsupported?: unknown
+      documents?: HydrationDocument[]
+      error?: {message?: string}
+    } | null
+
+    if (!response.ok || result?.ok !== true) {
+      throw new Error(result?.error?.message ?? `POST /commit responded ${response.status}`)
+    }
+
+    /* The response carries the overlay's materialized view *after* this write.
+     * Adopting it is what lets the next document action echo the real body. */
+    absorbOverlayDocuments(result.documents)
+
+    const log = echoLog()
+    if (log && result.committed === true) log.persist.committed += 1
+    if (Array.isArray(result.unsupported) && result.unsupported.length > 0) {
+      const reasons = result.unsupported.map(String)
+      if (log) log.persist.unsupported.push(...reasons)
+      /* The write was accepted but part of it is not representable in the
+       * overlay yet. Reported here so it cannot pass for a clean save. */
+      console.warn(`[spike-a] overlay did not persist part of this write: ${reasons.join('; ')}`)
+    }
+  } catch (error) {
+    persistFailure(`POST /commit ${idempotencyKey} (${kind}) did not land`, error)
   }
-  return Array.from(byDoc.entries()).map(([documentId, mutations]) => ({
-    documentId,
-    transition: 'update' as const,
-    mutations,
-  }))
+}
+
+/**
+ * Persist everything one intercepted write owes the overlay.
+ *
+ * A single Studio call can produce more than one commit — a restore of a deleted
+ * document arrives as a create plus a `replaceDraft`, which are a mutation and a
+ * document action respectively. They are posted in order, each under its own
+ * derived idempotency key so a retry replays exactly the batches it already ran
+ * (PRD §34.6) instead of half-applying the write.
+ */
+async function persistPlan(plan: EchoPlan, transactionId: string): Promise<void> {
+  if (!isPersistEnabled() || plan.commits.length === 0) return
+  const baseDocuments = baseDocumentsFor(plan.plans)
+  for (const [index, commit] of plan.commits.entries()) {
+    await postCommit(
+      commit.kind,
+      commit.payload,
+      `${sessionId()}:${transactionId}:${index}`,
+      baseDocuments,
+    )
+  }
 }
 
 /* ------------------------------------------------------------- interception */
@@ -710,33 +821,89 @@ function syntheticResult(transactionId: string, withDocuments: boolean): Rec {
  * more than once — a second echo would carry the same transactionId and break
  * the previousRev chain (dedupeListenerEvents would drop it, but do not rely
  * on that).
+ *
+ * `persist` (when persistence is on) is awaited BEFORE the success is handed
+ * back, so the order Studio observes is: on disk, then "saved", then the
+ * listener frame. Its promise is memoized for the same reason `once` exists —
+ * a second subscribe must not become a second POST.
  */
-function blockedResult(kind: Kind, value: Rec, onDelivered: () => void): unknown {
+function blockedResult(
+  kind: Kind,
+  value: Rec,
+  onDelivered: () => void,
+  persist?: () => Promise<void>,
+): unknown {
   let fired = false
   const once = (): void => {
     if (fired) return
     fired = true
     onDelivered()
   }
-  if (kind === 'observable') return observableOf(value, once)
-  once()
-  return Promise.resolve(value)
+
+  let pending: Promise<void> | null = null
+  /* The flag check belongs HERE, not only inside `persistPlan`: with persistence
+   * off the result must stay synchronous. Routing through an already-resolved
+   * promise would still defer the observable's `next` by a microtask, and "the
+   * flag is off" has to mean *nothing* changed.
+   *
+   * `persistPlan` reports its own failures and always resolves, so this can
+   * never reject and never blocks the editor on a downed server. */
+  const ready =
+    persist === undefined || !isPersistEnabled()
+      ? null
+      : (): Promise<void> => (pending ??= persist())
+
+  if (kind === 'observable') {
+    if (ready === null) return observableOf(value, once)
+    return makeObservable<Rec>((subscriber) => {
+      let cancelled = false
+      void ready().then(() => {
+        if (cancelled) return
+        subscriber.next(value)
+        subscriber.complete()
+        once()
+      })
+      return () => {
+        cancelled = true
+      }
+    })
+  }
+
+  if (ready === null) {
+    once()
+    return Promise.resolve(value)
+  }
+  return ready().then(() => {
+    once()
+    return value
+  })
 }
 
-/** Pass a read through untouched, but learn `_rev` from whatever it returns. */
-function tapRead(result: unknown, keepDocuments: boolean): unknown {
+/**
+ * Pass a read through untouched, but learn `_rev` from whatever it returns.
+ *
+ * `requestedIds` are the ids the caller ASKED for, which is not the same as the
+ * ids that came back: a draft the Content Lake has never seen returns `null`.
+ * Those are precisely the documents the overlay has to replay, so the replay is
+ * driven from the request, not from the response.
+ */
+function tapRead(result: unknown, keepDocuments: boolean, requestedIds: string[] = []): unknown {
   if (!result) return result
+  const observed = (value: unknown): void => {
+    try {
+      seedFromResult(value, keepDocuments)
+    } catch (err) {
+      noteError(`rev seed failed: ${String(err)}`)
+    }
+    if (keepDocuments) scheduleHydrationReplay(requestedIds)
+  }
   if (isRec(result) && typeof (result as Rec).subscribe === 'function') {
     captureObservableCtor(result)
     const source = result as unknown as MinimalObservable<unknown>
     return makeObservable<unknown>((subscriber) =>
       source.subscribe({
         next: (value) => {
-          try {
-            seedFromResult(value, keepDocuments)
-          } catch (err) {
-            noteError(`rev seed failed: ${String(err)}`)
-          }
+          observed(value)
           subscriber.next(value)
         },
         error: (err) => subscriber.error(err),
@@ -746,15 +913,19 @@ function tapRead(result: unknown, keepDocuments: boolean): unknown {
   }
   if (isRec(result) && typeof (result as Rec).then === 'function') {
     return (result as unknown as Promise<unknown>).then((value) => {
-      try {
-        seedFromResult(value, keepDocuments)
-      } catch (err) {
-        noteError(`rev seed failed: ${String(err)}`)
-      }
+      observed(value)
       return value
     })
   }
   return result
+}
+
+/** The document ids a `getDocument(id)` / `getDocuments([ids])` call asked for. */
+function requestedIdsFrom(args: unknown[]): string[] {
+  const first = args[0]
+  if (typeof first === 'string') return [first]
+  if (Array.isArray(first)) return first.filter((id): id is string => typeof id === 'string')
+  return []
 }
 
 /* ------------------------------------------------------------ listen merge */
@@ -802,15 +973,7 @@ function wrapListen(realListen: (...args: unknown[]) => unknown, self: object) {
     const tapped$ = makeObservable<unknown>((subscriber) =>
       upstream$.subscribe({
         next: (event) => {
-          if (isRec(event) && event.type === 'mutation' && typeof event.documentId === 'string') {
-            if (typeof event.resultRev === 'string' && event.identity !== IDENTITY) {
-              setDocState(event.documentId, {
-                rev: event.resultRev,
-                updatedAt: typeof event.timestamp === 'string' ? event.timestamp : undefined,
-                synthetic: false,
-              })
-            }
-          }
+          protocol.observeUpstreamEvent(event)
           subscriber.next(event)
         },
         error: (err) => subscriber.error(err),
@@ -902,15 +1065,17 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
         wrapped = wrapListen(fn as (...args: unknown[]) => unknown, t)
       } else if (name === 'action') {
         wrapped = (...args: unknown[]): unknown => {
-          const actions = toActionArray(args[0])
           const transactionId = transactionIdFromOptions(args[1]) ?? nextTransactionId()
-          const {plans, unhandled} = planFromActions(actions)
-          recordBlocked('action', args[0], transactionId, plans.length > 0)
-          if (unhandled.length > 0) {
-            noteError(`action blocked without echo for: ${unhandled.join(', ')}`)
+          const plan = protocol.planActions(args[0])
+          recordBlocked('action', args[0], transactionId, plan.plans.length > 0)
+          if (plan.unsupported.length > 0) {
+            noteError(`action blocked without echo for: ${plan.unsupported.join(', ')}`)
           }
-          return blockedResult(kind, syntheticResult(transactionId, false), () =>
-            scheduleEcho(plans, transactionId),
+          return blockedResult(
+            kind,
+            syntheticResult(transactionId, false),
+            () => scheduleEcho(plan.plans, transactionId),
+            () => persistPlan(plan, transactionId),
           )
         }
       } else if (name === 'dataRequest') {
@@ -922,13 +1087,16 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
             (isRec(body) && typeof body.transactionId === 'string' ? body.transactionId : undefined) ??
             transactionIdFromOptions(args[2]) ??
             nextTransactionId()
-          const plans =
-            endpoint === 'mutate'
-              ? planFromMutations(body)
-              : planFromActions(toActionArray(isRec(body) ? body.actions : undefined)).plans
-          recordBlocked(`dataRequest:${endpoint}`, body, transactionId, plans.length > 0)
-          return blockedResult(kind, syntheticResult(transactionId, endpoint === 'mutate'), () =>
-            scheduleEcho(plans, transactionId),
+          const isMutate = endpoint === 'mutate'
+          const plan = isMutate
+            ? protocol.planMutations(body)
+            : protocol.planActions(isRec(body) ? body.actions : undefined)
+          recordBlocked(`dataRequest:${endpoint}`, body, transactionId, plan.plans.length > 0)
+          return blockedResult(
+            kind,
+            syntheticResult(transactionId, isMutate),
+            () => scheduleEcho(plan.plans, transactionId),
+            () => persistPlan(plan, transactionId),
           )
         }
       } else if (name === 'request') {
@@ -944,23 +1112,29 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
           const transactionId =
             (isRec(body) && typeof body.transactionId === 'string' ? body.transactionId : undefined) ??
             nextTransactionId()
-          const plans = isRec(body) && Array.isArray(body.mutations) ? planFromMutations(body) : []
-          recordBlocked('request', options, transactionId, plans.length > 0)
-          return blockedResult(kind, syntheticResult(transactionId, true), () =>
-            scheduleEcho(plans, transactionId),
+          const plan = protocol.planMutations(body)
+          recordBlocked('request', options, transactionId, plan.plans.length > 0)
+          return blockedResult(
+            kind,
+            syntheticResult(transactionId, true),
+            () => scheduleEcho(plan.plans, transactionId),
+            () => persistPlan(plan, transactionId),
           )
         }
       } else if (WRITE_METHODS.has(name)) {
         wrapped = (...args: unknown[]): unknown => {
           const transactionId =
             transactionIdFromOptions(args[1]) ?? transactionIdFromOptions(args[2]) ?? nextTransactionId()
-          const plans =
-            name === 'mutate'
-              ? planFromMutations({mutations: Array.isArray(args[0]) ? args[0] : [args[0]]})
-              : []
-          recordBlocked(name, args[0], transactionId, plans.length > 0)
-          return blockedResult(kind, syntheticResult(transactionId, true), () =>
-            scheduleEcho(plans, transactionId),
+          /* `args[1]` carries the `tag`, which is the only trace of §18.9
+           * duplicate on the wire: Studio's duplicate is
+           * `client.create(copy, {tag: 'document.duplicate'})`, not an action. */
+          const plan = protocol.planWrite(name, args[0], args[1])
+          recordBlocked(name, args[0], transactionId, plan.plans.length > 0)
+          return blockedResult(
+            kind,
+            syntheticResult(transactionId, true),
+            () => scheduleEcho(plan.plans, transactionId),
+            () => persistPlan(plan, transactionId),
           )
         }
       } else if (name === 'patch' || name === 'transaction') {
@@ -977,8 +1151,9 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
           return isRec(result) ? echoProxy(result as object, kind) : result
         }
       } else if (READ_TAP_METHODS.has(name) || name === 'fetch') {
+        const authoritative = READ_TAP_METHODS.has(name)
         wrapped = (...args: unknown[]): unknown =>
-          tapRead(fn.apply(t, args), READ_TAP_METHODS.has(name))
+          tapRead(fn.apply(t, args), authoritative, authoritative ? requestedIdsFrom(args) : [])
       } else {
         wrapped = (...args: unknown[]): unknown => fn.apply(t, args)
       }
@@ -1001,7 +1176,15 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
  */
 export function wrapWithLocalEcho(client: SanityClient): SanityClient {
   const log = echoLog()
-  if (log) log.enabled = true
+  if (log) {
+    log.enabled = true
+    log.persist.enabled = isPersistEnabled()
+    log.persist.url = overlayUrl()
+  }
   probeObservableCtor(client as unknown as Rec)
+  /* Start the overlay read before Studio opens a pane: the replay is gated on
+   * this promise, so hydrating early only shortens the window in which a pane
+   * could render pre-overlay content. */
+  if (isPersistEnabled()) void hydrationReady()
   return echoProxy(client as unknown as object, 'promise') as unknown as SanityClient
 }

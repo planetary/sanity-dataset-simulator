@@ -61,6 +61,13 @@ async function expectParity(
 // claim is worthless if the Tier A set is whatever the file happens to say.
 // ===========================================================================
 
+// Tier reclassification 2026-08-04 (evidence review F6): article-count,
+// stats-aggregate and articles-by-author-name moved tier-a -> tier-b. Each
+// materializes EVERY document of its type to answer a small question, which
+// §22.6 forbids at scale ("never fetch every document of a large type merely
+// because the query is type-constrained"). The reasoning is recorded per entry
+// in registry.ts and swept by test/spike-c-boundedness.test.ts, which fails if
+// a type-linear query is registered tier-a.
 const EXPECTED_TIER_A = [
   'article-by-id',
   'page-by-slug',
@@ -72,14 +79,16 @@ const EXPECTED_TIER_A = [
   'articles-ordered-sliced',
   'filter-by-tag',
   'article-with-author',
-  'articles-by-author-name',
   'page-featured-refs',
   'references-author',
-  'article-count',
-  'stats-aggregate',
   'pt-text',
 ]
-const EXPECTED_TIER_B = ['recent-by-created-at']
+const EXPECTED_TIER_B = [
+  'article-count',
+  'stats-aggregate',
+  'articles-by-author-name',
+  'recent-by-created-at',
+]
 const EXPECTED_UNSUPPORTED = ['unconstrained-star']
 const EXPECTED_OVERLAY_FIXTURES = [
   'empty',
@@ -91,14 +100,16 @@ const EXPECTED_OVERLAY_FIXTURES = [
 ]
 
 describe('GAP 1: registry inventory + coverage matrix are pinned (M8, E1)', () => {
-  it('the Tier A inventory is exactly the 16 registered queries', () => {
+  it('the Tier A inventory is exactly the registered Tier A queries', () => {
     expect(REGISTRY.filter((d) => d.status === 'tier-a').map((d) => d.id).sort()).toEqual(
       [...EXPECTED_TIER_A].sort(),
     )
   })
 
   it('the Tier B and unsupported inventories are exactly as classified', () => {
-    expect(REGISTRY.filter((d) => d.status === 'tier-b').map((d) => d.id)).toEqual(EXPECTED_TIER_B)
+    expect(REGISTRY.filter((d) => d.status === 'tier-b').map((d) => d.id).sort()).toEqual(
+      [...EXPECTED_TIER_B].sort(),
+    )
     expect(REGISTRY.filter((d) => d.status === 'unsupported').map((d) => d.id)).toEqual(
       EXPECTED_UNSUPPORTED,
     )
@@ -132,14 +143,21 @@ describe('GAP 1: registry inventory + coverage matrix are pinned (M8, E1)', () =
 })
 
 // ===========================================================================
-// GAP 2 — boundedness is never asserted.
+// GAP 2 — TYPE-BOUNDARY guard (NOT the §22.6 boundedness proof).
+//
 // Mutations E2/E3/E4 made the ids, slug/types and top-k plans UNBOUNDED (each
 // pulling the whole dataset into the candidate set) and all three went GREEN.
 // Parity with the oracle is preserved by any SUPERSET of the correct candidate
-// set, so the existing suite proves completeness only. The one boundedness
-// test in the suite (`candidateCount < fullDatasetCount`, one query, one
-// overlay) still passed with no planning at all. Boundedness IS the spike-c
-// claim (PRD §22.6), so it needs a per-plan-type ceiling.
+// set, so the pre-existing suite proved completeness only.
+//
+// HONEST SCOPE (evidence review 2026-08-04, F6): the ceilings below are derived
+// from the PLAN, so for type-scanning plans the ceiling IS the scan and the
+// assertion cannot falsify over-fetching within a type. What this block proves
+// is exactly one thing — a plan never crosses a type boundary, which is what
+// kills E2/E3/E4. The §22.6 claim (candidate sets that do not grow with the
+// dataset) is proven in `test/spike-c-boundedness.test.ts` against ceilings
+// derived from query semantics plus a 10x scale sweep. Do not cite this block
+// as boundedness evidence.
 //
 // planSelected = candidateCount - referenceExpansions is the portion the plan
 // chose; reference expansion is a separate, legitimately unbounded mechanism.
@@ -156,9 +174,11 @@ function planUpperBound(
       return plan.idsFromParams.map((p) => String(params[p])).length
     case 'ids-literal':
       return plan.ids.length
+    case 'base-filter':
     case 'slug':
     case 'types': {
-      const types = plan.type === 'slug' ? [plan.docType] : plan.types
+      const types =
+        plan.type === 'slug' ? [plan.docType] : (plan.types as string[])
       const inBase = dataset.filter((d) => types.includes(d._type)).length
       const inOverlay = [...overlay.documents.values()].filter(
         (d) => types.includes(d._type) && !dataset.some((b) => b._id === d._id),
@@ -178,7 +198,7 @@ function planUpperBound(
   }
 }
 
-describe('GAP 2: candidate sets are genuinely bounded per plan type (E2, E3, E4)', () => {
+describe('GAP 2: candidate plans never cross a type boundary (E2, E3, E4)', () => {
   it.each(supported.map((d) => [d.id, d] as const))(
     '%s keeps planSelected within its plan ceiling under every overlay',
     async (_id, def) => {
