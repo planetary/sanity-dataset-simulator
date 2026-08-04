@@ -47,7 +47,7 @@ import fs from 'node:fs'
 import {dirname, join} from 'node:path'
 import {fileURLToPath, pathToFileURL} from 'node:url'
 
-import {isWriteRequest} from './writeGuard.mjs'
+import {createRealtimeFrameGuard, isWriteRequest} from './writeGuard.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -176,6 +176,48 @@ function serializeRequestHead(method, target, headers) {
   return lines.join('\r\n') + '\r\n\r\n'
 }
 
+/**
+ * How the upgrade path should dial the upstream — as data, so it can be
+ * asserted without opening a socket.
+ *
+ * Extracted from the upgrade handler for evidence review F5a. The handler used
+ * to build these options inline, which meant the branch that runs in
+ * production (`https:` upstream, i.e. always, against `<project>.api.sanity.io`)
+ * could only be exercised by standing up a real TLS server — and so it never
+ * was. `test/proxy-tls.test.ts` now does both: it asserts this function
+ * directly, AND drives a real `tls.connect` against a self-signed upstream.
+ *
+ * Three things here are load-bearing and each has a test:
+ *   - `servername`: SNI must carry the DERIVED hostname (`resolveUpstreamHostname`
+ *     rewrites `<project>.localhost` onto `<project>.api.sanity.io`), or the
+ *     handshake asks for a certificate the upstream cannot present.
+ *   - `ALPNProtocols: ['http/1.1']`: HTTP/2 removed the upgrade mechanism
+ *     (RFC 9113 §8.1). If ALPN negotiates h2 the handshake bytes below are
+ *     nonsense on the wire.
+ *   - the ABSENCE of `rejectUnauthorized: false`. This proxy forwards the
+ *     user's `Authorization: Bearer` upstream; disabling verification would
+ *     hand that token to anything that can answer on the API host's address.
+ *     Not a default worth relying on implicitly, so it is asserted.
+ *
+ * @param {{tls: boolean, hostname: string, port: number}} target
+ * @returns {{transport: 'tls'|'net', connectEvent: 'secureConnect'|'connect', options: object}}
+ */
+export function upstreamDialSpec({tls: useTls, hostname, port}) {
+  if (!useTls) {
+    return {transport: 'net', connectEvent: 'connect', options: {host: hostname, port}}
+  }
+  return {
+    transport: 'tls',
+    connectEvent: 'secureConnect',
+    options: {host: hostname, port, servername: hostname, ALPNProtocols: ['http/1.1']},
+  }
+}
+
+/** Open the socket a dial spec describes. The default `dialUpstream`. */
+function dialFromSpec(spec) {
+  return spec.transport === 'tls' ? tls.connect(spec.options) : net.connect(spec.options)
+}
+
 /** Status code of an HTTP response whose first bytes are `chunk`. */
 function parseStatusCode(chunk) {
   const head = chunk.toString('latin1', 0, Math.min(chunk.length, 64))
@@ -210,6 +252,12 @@ export function resolveProxyConfig(options = {}) {
     rewriteCookies: options.rewriteCookies ?? env.PROXY_REWRITE_COOKIES !== '0',
     logPath: options.logPath ?? env.PROXY_LOG ?? join(HERE, 'proxy-log.jsonl'),
     verbose: options.verbose ?? env.PROXY_VERBOSE === '1',
+    // Test seam ONLY, with no environment variable behind it on purpose: there
+    // must be no way to weaken the upstream dial from outside the process.
+    // `test/proxy-tls.test.ts` uses it to add a trust anchor for a self-signed
+    // upstream and to count dials; it receives the spec `upstreamDialSpec`
+    // produced and cannot see the request. Default is the real dial.
+    dialUpstream: options.dialUpstream ?? dialFromSpec,
   }
 }
 
@@ -234,6 +282,7 @@ export function createProxyServer(options = {}) {
     rewriteCookies: REWRITE_COOKIES,
     logPath: LOG_PATH,
     verbose: VERBOSE,
+    dialUpstream: DIAL_UPSTREAM,
   } = config
 
   const upstreamIsTls = UPSTREAM.protocol === 'https:'
@@ -634,15 +683,12 @@ export function createProxyServer(options = {}) {
     setHeader(headers, 'Connection', 'Upgrade')
     setHeader(headers, 'Upgrade', req.headers.upgrade || 'websocket')
 
-    const upstreamSocket = upstreamIsTls
-      ? tls.connect({
-          host: hostname,
-          port: upstreamPort,
-          servername: hostname,
-          // The upgrade only exists in HTTP/1.1; never let ALPN pick h2.
-          ALPNProtocols: ['http/1.1'],
-        })
-      : net.connect({host: hostname, port: upstreamPort})
+    const dialSpec = upstreamDialSpec({
+      tls: upstreamIsTls,
+      hostname,
+      port: upstreamPort,
+    })
+    const upstreamSocket = DIAL_UPSTREAM(dialSpec)
 
     let torn = false
     const teardown = () => {
@@ -659,12 +705,92 @@ export function createProxyServer(options = {}) {
     upstreamSocket.setNoDelay(true)
     upstreamSocket.setTimeout(0)
 
-    upstreamSocket.once(upstreamIsTls ? 'secureConnect' : 'connect', () => {
+    /* --- the frame guard (evidence review F5b) ------------------------------
+     *
+     * Past the 101 this handler used to `clientSocket.pipe(upstreamSocket)` —
+     * an opaque bidirectional tunnel on an allowlisted path, carrying the
+     * user's credentials. `/v2022-06-30/socket/<ds>` is not a stream: it is
+     * @sanity/bifur-client's JSON-RPC 2.0 channel, and `'mutate'` is one of its
+     * declared client request methods (see writeGuard.mjs's realtime section
+     * for the source citations). So the client leg is parsed, classified and
+     * logged frame by frame instead of piped.
+     *
+     * Only when the client asked for `websocket`. Any other upgrade protocol
+     * has no framing this guard understands; it is relayed as before and the
+     * log says `frameGuard: 'not-applicable'` rather than implying an audit
+     * that did not happen.
+     */
+    const isWebSocket = /websocket/i.test(String(req.headers.upgrade || ''))
+    const frameGuard = isWebSocket ? createRealtimeFrameGuard({enforce: BLOCK_WRITES}) : null
+
+    /**
+     * One log line per client frame. Method name and JSON-RPC id only —
+     * NEVER `params`. The first frame the bifur client sends is
+     * `{method:'authorization', params:{authorization:'Bearer <token>'}}`
+     * (@sanity/bifur-client/src/createClient.ts:107-125); a guard that logged
+     * payloads would write the user's credential to disk on every connection.
+     */
+    const logFrame = (verdict, enforced) => {
+      logLine({
+        at: new Date().toISOString(),
+        method: 'WS',
+        path: pathname,
+        status: enforced ? 1008 : 101,
+        ms: Date.now() - startedAt,
+        blocked: Boolean(enforced),
+        upgrade: true,
+        frame: true,
+        opcode: verdict.opcode,
+        rpc: verdict.rpcMethod,
+        rpcId: verdict.rpcId,
+        // The guard's verdict, independent of whether it was acted on — so an
+        // escape in observation mode is still server-side evidenced.
+        wouldBlock: Boolean(verdict.write),
+        reason: verdict.reason,
+      })
+    }
+
+    /** RFC 6455 §5.5.1 close frame, unmasked (server -> client). */
+    const closeFrame = (code) => {
+      const payload = Buffer.alloc(2)
+      payload.writeUInt16BE(code)
+      return Buffer.concat([Buffer.from([0x88, payload.length]), payload])
+    }
+
+    const rejectFrames = () => {
+      if (clientSocket.writable) clientSocket.write(closeFrame(1008)) // policy violation
+      teardown()
+    }
+
+    /**
+     * Client -> upstream. Replaces `pipe()`, so backpressure is ours to manage:
+     * a `write()` that returns false means the upstream's buffer is full and
+     * the client must stop until it drains, or a slow listener socket turns
+     * into unbounded memory growth in this process.
+     */
+    const forwardFromClient = (chunk) => {
+      if (!frameGuard) {
+        if (!upstreamSocket.write(chunk)) clientSocket.pause()
+        return
+      }
+      const result = frameGuard.inspect(chunk)
+      for (const verdict of result.frames) {
+        logFrame(verdict, Boolean(result.blocked) && verdict.write && BLOCK_WRITES)
+      }
+      if (result.forward.length && !upstreamSocket.write(result.forward)) clientSocket.pause()
+      if (result.blocked && BLOCK_WRITES) rejectFrames()
+    }
+
+    upstreamSocket.on('drain', () => clientSocket.resume())
+
+    upstreamSocket.once(dialSpec.connectEvent, () => {
       upstreamSocket.write(serializeRequestHead(req.method || 'GET', pathname + search, headers))
-      // Bytes the client already sent past its request head, before we dialled.
-      if (head && head.length) upstreamSocket.write(head)
-      // `end: false`: FIN propagation is handled explicitly below, not by pipe.
-      clientSocket.pipe(upstreamSocket, {end: false})
+      // Bytes the client pipelined behind its request head, before we dialled.
+      // For a websocket upgrade these are by definition frames, so they go
+      // through the guard like any others — otherwise putting the mutate frame
+      // in the same TCP segment as the GET would walk straight past it.
+      if (head && head.length) forwardFromClient(head)
+      clientSocket.on('data', forwardFromClient)
     })
 
     // Sniff the status line of the first upstream chunk for the log, then get out

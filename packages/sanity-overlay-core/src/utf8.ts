@@ -6,6 +6,21 @@
  * `TextEncoder` / `TextDecoder` or `Buffer` being present.
  */
 
+/**
+ * Number of UTF-8 bytes a single code point encodes to.
+ *
+ * Unpaired surrogates (`0xd800`–`0xdfff`) report 3, which is both their nominal
+ * three-byte width and the width of the U+FFFD that {@link utf8Encode} actually
+ * substitutes for them — so summing this over a string never disagrees with the
+ * bytes `utf8Encode` produces for a lone surrogate.
+ */
+export function utf8CodePointLength(codePoint: number): 1 | 2 | 3 | 4 {
+  if (codePoint < 0x80) return 1
+  if (codePoint < 0x800) return 2
+  if (codePoint < 0x10000) return 3
+  return 4
+}
+
 /** Encode a JavaScript string to UTF-8 bytes. Lone surrogates become U+FFFD. */
 export function utf8Encode(input: string): Uint8Array {
   const out: number[] = []

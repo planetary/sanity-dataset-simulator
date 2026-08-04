@@ -135,7 +135,68 @@ the same `403 OVERLAY_WRITE_BLOCKED` body, serialised by hand onto the raw socke
 `"blocked": true, "upgrade": true`.
 
 Pinned end-to-end by `packages/sanity-overlay-testkit/test/proxy-ws.test.ts` against a hand-rolled
-mock upstream — no websocket dependency, `node:net` and `node:crypto` only.
+mock upstream — no websocket dependency, `node:net` and `node:crypto` only — and by
+`test/proxy-tls.test.ts` against a real `tls.createServer` with a certificate generated at test
+time (SNI, ALPN, `secureConnect`, certificate rejection).
+
+### The frame guard — what the tunnel actually carries
+
+Guarding the handshake is not enough. Until evidence review F5b the handler classified the
+**request line** and then piped bytes opaquely, so an allowlisted upgrade was an unaudited
+bidirectional tunnel to Sanity carrying the user's credentials. What that tunnel carries was then
+read out of `node_modules`, not assumed:
+
+- `sanity@6.8.0`, `lib/WorkspaceLoader-BRx2afZV.js:8300-8303`, builds the URL and hands it to
+  `fromUrl` from **`@sanity/bifur-client@1.0.0`**.
+- That client is a **generic JSON-RPC 2.0 request/response channel**, not a one-way stream:
+  `src/createClient.ts:42-49` is the envelope, and `createClient.ts:137` is the single `ws.send()`
+  carrying every request — it takes `method: string` straight from its caller.
+- `src/types.ts:6-15` declares
+  `RequestMethod = 'doc' | 'query' | 'mutate' | 'presence_rollcall' | 'presence_announce' | 'presence_disconnect' | 'authorization'`.
+
+**`'mutate'` is a declared client request method on this socket.** No shipped code path calls it —
+Studio's document mutations go over HTTP `POST /data/mutate/<ds>`
+(`lib/datastores-DqFH7RLd.js:1789`), and `@sanity/mutator` contains no WebSocket code at all — but
+the bifur client is exposed to page JS as `__internal.bifur`
+(`lib/datastores-DqFH7RLd.js:7958`), and nothing between that object and Content Lake checks
+anything. **The channel could not be proven read-only, so it is enforced instead.**
+
+Past the 101, on the **client → upstream leg only** (the server leg stays opaque; parsing it would
+break on any protocol extension Sanity ships, and the threat points the other way):
+
+1. every frame is parsed as RFC 6455 — masking, both extended length forms, continuation
+   fragments, control frames;
+2. its JSON-RPC method is classified against a read allowlist (`writeGuard.mjs`,
+   `classifyRealtimeMethod`) — the same default-deny policy as the request line, at the frame
+   layer. Allowed: `authorization`, `presence*`, `listen`, `doc`, `query`, and the
+   `_subscribe`/`_unsubscribe` forms of the three `SubscribeMethods`. Blocked: `mutate` and
+   everything else, including `mutate_subscribe`, binary frames, non-JSON text, and any frame with
+   no method;
+3. **every frame gets a JSONL log line** — method name and JSON-RPC id only, so an escape is
+   server-side evidenced whether or not the policy is enforcing;
+4. with `PROXY_BLOCK_WRITES=1` a refused frame is never forwarded and the connection is closed
+   with RFC 6455 code **1008** (policy violation). Bytes are released only once the frame they
+   belong to has been classified, so the prefix of a mutation split across two frames cannot leak
+   ahead of the verdict.
+
+```json
+{"at":"…","method":"WS","path":"/v2022-06-30/socket/parity","status":1008,"blocked":true,"upgrade":true,"frame":true,"opcode":1,"rpc":"mutate","rpcId":"evil-1","wouldBlock":true,"reason":"…"}
+```
+
+**`params` is never logged.** The first frame the bifur client sends is
+`{method:'authorization', params:{authorization:'Bearer <token>'}}`
+(`@sanity/bifur-client/src/createClient.ts:107-125`); a guard that logged frame payloads would
+write the user's credential to disk on every connection. `test/proxy-ws-frames.test.ts` asserts the
+raw log file contains neither the token nor the string `Bearer`.
+
+With `PROXY_BLOCK_WRITES=0` the tunnel stays byte-transparent — observation mode means the same
+thing on both legs — but every frame is still classified and logged, with `wouldBlock` recording
+the verdict that was not acted on.
+
+**Residual gap, stated plainly:** this is enforcement against the protocol as vendored in
+`@sanity/bifur-client@1.0.0`. If Sanity's server accepts a method not in that type union, the
+allowlist will not know about it — but default-deny means the failure mode is a refused frame and a
+log line, not a silent write.
 
 ## Pointing the Studio at the proxy
 
@@ -252,8 +313,12 @@ now return exactly `cache-control: no-cache, no-transform`.
   here (Studio pins `useCdn: false`) but it changes read paths for any CDN-using client.
 - The login redirect flow (`/auth/login/<provider>?origin=...`) has not been exercised through
   the proxy; only token auth has.
-- The `upgrade` path is verified against a hand-rolled mock upstream over plain HTTP; the
-  TLS leg (`tls.connect` to `<project>.api.sanity.io:443`) has not been exercised in a test.
+- The `upgrade` path's TLS leg **is** now covered — `test/proxy-tls.test.ts` builds a self-signed
+  certificate from `node:crypto` at test time, stands up a real `tls.createServer`, and drives the
+  proxy's own `tls.connect` through it (SNI, ALPN, `secureConnect`, frames, teardown), plus a
+  no-injection case that proves the proxy *rejects* an untrusted certificate with 502. What is
+  still unproven is only the part no test can supply: that `tls.connect` succeeds against the real
+  `<project>.api.sanity.io:443` with the public root store and Sanity's own ALPN behaviour.
 
 ## §36.1 Track B verification checklist → what the orchestrator should observe
 
@@ -275,6 +340,139 @@ Concretely, the three observations that decide Track B:
 3. **Write guard holds while reads survive** — with `PROXY_BLOCK_WRITES=1`, edit + publish
    yields only `blocked: true` rows for `/data/actions`, the dataset is unchanged afterwards,
    and queries/listeners in the same session keep returning 200.
+
+## Substantiating a "re-verified live" claim (evidence review F3)
+
+`docs/plans/evidence/phase-1/spike-f-safety-boundary/report.md:64` claims a live smoke run in
+which **seven** request shapes all returned 403. The repository's only server-side proxy
+evidence, `proxy-log.jsonl`, holds **six** blocked rows in total — four `/data/actions/parity`,
+one `/data/mutate/parity`, one `/assets/images/parity` — and **zero** DELETE, PUT or PATCH
+requests of any kind. Three of the seven claimed shapes are non-POST verbs, so that log cannot be
+the log of the run that exercised them. By this project's standing rule (*server-side logs are the
+only trustworthy escape evidence*) the claim is currently **unevidenced**.
+
+The classifier half is already pinned: `test/proxy-log-replay.test.ts` asserts all seven shapes
+classify as writes, with a non-vacuity oracle showing five of the seven escape the pre-Spike-F
+guard. What follows is the live half — the exact server-side log lines a browser run must produce.
+
+**Ground rules.**
+
+1. **Never write to `proxy-log.jsonl`.** It is committed evidence of a different session. Point
+   `PROXY_LOG` at a new file.
+2. **`credentials: 'omit'` on every probe.** The guard blocks *before* the upstream socket is
+   dialled, so a blocked probe carries no credentials anywhere. Omitting them means that if the
+   guard were to fail, the escaped request reaches Sanity unauthenticated and 401s instead of
+   mutating `parity`. The point is to evidence the guard, not to gamble the dataset.
+3. **The proxy must be proven alive in the same log.** Two allowlisted reads are part of the
+   checklist for exactly this reason: seven 403s from a proxy that 403s everything prove nothing.
+
+### Step 1 — start the proxy with a dedicated log
+
+```bash
+cd examples/kitchen-sink
+PROXY_BLOCK_WRITES=1 \
+PROXY_LOG=spikeB-proxy/proxy-log-reverify.jsonl \
+node spikeB-proxy/proxy.mjs
+```
+
+### Step 2 — fire all nine probes from the Studio tab, in one `evaluate_script`
+
+Studio must already be running at `localhost:3333` with `apiHost` pointed at the proxy, so the
+probes originate from the same browser origin as real Studio traffic.
+
+```js
+const API = 'http://b1n03q3z.localhost:3999'
+const PROBES = [
+  ['POST',   '/v2025-02-19/assets/images/parity'],
+  ['POST',   '/v2025-02-19/agent/action/patch/parity'],
+  ['DELETE', '/v2025-02-19/datasets/parity'],
+  ['POST',   '/v2025-02-19/projects/b1n03q3z/datasets/parity/mutate'],
+  ['POST',   '/v2025-02-19//data//mutate//parity'],
+  ['POST',   '/v2025-02-19/DATA/MUTATE/parity'],
+  ['POST',   '/v2025-02-19/data/..%2Fmutate/parity'],
+  // The two liveness controls. These MUST come back 200.
+  ['GET',    '/v2025-02-19/ping'],
+  ['GET',    '/v2025-02-19/data/query/parity?query=*%5B_id%3D%3D%22article-01%22%5D%5B0%5D._id'],
+]
+const out = []
+for (const [method, path] of PROBES) {
+  try {
+    const res = await fetch(API + path, {method, credentials: 'omit'})
+    out.push({method, path, status: res.status})
+  } catch (err) {
+    out.push({method, path, status: 'NETWORK_ERROR', message: String(err)})
+  }
+}
+return out
+```
+
+The browser-side statuses are **not** the evidence — they are a convenience. The evidence is the
+log file. (If any `path` in the log differs from the string above, the browser normalised the URL;
+record that as a finding rather than editing the expectation.)
+
+### Step 3 — the exact log lines the run must produce
+
+`proxy-log-reverify.jsonl` must contain **one row per shape**, each with `"blocked": true` and
+`"status": 403`, on these exact `method` + `path` pairs:
+
+| # | `method` | `path` | `blocked` | `status` |
+|---|---|---|---|---|
+| 1 | `POST` | `/v2025-02-19/assets/images/parity` | `true` | `403` |
+| 2 | `POST` | `/v2025-02-19/agent/action/patch/parity` | `true` | `403` |
+| 3 | `DELETE` | `/v2025-02-19/datasets/parity` | `true` | `403` |
+| 4 | `POST` | `/v2025-02-19/projects/b1n03q3z/datasets/parity/mutate` | `true` | `403` |
+| 5 | `POST` | `/v2025-02-19//data//mutate//parity` | `true` | `403` |
+| 6 | `POST` | `/v2025-02-19/DATA/MUTATE/parity` | `true` | `403` |
+| 7 | `POST` | `/v2025-02-19/data/..%2Fmutate/parity` | `true` | `403` |
+
+and **two liveness rows**, which must be `"blocked": false` and `2xx`:
+
+| # | `method` | `path` | `blocked` | `status` |
+|---|---|---|---|---|
+| 8 | `GET` | `/v2025-02-19/ping` | `false` | `200` |
+| 9 | `GET` | `/v2025-02-19/data/query/parity` | `false` | `200` |
+
+Additional `OPTIONS` preflight rows (`status: 204`, `blocked: false`) are expected for the
+cross-origin probes and are not part of the checklist. Any other row with `blocked: false` on one
+of the seven paths is a **failure of the claim**, whatever the browser reported.
+
+### Step 4 — mechanical check, then commit the log
+
+```bash
+node -e '
+const fs=require("node:fs");
+const rows=fs.readFileSync("examples/kitchen-sink/spikeB-proxy/proxy-log-reverify.jsonl","utf8")
+  .split("\n").filter(Boolean).map(JSON.parse);
+const SHAPES=[
+  ["POST","/v2025-02-19/assets/images/parity"],
+  ["POST","/v2025-02-19/agent/action/patch/parity"],
+  ["DELETE","/v2025-02-19/datasets/parity"],
+  ["POST","/v2025-02-19/projects/b1n03q3z/datasets/parity/mutate"],
+  ["POST","/v2025-02-19//data//mutate//parity"],
+  ["POST","/v2025-02-19/DATA/MUTATE/parity"],
+  ["POST","/v2025-02-19/data/..%2Fmutate/parity"],
+];
+let ok=true;
+for(const [m,p] of SHAPES){
+  const hit=rows.find(r=>r.method===m&&r.path===p&&r.blocked===true&&r.status===403);
+  const leak=rows.find(r=>r.method===m&&r.path===p&&r.blocked!==true);
+  console.log((hit&&!leak?"PASS":"FAIL"),m,p);
+  if(!hit||leak) ok=false;
+}
+const live=rows.filter(r=>r.blocked===false&&r.status>=200&&r.status<300&&r.method==="GET");
+console.log(live.length?"PASS liveness":"FAIL liveness — no allowlisted read succeeded");
+if(!live.length) ok=false;
+process.exit(ok?0:1);
+'
+```
+
+Then `git add examples/kitchen-sink/spikeB-proxy/proxy-log-reverify.jsonl` and commit it. Adding
+that file makes `test/proxy-log-replay.test.ts` go **red** on its pinned
+`the live re-verification has not happened yet` assertion — that is deliberate. Flipping that
+literal to `true` is what switches the same suite from recording the claim as unevidenced to
+asserting all seven rows, so the claim cannot become "verified" without the evidence landing in
+the same commit. Finally, update `spike-f-safety-boundary/report.md:64` to cite the new file and
+its line numbers instead of asserting the run from memory.
 
 ## Verification already performed (no browser, curl + Node `fetch`)
 

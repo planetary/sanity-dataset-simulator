@@ -413,3 +413,326 @@ export function classifyRequest(request) {
 export function isWriteRequest(request) {
   return classifyRequest(request).write
 }
+
+/* ================================================================== *
+ * the realtime leg — `/socket/<dataset>` past the 101
+ * ================================================================== *
+ *
+ * Everything above classifies a REQUEST LINE. `/socket` is on the read
+ * allowlist (READ_ROOT_PREFIXES), so the handshake passes and `proxy.mjs`
+ * upgrades. Evidence review F5b asked the question the allowlist entry had
+ * quietly assumed away: what is an allowlisted upgrade a tunnel TO?
+ *
+ * Read out of the vendored source, not guessed:
+ *
+ *   sanity@6.8.0 lib/WorkspaceLoader-BRx2afZV.js:8300-8303 builds
+ *   `wss://<p>.api.sanity.io/v2022-06-30/socket/<ds>?tag=sanity.studio` and
+ *   hands it to `fromUrl` from @sanity/bifur-client@1.0.0.
+ *
+ *   That client is a generic JSON-RPC 2.0 request/response channel, not a
+ *   one-way stream. src/createClient.ts:42-49 is the envelope
+ *   (`{jsonrpc:'2.0', method, params, id}`); createClient.ts:137 is the single
+ *   `ws.send()` that carries every request, and it takes `method: string`
+ *   straight from its caller.
+ *
+ *   src/types.ts:6-15 declares the methods:
+ *       RequestMethod = 'doc' | 'query' | 'mutate'
+ *                     | 'presence_rollcall' | 'presence_announce'
+ *                     | 'presence_disconnect' | 'authorization'
+ *
+ * `'mutate'` is a declared client request method ON THIS SOCKET. No shipped
+ * code path calls it — Studio mutations go over HTTP `POST /data/mutate/<ds>`
+ * (lib/datastores-DqFH7RLd.js:1789) and @sanity/mutator contains no WebSocket
+ * code at all — but the bifur client is exposed to page JS as
+ * `__internal.bifur` (lib/datastores-DqFH7RLd.js:7958), and nothing between
+ * that object and Content Lake checks anything.
+ *
+ * So the channel could NOT be proven read-only, and the same policy that
+ * governs the request line now governs the frames: an allowlist of the reads we
+ * have read out of the source, and default-deny for everything else. Frames are
+ * classified on the CLIENT -> UPSTREAM leg only; the server leg stays opaque,
+ * because parsing it would break on any protocol extension Sanity ships and the
+ * threat here points the other way.
+ */
+
+/**
+ * JSON-RPC methods the bifur client legitimately sends. Every entry is a member
+ * of `RequestMethod`/`SubscribeMethods` in @sanity/bifur-client/src/types.ts:6-25
+ * with a read or ephemeral-session meaning; nothing is here on a guess.
+ *
+ *   authorization        createClient.ts:114 — the Bearer handshake frame
+ *   presence_rollcall    datastores-DqFH7RLd.js:7350 — "who is here?"
+ *   presence_announce    :7351 — this session's cursor/field locations
+ *   presence_disconnect  :7353 — leaving
+ *   presence / listen    SubscribeMethods; the read subscriptions
+ *   doc / query          RequestMethod — document and GROQ reads, the frame
+ *                        analogues of READ_DATA_OPS above
+ *
+ * Presence writes ephemeral session state, not documents: the payload is a
+ * session id plus document ids and field paths, and it does not reach Content
+ * Lake. Deliberately ABSENT: `mutate`.
+ */
+const READ_RPC_METHODS = new Set([
+  'authorization',
+  'presence',
+  'presence_rollcall',
+  'presence_announce',
+  'presence_disconnect',
+  'listen',
+  'doc',
+  'query',
+])
+
+/**
+ * `listen(m)` sends `` `${m}_subscribe` `` and its teardown sends
+ * `` `${m}_unsubscribe` `` (createClient.ts:157, 174) — but ONLY for the three
+ * members of `SubscribeMethods` (types.ts:20-25). The derived forms are
+ * enumerated from that set rather than computed by stripping a suffix off
+ * whatever arrived: a strip rule would accept `doc_subscribe`, which is not a
+ * wire method, and the whole point of default-deny is that "looks close enough
+ * to something real" is not a reason to forward a frame.
+ */
+const SUBSCRIBE_RPC_METHODS = ['presence', 'listen', 'authorization']
+
+/** The complete set of method tokens a client may put on the wire. */
+const ALLOWED_RPC_METHODS = new Set([
+  ...READ_RPC_METHODS,
+  ...SUBSCRIBE_RPC_METHODS.flatMap((method) => [`${method}_subscribe`, `${method}_unsubscribe`]),
+])
+
+/**
+ * Classify one JSON-RPC method name from a client frame.
+ *
+ * @param {unknown} method
+ * @returns {{write: boolean, reason: string}}
+ */
+export function classifyRealtimeMethod(method) {
+  if (typeof method !== 'string' || method.length === 0) {
+    return {write: true, reason: 'frame carries no JSON-RPC method (default-deny)'}
+  }
+  // NOT trimmed, NOT lower-cased, NOT suffix-stripped: JSON-RPC method names are
+  // exact tokens, so `  mutate  `, `MUTATE` and `mutate_subscribe` are simply
+  // not methods this client sends. Every loosening of this comparison widens the
+  // allowlist and none of them narrows it.
+  if (ALLOWED_RPC_METHODS.has(method)) return {write: false, reason: `allowlisted RPC method ${method}`}
+  return {write: true, reason: `RPC method ${JSON.stringify(method)} is not an allowlisted read`}
+}
+
+/** RFC 6455 opcodes. */
+const OPCODE_CONTINUATION = 0x0
+const OPCODE_TEXT = 0x1
+const OPCODE_CLOSE = 0x8
+const OPCODE_PING = 0x9
+const OPCODE_PONG = 0xa
+
+/**
+ * A presence announce is a few hundred bytes. 128 KiB is four orders of
+ * magnitude of headroom and still refuses to let a peer name its own buffer
+ * size — a guard that allocated whatever the frame header claimed would be a
+ * memory-exhaustion primitive reachable before any allowlist check.
+ */
+const MAX_FRAME_BYTES = 128 * 1024
+
+/**
+ * A streaming RFC 6455 reader for the CLIENT -> UPSTREAM leg.
+ *
+ * Bytes are only released once the frame they belong to has been parsed AND
+ * classified — a reader that forwarded optimistically could not take the prefix
+ * of a mutation back. On the first blocked frame the guard latches shut and
+ * forwards nothing else for the lifetime of the connection: the client has
+ * demonstrated intent, and re-admitting it after one rejection would make the
+ * block advisory.
+ *
+ * @returns {{inspect: (chunk: Buffer) => {frames: Array<object>, forward: Buffer, blocked: object|null}}}
+ */
+export function createRealtimeFrameGuard(options = {}) {
+  // `enforce: false` is observation mode, matching PROXY_BLOCK_WRITES=0 on the
+  // HTTP leg: every frame is still classified and reported so the audit trail
+  // is never conditional on the policy, but nothing is held back. The escape is
+  // evidenced either way — which is the point of logging server-side.
+  const enforce = options.enforce !== false
+  let pending = Buffer.alloc(0)
+  /** Payload of a fragmented message in progress (FIN=0 chains). */
+  let fragment = null
+  let latched = null
+
+  /** Decode one frame from the front of `buffer`, or null if it is incomplete. */
+  function readFrame(buffer) {
+    if (buffer.length < 2) return null
+    const fin = (buffer[0] & 0x80) !== 0
+    const opcode = buffer[0] & 0x0f
+    const masked = (buffer[1] & 0x80) !== 0
+    const lengthByte = buffer[1] & 0x7f
+
+    let offset = 2
+    let length = lengthByte
+    if (lengthByte === 126) {
+      if (buffer.length < 4) return null
+      length = buffer.readUInt16BE(2)
+      offset = 4
+    } else if (lengthByte === 127) {
+      if (buffer.length < 10) return null
+      const big = buffer.readBigUInt64BE(2)
+      if (big > BigInt(MAX_FRAME_BYTES)) return {oversize: true, declared: big.toString()}
+      length = Number(big)
+      offset = 10
+    }
+    if (length > MAX_FRAME_BYTES) return {oversize: true, declared: String(length)}
+
+    // Masking is decided BEFORE waiting for the payload: an unmasked client
+    // frame is an RFC 6455 §5.1 violation, and the guard must not sit waiting
+    // for bytes whose framing it does not trust.
+    if (!masked) return {unmasked: true}
+
+    const maskOffset = offset
+    offset += 4
+    if (buffer.length < offset + length) return null
+
+    const payload = Buffer.from(buffer.subarray(offset, offset + length))
+    const key = buffer.subarray(maskOffset, maskOffset + 4)
+    for (let i = 0; i < payload.length; i++) payload[i] ^= key[i % 4]
+
+    return {fin, opcode, payload, consumed: offset + length}
+  }
+
+  /** Turn a decoded frame into a verdict, maintaining fragment state. */
+  function classifyFrame(frame) {
+    if (frame.opcode === OPCODE_CLOSE || frame.opcode === OPCODE_PING || frame.opcode === OPCODE_PONG) {
+      // Control frames carry no RPC. They must pass or the connection cannot be
+      // kept alive or closed politely.
+      return {opcode: frame.opcode, rpcMethod: null, rpcId: null, write: false, reason: 'control frame'}
+    }
+
+    if (frame.opcode === OPCODE_TEXT) {
+      fragment = frame.fin ? null : {payload: frame.payload}
+      if (!frame.fin) {
+        return {opcode: frame.opcode, rpcMethod: null, rpcId: null, write: false, reason: 'fragment'}
+      }
+      return judge(frame.opcode, frame.payload)
+    }
+
+    if (frame.opcode === OPCODE_CONTINUATION) {
+      if (!fragment) {
+        return {
+          opcode: frame.opcode,
+          rpcMethod: null,
+          rpcId: null,
+          write: true,
+          reason: 'continuation frame with no message in progress',
+        }
+      }
+      fragment.payload = Buffer.concat([fragment.payload, frame.payload])
+      if (fragment.payload.length > MAX_FRAME_BYTES) {
+        fragment = null
+        return {
+          opcode: frame.opcode,
+          rpcMethod: null,
+          rpcId: null,
+          write: true,
+          reason: 'reassembled message too large to inspect',
+        }
+      }
+      if (!frame.fin) {
+        return {opcode: frame.opcode, rpcMethod: null, rpcId: null, write: false, reason: 'fragment'}
+      }
+      const whole = fragment.payload
+      fragment = null
+      return judge(frame.opcode, whole)
+    }
+
+    // Binary (0x2) and every reserved opcode. The bifur protocol is JSON text
+    // (createClient.ts:42), so a binary client frame is not something the
+    // allowlist can vouch for.
+    return {
+      opcode: frame.opcode,
+      rpcMethod: null,
+      rpcId: null,
+      write: true,
+      reason: `opcode 0x${frame.opcode.toString(16)} is not a JSON text frame`,
+    }
+  }
+
+  function judge(opcode, payload) {
+    let message
+    try {
+      message = JSON.parse(payload.toString('utf8'))
+    } catch {
+      return {
+        opcode,
+        rpcMethod: null,
+        rpcId: null,
+        write: true,
+        reason: 'text frame is not JSON, so its method cannot be established',
+      }
+    }
+    if (message === null || typeof message !== 'object' || Array.isArray(message)) {
+      return {opcode, rpcMethod: null, rpcId: null, write: true, reason: 'frame is not a JSON-RPC object'}
+    }
+    const verdict = classifyRealtimeMethod(message.method)
+    return {
+      opcode,
+      rpcMethod: typeof message.method === 'string' ? message.method : null,
+      // The id is a nanoid (createClient.ts:35-38) — safe to log, unlike params.
+      rpcId: typeof message.id === 'string' || typeof message.id === 'number' ? String(message.id) : null,
+      write: verdict.write,
+      reason: verdict.reason,
+    }
+  }
+
+  return {
+    inspect(chunk) {
+      if (latched) return {frames: [], forward: Buffer.alloc(0), blocked: latched}
+
+      pending = pending.length === 0 ? Buffer.from(chunk) : Buffer.concat([pending, chunk])
+      const frames = []
+      // `scanned` walks every complete frame; `releaseUpTo` only advances past a
+      // message that has been JUDGED. A non-final fragment is scanned but not
+      // released, so a `mutate` split across two frames cannot get its first
+      // half forwarded before the guard has seen the method name.
+      let scanned = 0
+      let releaseUpTo = 0
+
+      for (;;) {
+        const frame = readFrame(pending.subarray(scanned))
+        if (!frame) break
+
+        if (frame.oversize || frame.unmasked) {
+          // Unparseable framing. There is no safe place to resume reading a
+          // stream whose frame boundaries are unknown, so this stops the reader
+          // in BOTH modes: observation mode can report what it saw, but it
+          // cannot go on claiming to have seen the rest.
+          latched = {
+            opcode: null,
+            rpcMethod: null,
+            rpcId: null,
+            write: true,
+            reason: frame.oversize
+              ? `frame declares ${frame.declared} bytes, too large to inspect`
+              : 'client frame is not masked (RFC 6455 §5.1)',
+          }
+          frames.push(latched)
+          break
+        }
+
+        const verdict = classifyFrame(frame)
+        scanned += frame.consumed
+        const isFragment = verdict.reason === 'fragment'
+        if (!isFragment) frames.push(verdict)
+
+        if (verdict.write && enforce) {
+          latched = verdict
+          break
+        }
+        // A fragment is allowed-so-far, not allowed: hold its bytes until the
+        // continuation chain finishes and the method is known. In observation
+        // mode nothing is ever held — the tunnel stays byte-transparent, exactly
+        // as PROXY_BLOCK_WRITES=0 promises on the HTTP leg.
+        if (!isFragment || !enforce) releaseUpTo = scanned
+      }
+
+      const forward = Buffer.from(pending.subarray(0, releaseUpTo))
+      pending = latched ? Buffer.alloc(0) : Buffer.from(pending.subarray(releaseUpTo))
+      return {frames, forward, blocked: latched}
+    },
+  }
+}

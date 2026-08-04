@@ -139,3 +139,6 @@ export * from './references/index'
 /* W4 — injected schema-validation port (PRD §17.3 step 9, §20.1, §20.5). */
 export * from './validation/index'
 export * from './store/index'
+
+/* W5 — executable PRD §34 invariants (plan §8.3), for tests and debug tooling. */
+export * from './invariants/index'

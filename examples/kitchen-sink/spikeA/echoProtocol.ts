@@ -353,7 +353,7 @@ export function createEchoProtocol(options: EchoProtocolOptions = {}): EchoProto
       // Omitted entirely (not `undefined`-valued) when unknown:
       // `sequentializeListenerEvents` compares `base.revision === chain[0].previousRev`,
       // and a missing draft has base revision `undefined`.
-      ...(previousRev ? {previousRev: `MUTANT-${previousRev}`} : {}),
+      ...(previousRev ? {previousRev} : {}),
       resultRev: transactionId,
       timestamp,
       visibility: 'transaction',

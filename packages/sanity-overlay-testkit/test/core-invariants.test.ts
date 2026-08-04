@@ -138,8 +138,13 @@ describe('§34.1 at most one current local draft and one current local published
         'drafts.article-1': {...record, logicalId: 'drafts.article-1'},
       },
     })
-    expect(ids(violations)).toContain('34.1')
-    expect(violations.some((violation) => /drafts\./.test(violation.message))).toBe(true)
+    // Both §34.1 rules must fire, and each is asserted separately: the earlier
+    // `some(/drafts\./)` form stayed green when the draft-ID rule was disabled,
+    // because the duplicate-logical-document rule also mentions `drafts.` in its
+    // message. Pinning one assertion per rule makes either regression red.
+    expect(ids(violations)).toEqual(['34.1', '34.1'])
+    expect(violations[0]?.message).toMatch(/uses a "drafts\." ID as its logical ID/)
+    expect(violations[1]?.message).toMatch(/both describe logical document/)
   })
 
   it('reports a local draft materialized under the published document ID', () => {
@@ -281,14 +286,20 @@ describe('§34.3 every manifest document head points to an existing revision or 
   })
 
   it('reports an empty storage ref and a head filed under the wrong key', () => {
-    expect(ids(checkManifestHeads(manifestWith(''), {knownRefs: []}))).toContain('34.3')
+    // Each rule is pinned by its own message. Asserting only `toContain('34.3')`
+    // stayed green when the empty-ref rule was disabled, because an empty ref is
+    // also absent from `knownRefs` and the existence rule reported instead.
+    const empty = checkManifestHeads(manifestWith(''), {knownRefs: []})
+    expect(empty.some((violation) => /empty storageRef/.test(violation.message))).toBe(true)
 
     const manifest = manifestWith('revisions/abc')
     const misfiled: OverlayManifest = {
       ...manifest,
       documentHeads: {'article-2': manifest.documentHeads['article-1']!},
     }
-    expect(ids(checkManifestHeads(misfiled, {knownRefs: ['revisions/abc']}))).toContain('34.3')
+    const wrongKey = checkManifestHeads(misfiled, {knownRefs: ['revisions/abc']})
+    expect(ids(wrongKey)).toEqual(['34.3'])
+    expect(wrongKey[0]?.message).toMatch(/is filed under key "article-2"/)
   })
 })
 
@@ -405,8 +416,14 @@ describe('§34.6 one idempotency key maps to one immutable transaction result', 
     const transactions = broken([...state.transactions])
     transactions[1]!.idempotencyKey = transactions[0]!.idempotencyKey
     const violations = checkIdempotencyLedger({...state, transactions})
+    // Pinned to the duplicate-key message. `/idempotency key/i` stayed green when
+    // the duplicate-key rule was disabled, because the ledger-mismatch rule uses
+    // the same words; only the "were both committed under" phrasing is unique to
+    // the rule this test names.
     expect(ids(violations)).toContain('34.6')
-    expect(violations[0]?.message).toMatch(/idempotency key/i)
+    expect(
+      violations.some((violation) => /were both committed under idempotency key/.test(violation.message)),
+    ).toBe(true)
   })
 
   it('reports a ledger entry that no longer equals the committed transaction', () => {
@@ -513,12 +530,32 @@ describe('§34.17 checkpoint output is deterministic for the same logical state'
     expect(violations[0]?.message).toMatch(/byte-identical/i)
   })
 
-  it('reports a value that is not a serialization fixpoint', () => {
-    // `parse(serialize(x))` must serialize back to the same bytes; a value that
-    // cannot survive the round trip is not checkpointable.
+  it('reports a value the canonical serializer cannot render at all', () => {
+    // Renamed: the previous title claimed to cover the *fixpoint* branch, but
+    // `NaN` never reaches it — `serialize` throws first, so the reject branch
+    // answered and disabling the fixpoint comparison left this green. The
+    // message is now pinned to the branch actually exercised.
     expect(checkCheckpointDeterminism([{a: [1, {b: null}], c: 'ø'}])).toEqual([])
-    expect(ids(checkCheckpointDeterminism([{a: Number.NaN}]))).toContain('34.17')
+
+    for (const unserializable of [{a: Number.NaN}, {a: Number.POSITIVE_INFINITY}, {a: 1n}]) {
+      const violations = checkCheckpointDeterminism([unserializable])
+      expect(ids(violations)).toEqual(['34.17'])
+      expect(violations[0]?.message).toMatch(/is not canonically serializable/)
+    }
   })
+
+  /*
+   * The *fixpoint* branch of `checkCheckpointDeterminism` has no test here on
+   * purpose. It is defensive: no value reachable through the real serializer can
+   * trigger it. That was checked, not assumed — 18 adversarial candidates (lone
+   * surrogates, `-0`, `1e21`, denormals, 2^53+1, `undefined` in an array, empty
+   * and control-character keys, U+2028, a BOM, integer-like key ordering) are all
+   * fixpoints. Writing a test for it would mean faking a serializer, which would
+   * assert on the fake rather than on production. The property itself *is*
+   * covered, directly and generatively: `core-properties.test.ts` asserts
+   * `serialize(parse(serialize(x))) === serialize(x)` over 48 generated
+   * documents, and mutating the serializer's key sort turns that red.
+   */
 })
 
 /* ------------------------------------------------------------------ *

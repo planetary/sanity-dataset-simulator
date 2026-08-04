@@ -57,6 +57,21 @@ interface LogRow {
   ms: number
   blocked: boolean
   upgrade?: boolean
+  /* --- websocket frame-audit rows (F5b) ---------------------------------- *
+   * Since the frame guard landed, the proxy also writes ONE ROW PER CLIENT
+   * FRAME on an upgraded socket. Those rows carry `frame: true` and the
+   * pseudo-method `WS`, because a frame has no HTTP request line. They are NOT
+   * requests and must never be fed to `classifyRequest` — `WS` is not an HTTP
+   * method, so default-deny classifies it a write and the replay harness would
+   * report the Studio's own listener socket as "newly blocked". Keeping the two
+   * populations separate is what stops that false positive.
+   */
+  frame?: boolean
+  opcode?: number
+  rpc?: string | null
+  rpcId?: string | null
+  wouldBlock?: boolean
+  reason?: string
 }
 
 /** One distinct `method + path` pair, with everything the session observed about it. */
@@ -107,7 +122,11 @@ function distinctRequestLines(rows: LogRow[]): RequestLine[] {
   return [...byKey.values()]
 }
 
-const ROWS = readLog()
+const ALL_ROWS = readLog()
+/** The websocket frame-audit rows — one per client frame, method `WS`. */
+const FRAME_ROWS = ALL_ROWS.filter((row) => row.frame === true)
+/** The HTTP request rows. Everything the replay harness reasons about. */
+const ROWS = ALL_ROWS.filter((row) => row.frame !== true)
 const REQUEST_LINES = distinctRequestLines(ROWS)
 
 /* ------------------------------------------------------------------ *
@@ -162,10 +181,14 @@ const ACCEPTED_STUDIO_DEGRADATIONS: readonly AcceptedDegradation[] = Object.free
       '@sanity/cli/dist/services/telemetry.js). It POSTs a batch of studio ' +
       'telemetry events to Sanity. No read semantics exist at this path.',
     consequence:
-      'None observable. The single occurrence in the log answered 401, so the ' +
-      'session never delivered a batch even with the proxy forwarding it. A ' +
-      'preview environment posting telemetry from a branch build is a leak, not a ' +
-      'feature — blocking it is the outcome we would choose anyway.',
+      'None observable, now confirmed live. The pre-guard occurrence answered ' +
+      '401, so the session never delivered a batch even with the proxy ' +
+      'forwarding it; the 2026-08-04 session then hit it three times and got ' +
+      '403 each time with no user-visible effect. The consent probe it is paired ' +
+      'with, GET /v2023-12-18/intake/telemetry-status, is a read and still ' +
+      'answers 200 — so the Studio resolves consent normally and merely drops ' +
+      'the batch. A preview environment posting telemetry from a branch build is ' +
+      'a leak, not a feature: blocking it is the outcome we would choose anyway.',
   },
   {
     method: 'GET',
@@ -208,8 +231,13 @@ describe('proxy-log replay · the evidence itself', () => {
     // Pinned so a truncated, rotated or emptied log cannot turn this suite into
     // a green no-op. Every assertion below is quantified over these rows; with
     // zero rows they all pass vacuously.
-    expect(ROWS.length).toBe(422)
-    expect(REQUEST_LINES.length).toBe(88)
+    // Re-pinned 2026-08-04 after a second live Studio session was appended to
+    // the log. Growth is expected — the log is append-only evidence — but it
+    // must be a REVIEWED diff, which is what pinning the totals forces.
+    expect(ALL_ROWS.length).toBe(730)
+    expect(ROWS.length).toBe(669)
+    expect(FRAME_ROWS.length).toBe(61)
+    expect(REQUEST_LINES.length).toBe(96)
   })
 
   it('the log contains request lines that actually succeeded', () => {
@@ -217,10 +245,15 @@ describe('proxy-log replay · the evidence itself', () => {
     expect(succeeded.length).toBeGreaterThanOrEqual(80)
   })
 
-  it('the log contains the six server-side blocked rows Spike F relies on', () => {
+  it('the log contains the server-side blocked rows Spike F relies on', () => {
     const blocked = ROWS.filter((row) => row.blocked)
-    expect(blocked.length).toBe(6)
+    // Six at the time of evidence review F3; fourteen after the 2026-08-04
+    // session, which added three `descriptors/claim` and three `intake/batch`
+    // 403s plus two more `data/actions`. Every one of them is a POST the guard
+    // refused server-side.
+    expect(blocked.length).toBe(14)
     expect(blocked.every((row) => row.status === 403)).toBe(true)
+    expect(blocked.every((row) => row.method === 'POST')).toBe(true)
   })
 
   it('every accepted degradation names a real request line in the log', () => {
@@ -261,15 +294,54 @@ describe('proxy-log replay · default-deny must not silently break the Studio', 
     },
   )
 
-  it('the set of newly-blocked request lines is exactly the pinned set', () => {
-    const newlyBlocked = REQUEST_LINES.filter(
-      (line) => !line.wasBlocked && isWriteRequest({method: line.method, url: line.path}),
-    ).map((line) => line.key)
+  it('the set of request lines the guard blocks is exactly the pinned set', () => {
+    const blockedByGuard = REQUEST_LINES.filter((line) =>
+      isWriteRequest({method: line.method, url: line.path}),
+    )
+      .map((line) => line.key)
+      .sort()
 
-    // Not "at most four" — exactly these four. A guard that stops blocking one
-    // of them has widened the allowlist and must say so here; a guard that
-    // blocks a fifth has broken something the Studio was doing.
-    expect(newlyBlocked.sort()).toEqual([...DEGRADATION_KEYS].sort())
+    // Not "at most seven" — exactly these seven, spelled out. A guard that stops
+    // blocking one of them has widened the allowlist and must say so in this
+    // diff; a guard that blocks an eighth has broken something the Studio does.
+    expect(blockedByGuard).toEqual(
+      [
+        'GET /',
+        'GET /favicon.ico',
+        'POST /v2023-12-18/intake/batch',
+        'POST /v2025-02-19/assets/images/parity',
+        'POST /v2025-02-19/data/actions/parity',
+        'POST /v2025-02-19/data/mutate/parity',
+        'POST /v2025-02-19/descriptors/claim',
+      ].sort(),
+    )
+  })
+
+  it('every line the guard blocks is either evidenced blocked live, or an accepted degradation', () => {
+    // The policy, stated once as a closed rule rather than as a list. Nothing
+    // may be blocked for which no one has either a server-side 403 or a written,
+    // source-cited justification.
+    const unjustified = REQUEST_LINES.filter(
+      (line) =>
+        isWriteRequest({method: line.method, url: line.path}) &&
+        !line.wasBlocked &&
+        !DEGRADATION_KEYS.has(line.key),
+    ).map((line) => line.key)
+    expect(unjustified).toEqual([])
+  })
+
+  it('the 2026-08-04 session put descriptors/claim and intake/batch behind real 403s', () => {
+    // F4, closed by live evidence rather than by argument. Both rulings were
+    // made from vendored source BEFORE this session ran; the session then
+    // exercised both endpoints for real and the guard refused them, server-side,
+    // three times each. That is what makes the degradation list observed rather
+    // than predicted.
+    for (const requestPath of ['/v2025-02-19/descriptors/claim', '/v2023-12-18/intake/batch']) {
+      const blocked = ROWS.filter((row) => row.path === requestPath && row.blocked)
+      expect(blocked.length, `${requestPath} has no blocked rows`).toBe(3)
+      expect(blocked.every((row) => row.status === 403 && row.method === 'POST')).toBe(true)
+      expect(DEGRADATION_KEYS.has(`POST ${requestPath}`)).toBe(true)
+    }
   })
 
   it('nothing the live session blocked is allowed through now', () => {
@@ -290,10 +362,166 @@ describe('proxy-log replay · default-deny must not silently break the Studio', 
     const allowed = REQUEST_LINES.filter(
       (line) => !isWriteRequest({method: line.method, url: line.path}),
     )
-    // 81 of 88 at the time of writing. Pinned as a floor so "default-deny" can
-    // never quietly become "deny the Studio" — the same non-vacuity guard the
-    // write-guard contract applies to its read cases.
-    expect(allowed.length).toBeGreaterThanOrEqual(81)
+    // 89 of 96 after the 2026-08-04 session (81 of 88 before it). Pinned as a
+    // floor so "default-deny" can never quietly become "deny the Studio" — the
+    // same non-vacuity guard the write-guard contract applies to its read cases.
+    expect(allowed.length).toBeGreaterThanOrEqual(89)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * F5b — the frame audit, evidenced by a live Studio
+ * ------------------------------------------------------------------ */
+
+describe('F5b · the websocket frame audit ran against a real Studio', () => {
+  it('the live session upgraded and the guard classified every client frame', () => {
+    // The upgrade path is not theory: a real Studio completed the RFC 6455
+    // handshake through the proxy and the guard read its traffic frame by frame.
+    const upgrades = ROWS.filter((row) => row.upgrade && row.status === 101)
+    expect(upgrades.length).toBeGreaterThanOrEqual(4)
+    expect(upgrades.every((row) => row.path === '/v2022-06-30/socket/parity')).toBe(true)
+
+    expect(FRAME_ROWS.length).toBe(61)
+    // Every frame row carries a verdict. A row without one would mean the guard
+    // forwarded bytes it had not classified.
+    expect(FRAME_ROWS.every((row) => typeof row.reason === 'string' && row.reason.length > 0)).toBe(
+      true,
+    )
+    expect(FRAME_ROWS.every((row) => row.frame === true && row.method === 'WS')).toBe(true)
+  })
+
+  it('every RPC method the live Studio sent is one the allowlist names', () => {
+    // The allowlist was written from @sanity/bifur-client's source before this
+    // session existed. This is the check that it matches what Studio actually
+    // sends — i.e. that enforcing it does not break the real client.
+    const rpcMethods = [...new Set(FRAME_ROWS.map((row) => row.rpc).filter(Boolean))].sort()
+    expect(rpcMethods).toEqual([
+      'authorization',
+      'presence_announce',
+      'presence_disconnect',
+      'presence_rollcall',
+      'presence_subscribe',
+    ])
+    // Not one frame the real Studio sent would have been refused.
+    expect(FRAME_ROWS.filter((row) => row.wouldBlock)).toEqual([])
+    // And `mutate` — the method that motivated the whole guard — never appeared,
+    // which is exactly why it could only ever be ruled on from source.
+    expect(rpcMethods).not.toContain('mutate')
+  })
+
+  it('the frames the guard saw are text and control frames only', () => {
+    // 0x1 text (the JSON-RPC envelopes), 0x8 close, 0xa pong. A binary or
+    // reserved opcode from the real client would mean the allowlist was written
+    // against the wrong protocol.
+    const opcodes = [...new Set(FRAME_ROWS.map((row) => row.opcode))].sort(
+      (a, b) => Number(a) - Number(b),
+    )
+    expect(opcodes).toEqual([1, 8, 10])
+  })
+
+  it('no frame row ever recorded a payload', () => {
+    // The first frame bifur sends is `{method:'authorization', params:{
+    // authorization:'Bearer <token>'}}`. A guard that logged params would have
+    // written the user's credential to this file. Assert the SHAPE of every row
+    // rather than grepping for a token: the property is "no payload field
+    // exists", not "this particular secret is absent".
+    const permitted = new Set([
+      'at',
+      'method',
+      'path',
+      'status',
+      'ms',
+      'blocked',
+      'upgrade',
+      'frame',
+      'opcode',
+      'rpc',
+      'rpcId',
+      'wouldBlock',
+      'reason',
+    ])
+    for (const row of FRAME_ROWS) {
+      const unexpected = Object.keys(row).filter((key) => !permitted.has(key))
+      expect(unexpected, `frame row at ${row.at} carries ${unexpected.join(',')}`).toEqual([])
+    }
+    expect(JSON.stringify(FRAME_ROWS)).not.toMatch(/Bearer|"params"/)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * the HTTP/1.1 connection-pool starvation, as the live log records it
+ * ------------------------------------------------------------------ *
+ * The 2026-08-04 session hung the structure tool with
+ *   `Socket timed out on request to .../data/doc/parity/drafts.author-2`.
+ * The mechanism is reproduced end to end in `proxy-concurrency.test.ts`; what is
+ * pinned HERE is the live artifact that mechanism explains, so the finding
+ * cannot be quietly dropped by editing a comment somewhere.
+ */
+
+describe('the starved-request signature in the live log', () => {
+  /** `at` is written on COMPLETION, so a request's start is `at - ms`. */
+  const interval = (row: LogRow) => {
+    const end = new Date(row.at).getTime()
+    return {start: end - row.ms, end}
+  }
+
+  it('the request Studio reported as timed out has preflights but no GET row', () => {
+    const hung = '/v2025-02-19/data/doc/parity/drafts.author-2'
+    const window = ROWS.filter((row) => row.path === hung && row.at < '2026-08-04T20:50:00')
+
+    // Two 204 preflights at 20:47:43.65x ...
+    expect(window.map((row) => row.method)).toEqual(['OPTIONS', 'OPTIONS'])
+    expect(window.every((row) => row.status === 204)).toBe(true)
+    // ... and no GET. Rows are written on completion, so a GET with no row never
+    // completed. The browser never sent it: it was queued behind the listeners.
+    expect(window.filter((row) => row.method === 'GET')).toEqual([])
+  })
+
+  it('the same endpoint answered normally once the page had settled', () => {
+    // Load-dependent starvation, not a broken route. Without this the diagnosis
+    // would be "the endpoint is blocked", which is false, and would send the fix
+    // to the write guard instead of to the transport.
+    const later = ROWS.find(
+      (row) => row.path === '/v2025-02-19/data/doc/parity/drafts.author-2' && row.method === 'GET',
+    )
+    expect(later).toBeDefined()
+    expect(later!.status).toBe(200)
+    expect(later!.ms).toBeLessThan(1000)
+    expect(later!.at > '2026-08-04T20:50:00').toBe(true)
+  })
+
+  it('long-lived listener streams saturated the browsers six-connection budget', () => {
+    // The cause, measured. Chrome allows six HTTP/1.1 connections per host; the
+    // session held at least that many listener streams open at once.
+    const longLived = ROWS.filter(
+      (row) => row.method === 'GET' && /\/listen/.test(row.path) && row.ms > 10_000,
+    ).map(interval)
+    expect(longLived.length).toBeGreaterThanOrEqual(7)
+
+    const events = longLived.flatMap(({start, end}) => [
+      {t: start, d: 1},
+      {t: end, d: -1},
+    ])
+    events.sort((a, b) => a.t - b.t || a.d - b.d)
+    let open = 0
+    let peak = 0
+    for (const {d} of events) {
+      open += d
+      peak = Math.max(peak, open)
+    }
+    expect(peak).toBeGreaterThanOrEqual(6)
+  })
+
+  it('listener GETs outnumber their completions, the signature of streams left hanging', () => {
+    // A preflight with no completed GET is a request that never finished. Across
+    // the session the listener path was preflighted far more often than it
+    // completed — the accumulation that eventually starved everything else.
+    const listen = (method: string) =>
+      ROWS.filter((row) => row.method === method && row.path === '/v2025-02-19/data/listen/parity')
+        .length
+    expect(listen('OPTIONS')).toBe(18)
+    expect(listen('GET')).toBe(8)
+    expect(listen('OPTIONS')).toBeGreaterThan(listen('GET'))
   })
 })
 
@@ -380,5 +608,164 @@ describe('F3 · the seven shapes Spike F claims were re-verified live', () => {
     // verb in it cannot be the log of the run that exercised them.
     const methods = new Set(ROWS.map((row) => row.method))
     expect([...methods].sort()).toEqual(['GET', 'OPTIONS', 'POST'])
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * F3 · grading the live run the README asks for
+ * ------------------------------------------------------------------ *
+ * `examples/kitchen-sink/spikeB-proxy/README.md`, "Substantiating a
+ * re-verified-live claim", tells the orchestrator to run the seven shapes
+ * through a live proxy with `PROXY_LOG=…/proxy-log-reverify.jsonl` and commit
+ * the result. This block is the machine that grades it, so "re-verified live"
+ * stops being prose the moment the file lands.
+ *
+ * The grader is tested against synthetic logs FIRST — including the committed
+ * `proxy-log.jsonl`, which must FAIL, because that is precisely the substitution
+ * F3 caught: an old log offered in place of the run that never happened.
+ */
+
+const REVERIFY_LOG_PATH = path.resolve(
+  HERE,
+  '../../../examples/kitchen-sink/spikeB-proxy/proxy-log-reverify.jsonl',
+)
+
+interface ShapeVerdict {
+  claim: string
+  ok: boolean
+  reason: string
+}
+
+/**
+ * Exactly the rule the README's `node -e` snippet applies, so the two cannot
+ * drift: one row per shape with `blocked: true` and `status: 403`, no row on
+ * that shape that was NOT blocked, and at least one allowlisted read that
+ * succeeded in the same log.
+ */
+function gradeReverifyLog(rows: LogRow[]): {shapes: ShapeVerdict[]; liveness: ShapeVerdict} {
+  const shapes = SPIKE_F_RE_VERIFIED_SHAPES.map((shape) => {
+    const onShape = rows.filter((row) => row.method === shape.method && row.path === shape.path)
+    const blocked = onShape.find((row) => row.blocked === true && row.status === 403)
+    const leaked = onShape.find((row) => row.blocked !== true)
+    if (leaked) {
+      return {
+        claim: shape.claim,
+        ok: false,
+        reason: `reached upstream (status ${leaked.status}, blocked=${leaked.blocked})`,
+      }
+    }
+    if (!blocked) return {claim: shape.claim, ok: false, reason: 'no blocked 403 row in the log'}
+    return {claim: shape.claim, ok: true, reason: 'blocked 403, server-side'}
+  })
+
+  const alive = rows.some(
+    (row) => row.method === 'GET' && !row.blocked && row.status >= 200 && row.status < 300,
+  )
+  return {
+    shapes,
+    liveness: {
+      claim: 'proxy answered an allowlisted read in the same session',
+      ok: alive,
+      // Without this a proxy that 403s absolutely everything scores 7/7.
+      reason: alive ? 'at least one 2xx GET' : 'no allowlisted read succeeded',
+    },
+  }
+}
+
+/** The shape of a log the README's checklist would accept. */
+function syntheticPassingLog(): LogRow[] {
+  const rows: LogRow[] = SPIKE_F_RE_VERIFIED_SHAPES.map((shape, index) => ({
+    at: new Date(Date.UTC(2026, 7, 5, 12, 0, index)).toISOString(),
+    method: shape.method,
+    path: shape.path,
+    status: 403,
+    ms: 0,
+    blocked: true,
+  }))
+  rows.push({
+    at: new Date(Date.UTC(2026, 7, 5, 12, 0, 30)).toISOString(),
+    method: 'GET',
+    path: '/v2025-02-19/ping',
+    status: 200,
+    ms: 12,
+    blocked: false,
+  })
+  return rows
+}
+
+describe('F3 · the grader for a future live re-verification run', () => {
+  it('accepts a log that satisfies the README checklist', () => {
+    const graded = gradeReverifyLog(syntheticPassingLog())
+    expect(graded.shapes.filter((verdict) => !verdict.ok)).toEqual([])
+    expect(graded.liveness.ok).toBe(true)
+  })
+
+  it('rejects the committed proxy-log.jsonl — which is exactly what F3 found', () => {
+    // The whole finding, as an executable assertion: offering the existing log
+    // as evidence for the seven shapes fails on six of them. If this ever goes
+    // green against `proxy-log.jsonl`, the log has been overwritten and the
+    // repository has lost the session it records.
+    const graded = gradeReverifyLog(ROWS)
+    const passed = graded.shapes.filter((verdict) => verdict.ok).map((verdict) => verdict.claim)
+    expect(passed).toEqual(['/assets/images/*'])
+    expect(graded.shapes.filter((verdict) => !verdict.ok)).toHaveLength(6)
+  })
+
+  it('rejects a log missing the non-POST verbs', () => {
+    const rows = syntheticPassingLog().filter((row) => row.method === 'POST' || !row.blocked)
+    const graded = gradeReverifyLog(rows)
+    const failed = graded.shapes.filter((verdict) => !verdict.ok).map((verdict) => verdict.claim)
+    expect(failed).toEqual(['DELETE /datasets/*'])
+  })
+
+  it('rejects a log in which a shape reached upstream', () => {
+    const rows = syntheticPassingLog()
+    const escapee = rows.find((row) => row.path.endsWith('/DATA/MUTATE/parity'))!
+    escapee.blocked = false
+    escapee.status = 200
+    const graded = gradeReverifyLog(rows)
+    const failed = graded.shapes.filter((verdict) => !verdict.ok)
+    expect(failed.map((verdict) => verdict.claim)).toEqual(['/DATA/MUTATE/'])
+    expect(failed[0].reason).toContain('reached upstream')
+  })
+
+  it('rejects a log from a proxy that blocked everything', () => {
+    // Non-vacuity in the other direction: 7/7 blocked is not evidence unless a
+    // read got through in the same session.
+    const rows = syntheticPassingLog().filter((row) => row.blocked)
+    const graded = gradeReverifyLog(rows)
+    expect(graded.shapes.every((verdict) => verdict.ok)).toBe(true)
+    expect(graded.liveness.ok).toBe(false)
+  })
+})
+
+describe('F3 · has the live re-verification actually happened?', () => {
+  const present = fs.existsSync(REVERIFY_LOG_PATH)
+
+  it('the live re-verification has not happened yet', () => {
+    // A PINNED LITERAL, not a skip. `describe.skipIf` would let the whole leg
+    // vanish silently (evidence review F7); this cannot. Committing
+    // proxy-log-reverify.jsonl turns this assertion red, and flipping it to
+    // `true` is what switches the block below on. The claim in
+    // spike-f-safety-boundary/report.md:64 therefore cannot be marked verified
+    // without the server-side artifact landing in the same diff.
+    expect(present).toBe(false)
+  })
+
+  it('grades the re-verification log when one exists', () => {
+    if (!present) {
+      // Not a silent pass: the assertion above is what fails if this branch is
+      // taken after the log lands.
+      expect(present).toBe(false)
+      return
+    }
+    const rows = fs
+      .readFileSync(REVERIFY_LOG_PATH, 'utf8')
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as LogRow)
+    const graded = gradeReverifyLog(rows)
+    expect(graded.shapes.filter((verdict) => !verdict.ok)).toEqual([])
+    expect(graded.liveness.ok).toBe(true)
   })
 })

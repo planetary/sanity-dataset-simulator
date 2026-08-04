@@ -112,8 +112,18 @@ function utcTimeString(date: Date): string {
 }
 
 function pem(label: string, der: Buffer): string {
-  const body = der.toString('base64').replace(/(.{64})/g, '$1\n')
-  return `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n`
+  // Chunked by slicing, NOT by `.replace(/(.{64})/g, '$1\n')`: that form emits a
+  // trailing newline when the base64 length is an exact multiple of 64, and the
+  // template then adds a second one. The resulting blank line makes OpenSSL's
+  // PEM reader stop early and the certificate fails to parse with an ASN.1
+  // "wrong tag". ECDSA signatures are 70-72 bytes depending on the random `r`
+  // and `s`, so the total length — and therefore the bug — varies run to run.
+  const base64 = der.toString('base64')
+  const lines: string[] = []
+  for (let offset = 0; offset < base64.length; offset += 64) {
+    lines.push(base64.slice(offset, offset + 64))
+  }
+  return `-----BEGIN ${label}-----\n${lines.join('\n')}\n-----END ${label}-----\n`
 }
 
 interface SelfSignedCert {
@@ -154,9 +164,14 @@ function selfSignedLocalhostCert(): SelfSignedCert {
     ),
   )
 
+  // Serial: random, but with the top byte forced into 0x01-0x7f so the DER
+  // INTEGER is both positive and minimally encoded without a pad byte.
+  const serial = crypto.randomBytes(8)
+  serial[0] = (serial[0] % 0x7f) + 1
+
   const tbs = seq(
     explicit(0, tlv(0x02, Buffer.from([0x02]))), // version v3
-    derInteger(crypto.randomBytes(8)),
+    derInteger(serial),
     ecdsaWithSha256,
     commonName, // issuer
     validity,
@@ -404,8 +419,30 @@ function upgradeThroughProxy(port: number, requestPath: string, key: string): Pr
 
 const SOCKET_PATH = '/v2022-06-30/socket/parity'
 const CERT = selfSignedLocalhostCert()
-console.log('CERTHEAD', JSON.stringify(CERT.certPem.slice(0,40)), CERT.certPem.length, JSON.stringify(CERT.keyPem.slice(0,40)))
-try { new crypto.X509Certificate(CERT.certPem) ; console.log('X509 OK') } catch (e) { console.log('X509 FAIL', e.message) }
+
+/* ------------------------------------------------------------------ *
+ * 0. the test's own instrument
+ * ------------------------------------------------------------------ */
+
+describe('spikeB-proxy · the self-signed certificate this file builds', () => {
+  /**
+   * Non-vacuity for the harness itself. Everything below depends on a real
+   * TLS handshake happening; a certificate that silently failed to parse would
+   * turn "the proxy answered 502" from a proof of the tls branch into an
+   * artifact of broken test infrastructure. This assertion is what tells the
+   * two apart, and it is what caught the `pem()` line-wrapping bug.
+   */
+  it('is a certificate Node can actually parse, with the SANs the tests rely on', () => {
+    const parsed = new crypto.X509Certificate(CERT.certPem)
+    expect(parsed.subject).toContain('CN=localhost')
+    expect(parsed.subjectAltName).toContain('DNS:localhost')
+    expect(parsed.subjectAltName).toContain('127.0.0.1')
+    expect(new Date(parsed.validTo).getTime()).toBeGreaterThan(Date.now())
+    // And it is genuinely untrusted, which is what test 2 below turns into
+    // proof that the proxy verifies.
+    expect(tls.rootCertificates).not.toContain(CERT.certPem)
+  })
+})
 
 /* ------------------------------------------------------------------ *
  * 1. the dial decision, on its own

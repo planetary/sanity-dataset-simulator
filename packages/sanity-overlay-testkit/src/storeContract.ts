@@ -364,6 +364,23 @@ export function runStoreContractSuite(name: string, makeStore: StoreContractFact
         'INVALID_REQUEST',
       )
       expect((await store.readManifest(CONTRACT_OVERLAY_ID)).revision).toBe(1)
+
+      /* The overlayId *is* the overlay's identity (PRD §12.1) — not a field a
+       * write may edit. A body that renames the overlay is refused even when its
+       * revision arithmetic is impeccable, so a manifest write can never
+       * re-identify the state it replaces. */
+      await expectStoreError(
+        () =>
+          store.writeManifestConditional(
+            CONTRACT_OVERLAY_ID,
+            {...reread, overlayId: 'some-other-overlay', revision: reread.revision + 1},
+            reread.revision,
+          ),
+        'OVERLAY_IDENTITY_MISMATCH',
+      )
+      const unchanged = await store.readManifest(CONTRACT_OVERLAY_ID)
+      expect(unchanged.overlayId).toBe(CONTRACT_OVERLAY_ID)
+      expect(unchanged.revision).toBe(1)
     })
 
     /* ---------------------------------------------------------- 4 */
@@ -411,6 +428,23 @@ export function runStoreContractSuite(name: string, makeStore: StoreContractFact
           ),
         'DOCUMENT_REVISION_CONFLICT',
       )
+
+      /* A record carrying a foreign `overlayId` is refused, never silently
+       * refiled under this overlay (PRD §12.1, §13.3). The rejection happens
+       * before anything is stored, so no head and no revision appear. */
+      const beforeForeign = await store.readManifest(CONTRACT_OVERLAY_ID)
+      await expectStoreError(
+        () =>
+          store.putDocumentRevision(CONTRACT_OVERLAY_ID, {
+            ...documentRecordFixture({logicalId: 'article-2'}),
+            overlayId: 'some-other-overlay',
+          }),
+        'OVERLAY_IDENTITY_MISMATCH',
+      )
+      const afterForeign = await store.readManifest(CONTRACT_OVERLAY_ID)
+      expect(afterForeign.revision).toBe(beforeForeign.revision)
+      expect(afterForeign.documentHeads['article-2']).toBeUndefined()
+      expect(await store.readDocumentByLogicalId(CONTRACT_OVERLAY_ID, 'article-2')).toBeNull()
     })
 
     /* ---------------------------------------------------------- 5 */
@@ -519,6 +553,22 @@ export function runStoreContractSuite(name: string, makeStore: StoreContractFact
       expect(
         await store.getTransaction(CONTRACT_OVERLAY_ID, {transactionId: 'tx-does-not-exist'}),
       ).toBeNull()
+
+      /* A transaction is scoped to the overlay that committed it (PRD §12.1,
+       * §13.10). Asking under a different overlay ID is an identity error, not a
+       * silent hit — otherwise an idempotency key could replay one overlay's
+       * committed work into another. */
+      await expectStoreError(
+        () =>
+          store.getTransaction('some-other-overlay', {
+            transactionId: first.transaction.transactionId,
+          }),
+        'OVERLAY_IDENTITY_MISMATCH',
+      )
+      await expectStoreError(
+        () => store.getTransaction('some-other-overlay', {idempotencyKey: 'replay-key'}),
+        'OVERLAY_IDENTITY_MISMATCH',
+      )
     })
 
     /* ---------------------------------------------------------- 7 */
@@ -576,6 +626,29 @@ export function runStoreContractSuite(name: string, makeStore: StoreContractFact
           }),
         'OVERLAY_WRITE_CONFLICT',
       )
+      expect((await store.readManifest(CONTRACT_OVERLAY_ID)).revision).toBe(readerA.revision + 1)
+
+      /* The per-document precondition guards a commit as well as a single write
+       * (PRD §25.5 `expectedDocumentRevisions`): a caller that believes it holds
+       * `article-1` at some revision must lose when the overlay disagrees — here
+       * the document does not exist at all, so every expectation is stale. */
+      await expectStoreError(
+        () =>
+          store.commitTransaction(CONTRACT_OVERLAY_ID, {
+            idempotencyKey: 'stale-document-commit',
+            actor: CONTRACT_ACTOR,
+            mutations: [],
+            records: [documentRecordFixture({logicalId: 'article-1'})],
+            expectedDocumentRevisions: {'article-1': 'overlay.9.aaaaaaaaaaaa'},
+          }),
+        'DOCUMENT_REVISION_CONFLICT',
+      )
+      /* The rejected commit is not recorded, so its key stays replayable. */
+      expect(
+        await store.getTransaction(CONTRACT_OVERLAY_ID, {
+          idempotencyKey: 'stale-document-commit',
+        }),
+      ).toBeNull()
       expect((await store.readManifest(CONTRACT_OVERLAY_ID)).revision).toBe(readerA.revision + 1)
     })
 

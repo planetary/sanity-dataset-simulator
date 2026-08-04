@@ -1043,6 +1043,12 @@ describe('spikeB-proxy · upgrade x write-guard composition', () => {
   it('still lets the real listener socket through with the guard on', async () => {
     // The other half of the ruling: guarding this path must not cost the feature
     // it exists for. Without this, "block every upgrade" would pass everything above.
+    //
+    // The payload is a REAL @sanity/bifur-client frame rather than an arbitrary
+    // string, because since evidence review F5b the proxy also classifies the
+    // frames themselves (see test/proxy-ws-frames.test.ts). An arbitrary string
+    // is not JSON-RPC and is now correctly refused — this test asserts the
+    // Studio's actual traffic survives, which is the property that matters.
     const upstream = await useUpstream()
     const proxy = await startProxy(upstream.origin, {blockWrites: true})
 
@@ -1050,8 +1056,14 @@ describe('spikeB-proxy · upgrade x write-guard composition', () => {
     expect(client.status).toBe(101)
 
     expect(await client.frames.nextText('the welcome frame')).toContain('welcome')
-    client.send('mutation-1')
-    expect(await client.frames.nextText()).toBe('echo:mutation-1')
+    const presence = JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'presence_announce',
+      params: {data: {locations: [], sessionId: 's-1'}, apiVersion: 'v1'},
+      id: 'p1',
+    })
+    client.send(presence)
+    expect(await client.frames.nextText()).toBe(`echo:${presence}`)
 
     const [upgrade] = await upstream.waitForUpgrades(1)
     expect(upgrade.url).toBe(`${SOCKET_PATH}?query=*`)

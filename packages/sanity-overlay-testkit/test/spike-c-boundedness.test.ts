@@ -256,6 +256,17 @@ async function planSelected(c: Ctx): Promise<number> {
   return diagnostics.candidateCount - diagnostics.referenceExpansions
 }
 
+/**
+ * EVERY document the planner materialized, reference expansion included. This
+ * is the quantity §22.6 is actually about — documents transferred — whereas
+ * `planSelected` isolates the plan's own choice. Asserting only `planSelected`
+ * would leave dereference free to be unbounded.
+ */
+async function totalMaterialized(c: Ctx): Promise<number> {
+  const {diagnostics} = await evaluateRegistered(c.def, c.dataset, c.overlay, c.params)
+  return diagnostics.candidateCount
+}
+
 // ===========================================================================
 // 1. Every supported query is classified, and the table cannot rot silently.
 // ===========================================================================
@@ -331,7 +342,19 @@ describe('§22.6: plan-selected candidates stay within the independent ceiling',
 
 const clone = <T>(x: T): T => JSON.parse(JSON.stringify(x)) as T
 
-/** Deterministic 10x fixture: 300 articles, same pages/authors/settings. */
+/**
+ * Deterministic 10x fixture: 300 articles, same pages/authors/settings.
+ *
+ * INVARIANT — the added documents must sort strictly BELOW every original on
+ * EVERY field the registry orders by (`publishedAt` and `_createdAt`), so that
+ * every top-K answer is byte-identical at 1x and 10x. Otherwise scaling changes
+ * the ANSWER as well as the dataset and the sweep measures two things at once.
+ * Missing `_createdAt` here is what made the first run of the total-materialized
+ * test go red: ten clones tied on each original timestamp, the top-5 `_createdAt`
+ * window drew from the tie group, and it dereferenced a different set of authors.
+ */
+const ORDER_FIELDS = ['publishedAt', '_createdAt'] as const
+
 function scaleArticles(dataset: FixtureDocument[], factor: number): FixtureDocument[] {
   const out = [...dataset]
   const articles = dataset.filter((d) => d._type === 'article')
@@ -340,10 +363,12 @@ function scaleArticles(dataset: FixtureDocument[], factor: number): FixtureDocum
       const n = copy * 1000 + Number(a._id.slice('article-'.length))
       const d = clone(a)
       d._id = `article-${n}`
+      d._rev = `fixture-rev-article-${n}`
       d.title = `Article ${n}`
       d.slug = {_type: 'slug', current: `article-scale-${n}`}
-      // Sort strictly BELOW every original so top-K answers stay stable.
-      d.publishedAt = `2025-01-01T12:00:${String(n % 60).padStart(2, '0')}Z`
+      const stamp = `2025-01-01T12:00:${String(n % 60).padStart(2, '0')}Z`
+      for (const f of ORDER_FIELDS) d[f] = stamp
+      d._updatedAt = stamp
       out.push(d)
     }
   }
@@ -361,6 +386,23 @@ describe('§22.6: boundedness at 10x dataset scale', () => {
     expect(
       scaled.filter((d) => (d.slug as {current?: string} | undefined)?.current === 'article-7'),
     ).toHaveLength(1)
+  })
+
+  it('every added article sorts strictly below every original on every ordered field', () => {
+    // Guards the invariant above. Without it the 10x sweep silently changes the
+    // ANSWER as well as the dataset, and a "grew by 2" reads as a planner bug.
+    const originals = base.filter((d) => d._type === 'article')
+    const originalIds = new Set(originals.map((d) => d._id))
+    const added = scaled.filter((d) => d._type === 'article' && !originalIds.has(d._id))
+    expect(added).toHaveLength(270)
+    for (const f of ORDER_FIELDS) {
+      const ms = (d: FixtureDocument) => Date.parse(String(d[f]))
+      const lowestOriginal = Math.min(...originals.map(ms))
+      const highestAdded = Math.max(...added.map(ms))
+      expect(highestAdded, `field ${f}: added must sort strictly below originals`).toBeLessThan(
+        lowestOriginal,
+      )
+    }
   })
 
   it.each(CASES)('%s stays within its ceiling at 10x', async (_label, def, ov) => {
@@ -398,6 +440,19 @@ describe('§22.6: boundedness at 10x dataset scale', () => {
         sel10 - sel1,
         `${def.id} x ${ov}: candidates grew ${sel10 - sel1}, answer grew ${ans10 - ans1}`,
       ).toBeLessThanOrEqual(ans10 - ans1 + branchDelta(c10, BOUNDS[def.id].types))
+    },
+  )
+
+  // Reference expansion is the one mechanism `planSelected` deliberately does
+  // not police. If it grew with the dataset, a "constant" plan would still
+  // transfer a linear number of documents and §22.6 would be unproven — so the
+  // TOTAL is pinned too, not just the plan's own choice.
+  it.each(casesWhere((id) => BOUNDS[id].klass === 'constant'))(
+    '%s materializes the SAME total (reference expansion included) at 1x and 10x',
+    async (_label, def, ov) => {
+      const at1 = await totalMaterialized(ctxFor(def, base, ov))
+      const at10 = await totalMaterialized(ctxFor(def, scaled, ov))
+      expect(at10, `${def.id} x ${ov}: 1x total ${at1}, 10x total ${at10}`).toBe(at1)
     },
   )
 
@@ -455,4 +510,61 @@ describe('non-vacuity: deliberately unbounded planners must fail this suite', ()
     expect(ceiling).toBe(1)
     expect(typeScan(c, ['article'])).toBe(300)
   })
+})
+
+// ===========================================================================
+// 5. NON-VACUITY, END TO END. Section 4 argues arithmetically about what an
+// unbounded planner WOULD select. That is not the same as running one: the
+// numbers could be right while `diagnostics.candidateCount` under-reports, or
+// while `planSelected` subtracts away the over-fetch as "reference expansion".
+//
+// So these two run the REAL `evaluateRegistered` with the plan swapped for a
+// deliberately unbounded one, and require the ceiling sweep above to reject it.
+// The first self-correction happened because nothing like this existed.
+// ===========================================================================
+
+const ALL_TYPES = [...new Set(base.map((d) => d._type))]
+
+/** The same def with its candidate plan replaced by an unbounded scan. */
+const withPlan = (def: SpikeQueryDefinition, types: string[]): SpikeQueryDefinition => ({
+  ...def,
+  candidatePlan: {type: 'types', types},
+})
+
+describe('non-vacuity (executed): a deliberately unbounded planner fails the ceiling sweep', () => {
+  it('the mutant plans really are distinct from the registered ones', () => {
+    expect(ALL_TYPES.length).toBeGreaterThan(1)
+    // A `types`-over-every-type plan is the E2/E3/E4 mutation in plan form.
+    expect(ALL_TYPES).toContain('article')
+    expect(ALL_TYPES).toContain('page')
+  })
+
+  it.each(CASES)(
+    '%s: a whole-dataset plan run through the real planner exceeds the ceiling',
+    async (_label, def, ov) => {
+      const c = ctxFor(def, base, ov)
+      const ceiling = await BOUNDS[def.id].ceiling(c)
+      const mutant = await planSelected({...c, def: withPlan(def, ALL_TYPES)})
+      expect(
+        mutant,
+        `${def.id} x ${ov}: unbounded planner selected ${mutant}, ceiling ${ceiling} — if this passes, the ceiling is vacuous`,
+      ).toBeGreaterThan(ceiling)
+    },
+  )
+
+  it.each(casesWhere((id) => BOUNDS[id].klass === 'constant'))(
+    '%s: the PRE-F6 plan (scan the candidate type) exceeds the ceiling',
+    async (_label, def, ov) => {
+      // This is precisely what `article-by-slug` used to do: 30 documents in,
+      // 1 document out, and the old GAP-2 ceiling said fine.
+      const c = ctxFor(def, base, ov)
+      const spec = BOUNDS[def.id]
+      const ceiling = await spec.ceiling(c)
+      const mutant = await planSelected({...c, def: withPlan(def, spec.types)})
+      expect(
+        mutant,
+        `${def.id} x ${ov}: a full ${spec.types.join('/')} scan selected ${mutant}, ceiling ${ceiling}`,
+      ).toBeGreaterThan(ceiling)
+    },
+  )
 })

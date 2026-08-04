@@ -19,12 +19,45 @@
  * - Hunk header `@@ -start1[,length1] +start2[,length2] @@`. Following upstream,
  *   an omitted length means `1` and the start is 1-based; an explicit length of
  *   `0` means an insertion point and the start is 0-based.
+ * - **Every number in that header counts UTF-8 bytes, not UTF-16 code units.**
+ *   See "Coordinates are bytes" below — this is the single most load-bearing
+ *   fact about the format, and reading them as JavaScript string indices breaks
+ *   every edit containing a non-ASCII character.
  * - Body lines prefixed ` ` (equality/context), `-` (deletion) and `+`
  *   (insertion). Line payloads are `encodeURI`-encoded with `%20` written back as
  *   a literal space, so they are read with `decodeURI`.
  * - Blank lines between hunks are ignored (upstream does the same).
  * - Multiple hunks in one patch string, applied left to right with a running
  *   offset.
+ *
+ * ## Coordinates are bytes
+ *
+ * `patch_toText` writes `utf8Start1`/`utf8Length1`/`utf8Start2`/`utf8Length2`,
+ * all measured in UTF-8 bytes; `patch_fromText` reads them back the same way and
+ * converts to UTF-16 indices against the target string. JavaScript string
+ * indices are UTF-16 code units, and the two numbers coincide only for ASCII —
+ * which is why a suite full of ASCII fixtures can pass while every em dash,
+ * curly apostrophe, accented letter, CJK character and emoji fails in
+ * production. This module therefore keeps {@link DiffMatchPatchHunk} in the
+ * byte domain and crosses into UTF-16 exactly once, in
+ * {@link byteOffsetToIndex}.
+ *
+ * Two subtleties worth stating, because both are silent when wrong:
+ *
+ * 1. **Astral characters have three different counts.** `"🎉"` is one code
+ *    point, two UTF-16 code units, and four true UTF-8 bytes — but
+ *    diff-match-patch's own `countUtf8Bytes` walks *code units* and asks
+ *    `codePointAt` at each, charging 4 for the lead surrogate and a further 3
+ *    for the trailing one: **7**. `patch_make` and `patch_fromText` apply that
+ *    convention symmetrically, so 7 is what the wire format means and what
+ *    {@link byteLength} reproduces. A `TextEncoder` would disagree and reject
+ *    every valid patch containing an emoji.
+ * 2. **Starts are rolling, not absolute.** `patch_make` resets its running
+ *    counters to the post-patch text after each hunk, so hunk *n*'s start is an
+ *    offset into the text as already modified by hunks `0…n-1` — exactly what
+ *    upstream `patch_apply` assumes when it uses `start2` directly. Adding a
+ *    running delta on top of it double-counts and lands later hunks past their
+ *    context.
  *
  * ## What this deliberately does not implement
  *
@@ -40,27 +73,68 @@
  * |---|---|
  * | Malformed or missing hunk header, body line with an unknown prefix, body line before any header | `OVERLAY_DMP_PATCH_INVALID` |
  * | Malformed percent-escape in a body line | `OVERLAY_DMP_PATCH_INVALID` |
- * | Hunk `length1` disagreeing with the context+deletion payload it declares | `OVERLAY_DMP_PATCH_INVALID` |
+ * | Hunk `length1` disagreeing with the byte length of the context+deletion payload it declares | `OVERLAY_DMP_PATCH_INVALID` |
  * | Unidiff file headers (`--- a`, `+++ b`), `\ No newline at end of file`, or any other non-`@@` framing | `OVERLAY_DMP_PATCH_UNSUPPORTED` |
- * | Hunk start beyond the end of the target text, or context that does not match the target byte-for-byte at `start1` | `OVERLAY_DMP_CONTEXT_MISMATCH` |
+ * | Hunk start beyond the end of the target text, a start that falls strictly inside a character, or context that does not match the target exactly there | `OVERLAY_DMP_CONTEXT_MISMATCH` |
  *
  * A caller that needs fuzzy application must supply the already-resolved string
  * with `set` instead; §17.9 already forbids replaying a diff against a later base.
  */
 import {OverlayDiffMatchPatchError} from '../errors'
+import {utf8CodePointLength} from '../utf8'
 
 const HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$/
 
 export type DiffOp = 'equal' | 'delete' | 'insert'
 
 export interface DiffMatchPatchHunk {
-  /** 0-based offset into the source text. */
+  /** 0-based **UTF-8 byte** offset into the source text. */
   start1: number
+  /** Byte length of this hunk's context and deletions. */
   length1: number
-  /** 0-based offset into the destination text. */
+  /** 0-based **UTF-8 byte** offset into the destination text. */
   start2: number
+  /** Byte length of this hunk's context and insertions. */
   length2: number
   diffs: {op: DiffOp; text: string}[]
+}
+
+/**
+ * Byte length of `text` in the accounting `patch_toText` uses for the numbers it
+ * writes into a hunk header: one contribution per UTF-16 code unit, sized by the
+ * code point starting at that unit.
+ *
+ * For everything in the BMP this is the true UTF-8 length. For an astral
+ * character it is not — the lead surrogate is charged the code point's 4 bytes
+ * and the trailing surrogate a further 3 — but `patch_make` and `patch_fromText`
+ * both count that way, so it is the definition the wire format carries. See the
+ * module comment.
+ */
+function byteLength(text: string): number {
+  let bytes = 0
+  for (let index = 0; index < text.length; index += 1) {
+    bytes += utf8CodePointLength(text.codePointAt(index)!)
+  }
+  return bytes
+}
+
+/**
+ * Map a hunk's byte offset onto a UTF-16 index in `text`, using the same
+ * accounting as {@link byteLength}.
+ *
+ * Returns `-1` when the offset runs past the end of `text` or falls strictly
+ * inside a character — neither can be applied exactly, so the caller reports a
+ * context mismatch rather than rounding to a nearby index.
+ */
+function byteOffsetToIndex(text: string, byteOffset: number): number {
+  if (byteOffset < 0) return -1
+  let bytes = 0
+  let index = 0
+  while (index < text.length && bytes < byteOffset) {
+    bytes += utf8CodePointLength(text.codePointAt(index)!)
+    index += 1
+  }
+  return bytes === byteOffset ? index : -1
 }
 
 function invalid(message: string, details: Record<string, unknown> = {}): never {
@@ -158,18 +232,18 @@ export function parseDiffMatchPatch(patchText: string): DiffMatchPatchHunk[] {
   }
 
   for (const hunk of hunks) {
-    const source = sourceText(hunk)
-    if (source.length !== hunk.length1) {
+    const sourceBytes = byteLength(sourceText(hunk))
+    if (sourceBytes !== hunk.length1) {
       return invalid(
-        `Hunk declares length1 ${hunk.length1} but its context and deletions total ${source.length} characters`,
-        {declared: hunk.length1, actual: source.length},
+        `Hunk declares length1 ${hunk.length1} but its context and deletions total ${sourceBytes} UTF-8 bytes`,
+        {declared: hunk.length1, actual: sourceBytes},
       )
     }
-    const destination = destinationText(hunk)
-    if (destination.length !== hunk.length2) {
+    const destinationBytes = byteLength(destinationText(hunk))
+    if (destinationBytes !== hunk.length2) {
       return invalid(
-        `Hunk declares length2 ${hunk.length2} but its context and insertions total ${destination.length} characters`,
-        {declared: hunk.length2, actual: destination.length},
+        `Hunk declares length2 ${hunk.length2} but its context and insertions total ${destinationBytes} UTF-8 bytes`,
+        {declared: hunk.length2, actual: destinationBytes},
       )
     }
   }
@@ -194,9 +268,11 @@ function destinationText(hunk: DiffMatchPatchHunk): string {
 /**
  * Apply a `diff-match-patch` patch string to `text`, exactly.
  *
- * Every hunk must match its declared source text at its declared offset (shifted
- * by the net length change of earlier hunks). Anything else throws — see the
- * module comment for the full table.
+ * Each hunk's `start2` is a UTF-8 byte offset into the text as the earlier hunks
+ * left it (the format's rolling coordinates — see the module comment), so it is
+ * translated to a UTF-16 index against the running result and no separate delta
+ * is carried. The source text must then match there exactly; anything else
+ * throws — see the module comment for the full table.
  */
 export function applyDiffMatchPatch(text: string, patchText: string): string {
   if (typeof text !== 'string') {
@@ -205,16 +281,15 @@ export function applyDiffMatchPatch(text: string, patchText: string): string {
 
   const hunks = parseDiffMatchPatch(patchText)
   let result = text
-  let offset = 0
 
   for (const hunk of hunks) {
     const expected = sourceText(hunk)
-    const start = hunk.start1 + offset
-    if (start < 0 || start > result.length) {
+    const start = byteOffsetToIndex(result, hunk.start2)
+    if (start < 0) {
       throw new OverlayDiffMatchPatchError(
         'OVERLAY_DMP_CONTEXT_MISMATCH',
-        `Hunk start ${start} lies outside the target text of length ${result.length}`,
-        {start, textLength: result.length},
+        `Hunk starts at byte ${hunk.start2}, which is not a character boundary within the target text of ${byteLength(result)} bytes`,
+        {startByte: hunk.start2, textBytes: byteLength(result)},
       )
     }
     const actual = result.slice(start, start + expected.length)
@@ -225,9 +300,7 @@ export function applyDiffMatchPatch(text: string, patchText: string): string {
         {offset: start, expected, actual},
       )
     }
-    const replacement = destinationText(hunk)
-    result = result.slice(0, start) + replacement + result.slice(start + expected.length)
-    offset += replacement.length - expected.length
+    result = result.slice(0, start) + destinationText(hunk) + result.slice(start + expected.length)
   }
 
   return result
