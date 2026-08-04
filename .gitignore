@@ -1,2 +1,9 @@
 claude.md
 agents.md
+node_modules/
+dist/
+.sanity/
+.next/
+*.tsbuildinfo
+.env
+.env.*

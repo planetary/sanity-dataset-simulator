@@ -1,0 +1,20 @@
+{
+  "name": "kitchen-sink",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "sanity dev",
+    "build": "sanity build"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "sanity": "6.8.0",
+    "@sanity/client": "7.26.0",
+    "styled-components": "6.4.4"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

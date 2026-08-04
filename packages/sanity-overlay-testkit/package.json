@@ -1,0 +1,17 @@
+{
+  "name": "sanity-overlay-testkit",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {".": "./src/index.ts"},
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "groq-js": "2.0.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

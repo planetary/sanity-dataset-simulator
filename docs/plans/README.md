@@ -152,6 +152,7 @@ Execution rules that apply to every phase (§0.6): each spike runs in an isolate
 | 7 | `phase-7-conflicts-checkpoint-ci.md` | Plan doc not yet written |
 | 8 | `phase-8-assets-promotion.md` | Plan doc not yet written |
 | 9 | `phase-9-hardening-release.md` | Plan doc not yet written |
+| Cross-phase | [testing-strategy.md](testing-strategy.md) | Written |
 
 Source of truth: [PRD-v1.md](../PRD-v1.md). Frequently referenced sections: [§0 Read this first](../PRD-v1.md), [§1 Requirement language](../PRD-v1.md), [§5 Success criteria](../PRD-v1.md), [§36 Feasibility spikes](../PRD-v1.md), [§37 Implementation plan](../PRD-v1.md), [§38 Acceptance criteria](../PRD-v1.md), [§39 Risks and open decisions](../PRD-v1.md).
 

@@ -1,0 +1,9 @@
+{
+  "name": "sanity-branch-overlay",
+  "private": true,
+  "scripts": {
+    "test": "pnpm -r test",
+    "fixtures:generate": "node packages/sanity-overlay-testkit/fixtures/generate.mjs"
+  },
+  "packageManager": "pnpm@10.33.2"
+}
