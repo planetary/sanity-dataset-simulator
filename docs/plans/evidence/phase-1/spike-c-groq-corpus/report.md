@@ -1,6 +1,12 @@
 # Spike C report — GROQ query corpus (PRD §36.3)
 
-**Date:** 2026-08-03 · **Status: PASS** (for the current greenfield corpus; see caveats) · **Attempts used:** 1 inventory + 1 planner pass (bound: 1 + 1 + 1 repair, §36.0) · **Deviation:** ran in the working tree, not an isolated `spike/c-groq-corpus` branch — the repo predates its first commit; waiver recorded.
+**Date:** 2026-08-03, **materially revised 2026-08-04** · **Status: PASS for correctness; boundedness was NOT proven by the original suite (now fixed)** · **Attempts used:** 1 inventory + 1 planner pass + 1 test-quality repair (bound: 1 + 1 + 1 repair, §36.0) · **Deviation:** ran in the working tree, not an isolated `spike/c-groq-corpus` branch — the repo predates its first commit; waiver recorded.
+
+> **Correction notice (2026-08-04).** A mutation-testing audit found the original parity suite **proved the wrong half of the claim**. Parity against a full-dataset oracle detects *under*-fetching (incompleteness) but is mathematically incapable of detecting *over*-fetching: a planner that loads the entire dataset for every plan type **passed all 463 tests**. The single boundedness assertion (`candidateCount < fullDatasetCount`, one query, one overlay) was too loose to compensate. §22.6's top-K proof — the actual point of the spike — was therefore unverified.
+>
+> Also unverified: the registry was **self-certifying** (it both defined the tier classification and generated the test list), so any Tier A entry could be downgraded or deleted with zero test signal; and the tombstone fixture covered exactly one article in one perspective.
+>
+> All fixed — see "Test-quality remediation" below. The correctness findings in this report stand; the efficiency/scalability claim did not, and is now separately evidenced.
 
 ## Deliverables
 
@@ -32,6 +38,20 @@
 - [x] Remaining Tier C below the §0.6 threshold (1 registered, deliberately unsupported, not launch-critical).
 - [x] No launch-critical query depends on silent approximation (structured error proven).
 - [ ] **Preview latency within budget on representative data — OPEN.** Re-run candidate-count/latency measurement when a representative-scale dataset exists.
+
+## Test-quality remediation (2026-08-04, mutation-driven)
+
+A 14-mutation audit plus 10 follow-up class probes found **9 coverage gaps**. 13 of 14 correctness mutations died fast (control M1 → 6 failures; tombstone-ignoring M4 → 8; overlay-ignoring M7 → 23), confirming the correctness half is genuinely tested. The gaps and their fixes, each proven red under its mutation then green after restore:
+
+| Gap class | Mutation that survived | Fix (139 new tests in `test/mutation-gaps.test.ts`) |
+|---|---|---|
+| **Boundedness never asserted** | ids / slug+types / top-k planners made **unbounded** — all still passed | Per-plan-type ceilings on `planSelected = candidateCount − referenceExpansions` across all 17 queries × 6 overlays, plus three tight anchors. Red proof: unbounded ids → 6 failures, slug/types → 10, top-k → 4 |
+| **Registry self-certifying** | Tier A entry downgraded to `unsupported`, or deleted outright | Inventory pinned: exact Tier A/B/unsupported id sets, count = 18, uniqueness, per-Tier-A executability, matrix size 17 × 6 = 102. Red proof: 6 and 5 failures |
+| **Tombstone matrix too narrow** | Tombstones honoured only for `_type === 'article'` | 4 tombstone overlays (article/page/author/mixed) swept across all queries + 8 per-plan-type assertions + full drafts-perspective sweep. Red proof: 10 failures; also broadens M4 from 8 → 30 |
+
+**Suite after remediation: 602 tests, all green** (463 pre-existing + 139 new).
+
+**Residual weakness to watch:** most mutants are killed by exactly one test — there is no redundancy, so a single careless test edit can silently reopen a hole.
 
 ## Caveats for gate review
 

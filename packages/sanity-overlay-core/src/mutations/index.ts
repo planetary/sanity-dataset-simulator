@@ -74,6 +74,7 @@ export type {ResolveContext} from './resolve'
 export {
   applyMutation,
   blockingStrongReferences,
+  ensureRecord,
   mutationTargetId,
   validateMutation,
 } from './mutation'

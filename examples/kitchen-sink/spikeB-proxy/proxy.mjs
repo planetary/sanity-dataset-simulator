@@ -37,6 +37,8 @@ import fs from 'node:fs'
 import {dirname, join} from 'node:path'
 import {fileURLToPath} from 'node:url'
 
+import {isWriteRequest} from './writeGuard.mjs'
+
 const HERE = dirname(fileURLToPath(import.meta.url))
 const env = process.env
 
@@ -133,29 +135,22 @@ function splitPath(rawUrl) {
   return {pathname, search, apiPath}
 }
 
-const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
-
 /**
  * Overlay write guard (§36.1 Track B: "Reject unknown write-capable endpoints").
  *
- * Blocked when PROXY_BLOCK_WRITES=1:
- *   - POST/PUT/PATCH/DELETE to /data/mutate*, /data/actions*, /assets*
- *   - any non-GET/HEAD to /data/*  EXCEPT  /data/query  (GROQ over POST is a legal read)
+ * The classification itself lives in `./writeGuard.mjs` and is pinned by the
+ * write-guard contract in `packages/sanity-overlay-testkit`. It replaced the
+ * inline rule set that Spike F escaped four ways (no leading slash, /assets/*,
+ * /agent/action/*, /datasets/*); see that module's header for the full record.
  *
- * Everything else (platform endpoints, /users/me, /projects/*, telemetry, auth) passes.
+ * The proxy keeps only the policy switch: PROXY_BLOCK_WRITES decides *whether*
+ * to enforce, the guard decides *what* counts as a write. The raw request URL
+ * is handed over unmodified — normalising before classification is the guard's
+ * job, and doing it here as well would just be a second place to get it wrong.
  */
-function isBlockedWrite(method, apiPath) {
+function isBlockedWrite(method, rawUrl) {
   if (!BLOCK_WRITES) return false
-  if (READ_METHODS.has(method)) return false
-
-  const p = apiPath
-  if (p === '/data/query' || p.startsWith('/data/query/')) return false // GROQ POST == read
-  if (p === '/data/mutate' || p.startsWith('/data/mutate/')) return true
-  if (p === '/data/actions' || p.startsWith('/data/actions/')) return true
-  if (p === '/assets' || p.startsWith('/assets/')) return true
-  if (p === '/data' || p.startsWith('/data/')) return true // catch-all: unknown /data/* writer
-
-  return false
+  return isWriteRequest({method, url: rawUrl})
 }
 
 function isListenPath(apiPath) {
@@ -302,7 +297,7 @@ const server = http.createServer((req, res) => {
   }
 
   // --- 2. Overlay write guard ----------------------------------------------
-  if (isBlockedWrite(req.method, apiPath)) {
+  if (isBlockedWrite(req.method, req.url || '/')) {
     const body = JSON.stringify({
       error: {
         code: 'OVERLAY_WRITE_BLOCKED',

@@ -201,8 +201,12 @@ function captureRecordFromBase(
   return record
 }
 
-/** Find the record, capturing it from base on first touch. */
-function requireRecord(
+/**
+ * Find the record, capturing it from base on first touch (PRD §13.3 "captured at
+ * first touch"). The captured record is returned but *not* inserted into state —
+ * the caller commits it as part of its own write.
+ */
+export function ensureRecord(
   state: OverlayState,
   id: string,
   context: MutationContext,
@@ -417,7 +421,7 @@ function applyPatch(
 ): AppliedMutation {
   const logicalId = toPublishedId(mutation.id)
   const version = versionKindFor(mutation.id)
-  const record = requireRecord(state, mutation.id, context)
+  const record = ensureRecord(state, mutation.id, context)
 
   if (mutation.ifRevision !== undefined) {
     const actual = currentRevisionOf(record, version)

@@ -19,7 +19,12 @@ import {OverlayActionBlockedError, OverlayMutationError} from '../errors'
 import type {SanityDocument} from '../types/document'
 import type {OverlayMutation, OverlayOperation} from '../types/operations'
 import type {OverlayDocumentRecord} from '../types/record'
-import {applyMutation, blockingStrongReferences, type MutationContext} from '../mutations/mutation'
+import {
+  applyMutation,
+  blockingStrongReferences,
+  ensureRecord,
+  type MutationContext,
+} from '../mutations/mutation'
 import {deepClone} from '../mutations/paths'
 import {
   noopValidator,
@@ -33,7 +38,6 @@ import {
   createDocumentRecord,
   createLocalVersion,
   documentIdFor,
-  getRecord,
   withRecord,
   type OverlayState,
 } from '../mutations/state'
@@ -76,16 +80,16 @@ function actionContext(state: OverlayState, options: ActionOptions): MutationCon
   }
 }
 
-function requireRecord(state: OverlayState, logicalId: string): OverlayDocumentRecord {
-  const record = getRecord(state, logicalId)
-  if (record === null) {
-    throw new OverlayMutationError(
-      'OVERLAY_DOCUMENT_NOT_FOUND',
-      `Document ${JSON.stringify(logicalId)} has no overlay record`,
-      {logicalId},
-    )
-  }
-  return record
+/**
+ * The record an action operates on, captured from base on first touch so an
+ * action works on an untouched base document exactly as a patch does (PRD §13.3).
+ */
+function requireRecord(
+  state: OverlayState,
+  logicalId: string,
+  context: MutationContext,
+): OverlayDocumentRecord {
+  return ensureRecord(state, logicalId, context)
 }
 
 function assertLiveEditDisabled(options: ActionOptions, action: string): void {
@@ -174,7 +178,7 @@ export function publish(
 ): ActionResult {
   const logicalId = toPublishedId(input.id)
   const context = actionContext(state, options)
-  const record = requireRecord(state, logicalId)
+  const record = requireRecord(state, logicalId, context)
 
   const resolved = resolveDraft(state, logicalId, context)
   if (resolved === null) {
@@ -269,7 +273,7 @@ export function unpublish(
 ): ActionResult {
   const logicalId = toPublishedId(input.id)
   const context = actionContext(state, options)
-  const record = requireRecord(state, logicalId)
+  const record = requireRecord(state, logicalId, context)
 
   const resolved = resolvePublished(state, logicalId, context)
   if (resolved === null) {
@@ -351,7 +355,7 @@ export function discardDraft(
   options: ActionOptions,
 ): ActionResult {
   const logicalId = toPublishedId(input.id)
-  const record = requireRecord(state, logicalId)
+  const record = requireRecord(state, logicalId, actionContext(state, options))
 
   return commitTransform(state, options, (current, mutationContext) => {
     const now = mutationContext.now()
@@ -404,7 +408,7 @@ export function restore(
   options: ActionOptions,
 ): ActionResult {
   const logicalId = toPublishedId(input.id)
-  const record = requireRecord(state, logicalId)
+  const record = requireRecord(state, logicalId, actionContext(state, options))
   const target = input.target ?? 'both'
 
   return commitTransform(state, options, (current, mutationContext) => {

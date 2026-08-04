@@ -90,6 +90,25 @@ A request that reached the endpoint and was rejected **401/403 by the server** i
 as `blocked: false`. §36.6 requires the write to fail *before* reaching an authorized endpoint;
 "the server happened to say no" is not a guard we control.
 
+### Why detection needs all four signals — two ways to get a false PASS
+
+Both of these make an escaped write look blocked, and both were hit while building this suite:
+
+1. **Tapping only `window.fetch`.** Mutations are XHRs (above), so a fetch-only tap sees nothing
+   and reports "no egress" for a request that did go out. Only raw `fetch` attacks (26) would
+   still be caught — which produces the very plausible-looking result "everything blocked except
+   raw fetch".
+2. **The resource timing buffer.** It holds **250 entries by default and drops everything once
+   full**. A Studio page that has been open for minutes is long past 250 resources, so the
+   `getEntriesByType('resource')` delta is empty no matter what happened on the wire. The suite
+   therefore raises the cap to 5000 and calls `performance.clearResourceTimings()` at the start
+   of the run (pre-run resource entries are discarded; attack-time entries are all preserved),
+   and flags `resourcetimingbufferfull` in the evidence if it still overflows.
+
+Any earlier Spike F evidence produced without an XHR tap and without priming the buffer should be
+treated as **unverified**, particularly if it reports `client.assets.upload` as blocked —
+`write-block-validation.md` finding 8 already established that asset uploads reach the network.
+
 Two softer verdicts appear in `evidence`, both with `blocked: true`:
 
 - `severity: 'low'` — "no egress, but the facade did not record it — the call failed

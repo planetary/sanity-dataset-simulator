@@ -96,7 +96,25 @@ function instrument<T extends object>(target: T, path: string): T {
   return proxy
 }
 
+/**
+ * SPIKE A — D13 HYBRID validation (see track-b-proxy.md).
+ * When `localStorage.SPIKE_API_HOST` is set, the factory injects `apiHost` into
+ * every ClientConfig and does NOTHING else — no method wrapping, so none of
+ * Track A's identity-stability hazard. Enforcement then lives entirely in the
+ * Track B proxy. Note @sanity/client builds `<projectId>.<apiHost>`, so the
+ * proxy must map the project sub-label back to the upstream host.
+ */
+function hybridApiHost(): string | null {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage.getItem('SPIKE_API_HOST') : null
+  } catch {
+    return null
+  }
+}
+
 export function spikeClientFactory(options: ClientConfig): SanityClient {
+  const apiHost = hybridApiHost()
+  if (apiHost) options = {...options, apiHost}
   const log = spikeLog()
   if (log) {
     log.factoryInvocations += 1

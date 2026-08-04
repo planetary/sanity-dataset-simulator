@@ -97,7 +97,7 @@ export async function evaluateRegistered<T = unknown>(
       .sort((a, b) => String(b[plan.orderField]).localeCompare(String(a[plan.orderField])))
       .slice(0, baseFetchCount)
     for (const d of baseTop) add(d._id)
-    // MUTATION: affected-doc handling removed
+    for (const id of affected) add(id)
   }
 
   // Reference expansion (dereference support): virtual-resolve ref targets.
@@ -119,7 +119,7 @@ export async function evaluateRegistered<T = unknown>(
     frontier = next
   }
 
-  const dataset = applyOverlay(base, overlay) // AUDIT MUTATION: planner deleted
+  const dataset = [...candidates.values()]
   const result = await runGroq<T>(def.query, dataset, params)
   return {
     result,

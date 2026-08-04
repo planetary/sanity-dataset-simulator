@@ -365,7 +365,40 @@ function installXhrTap(): void {
   ;(proto as unknown as Rec).send = sendTap
 }
 
+/**
+ * FINDING (this silently invalidates any resource-timing-based evidence): the
+ * resource timing buffer holds 250 entries by default, and once it is FULL the
+ * browser drops every subsequent entry. A Studio page that has been open for a
+ * few minutes is far past 250 resources, so `getEntriesByType('resource')`
+ * deltas would show *nothing* for a request that did leave — reading as
+ * "blocked" when the write actually went out. Raise the cap and clear the
+ * buffer before the run so the detector is live for the duration.
+ */
+let bufferFullDuringRun = false
+
+function primeResourceTiming(): void {
+  if (typeof performance === 'undefined') return
+  try {
+    performance.setResourceTimingBufferSize(5000)
+  } catch {
+    /* not supported */
+  }
+  try {
+    performance.addEventListener?.('resourcetimingbufferfull', () => {
+      bufferFullDuringRun = true
+    })
+  } catch {
+    /* not supported */
+  }
+  try {
+    performance.clearResourceTimings()
+  } catch {
+    /* not supported */
+  }
+}
+
 function installNetTap(): void {
+  primeResourceTiming()
   installFetchTap()
   installXhrTap()
 }
@@ -849,6 +882,9 @@ async function runOne(spec: AttackSpec, ctx: AttackCtx, cleanup: Set<string>): P
     describeHits(hits),
     facadeNote,
     `result=${summarizeValue(value)}`,
+    ...(bufferFullDuringRun
+      ? ['WARNING: resource timing buffer overflowed during the run — that detector is degraded']
+      : []),
   ].join(' | ')
 
   return {

@@ -754,6 +754,30 @@ describe('PRD §35.5 draft and action tests', () => {
     expect(resolveDraft(state, 'article-1', {base})?.title).toBe('Live')
   })
 
+  it('§35.5 "Branch unpublish creates draft and published tombstone." on an untouched base document', () => {
+    // No prior overlay record: the §13.3 base block is captured at first touch.
+    const {state} = unpublish(emptyState(), {id: 'article-1'}, actionOptions())
+
+    const record = state.documents['article-1']!
+    expect(record.origin).toBe('base')
+    expect(record.base?.published?.revision).toBe('base-rev-1')
+    expect(record.local.draft?.materialized.title).toBe('Base title')
+    expect(record.local.publishedTombstone).toBe(true)
+    expect(resolvePublished(state, 'article-1', {base})).toBeNull()
+  })
+
+  it('§35.5 "Branch publish creates local published and removes local draft." from an untouched base draft', () => {
+    // page-1 has a base draft and a base published version; publishing without a
+    // prior local edit promotes the resolved base draft (§18.2 → §18.5).
+    const {state} = publish(emptyState(), {id: 'page-1'}, actionOptions())
+
+    const record = state.documents['page-1']!
+    expect(record.local.published?.materialized.title).toBe('Base draft page')
+    expect(record.local.draft).toBeNull()
+    expect(record.local.published?.materialized._id).toBe('page-1')
+    expect(resolvePublished(state, 'page-1', {base})?.title).toBe('Base draft page')
+  })
+
   it('§35.5 "Discard local draft preserves local published."', () => {
     const edited = edit(
       emptyState(),

@@ -36,6 +36,20 @@
 - [x] No base data is lost — byte-identical base snapshot asserted after all scans + migration.
 - [x] Migration path is explicit (§20.4 plan, §13.7 mutations, per-document operations).
 
+## Test-quality remediation (2026-08-04, mutation-driven)
+
+A mutation audit confirmed all six finding codes have live detection (each scanner mutation killed 1–3 tests), but found the consequential bug class was **unguarded: severity**. A finding emitted at the *wrong severity* silently converts a branch-blocking error into an advisory one.
+
+| Surviving mutation | Meaning | Fix |
+|---|---|---|
+| `TYPE_MISMATCH` severity hard → soft | Incompatible scalar types would stop blocking | Explicit hard-severity assertions |
+| `DISALLOWED_REFERENCE_TARGET` hard → soft | Invalid reference targets would stop blocking | Explicit hard-severity assertions |
+| `INVALID_ARRAY_MEMBER` never emitted | **Dead code** — declared, implemented, never exercised by any §36.4 variant | New variant (`article.tags` string → number) that triggers it |
+
+Plus a whole-corpus invariant asserting every emitted code carries its documented severity **and** that all six codes are reachable. Each proven red under its mutation (2 failures each), then green.
+
+**Assessment after remediation:** moderately trustworthy. Detection is real but thin — most mutants die by exactly one test, so there is no redundancy against a careless edit.
+
 ## Caveats
 
 1. Scanner is spike-grade: unions and Portable Text internals validated shallowly; `sanity.imageAsset` chain untested (no assets in fixture, D01 default).

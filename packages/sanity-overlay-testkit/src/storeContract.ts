@@ -467,6 +467,11 @@ export function runStoreContractSuite(name: string, makeStore: StoreContractFact
       ])
       expect(manifest.transactionHead).toBe(result.transaction.transactionId)
 
+      /* Unresolved conflicts roll up into the manifest summary (PRD §13.1). */
+      expect(manifest.documentHeads['article-c']?.hasConflict).toBe(true)
+      expect(manifest.documentHeads['article-a']?.hasConflict).toBe(false)
+      expect(manifest.conflictSummary).toEqual({total: 1, hard: 1, soft: 0})
+
       /* Every head reaches a stored revision (PRD §34.3). */
       for (const head of Object.values(manifest.documentHeads)) {
         const stored = await store.getDocumentRevision(CONTRACT_OVERLAY_ID, head.storageRef)

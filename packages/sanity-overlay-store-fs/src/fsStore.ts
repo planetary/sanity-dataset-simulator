@@ -165,6 +165,16 @@ export interface FsOverlayStoreOptions {
    */
   newTransactionId?: (context: {overlayId: string; timestamp: string; sequence: number}) => string
   hooks?: FsOverlayStoreHooks
+  /**
+   * `fsync` the staging file before renaming it.
+   *
+   * Off by default. PRD §14.3 requires *atomicity* ("temporary file plus
+   * rename"), which the rename alone provides — a reader always sees whole old
+   * bytes or whole new bytes. `fsync` adds *durability across a power loss*,
+   * which costs an F_FULLFSYNC per file on APFS and is not what local branch
+   * state needs. Turn it on where the overlay is the system of record.
+   */
+  fsync?: boolean
 }
 
 /** Generated artifact written to `.runtime/materialized/<key>.json` (PRD §14.2, §14.4 step 6). */
@@ -204,6 +214,7 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
 
   readonly #now: OverlayClock
   readonly #hooks: FsOverlayStoreHooks
+  readonly #fsync: boolean
   readonly #newTransactionId: NonNullable<FsOverlayStoreOptions['newTransactionId']>
 
   /** Last valid parse of each canonical file, retained across malformed edits (§14.3). */
@@ -223,6 +234,7 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     this.layout = new OverlayLayout(options.root)
     this.#now = options.now
     this.#hooks = options.hooks ?? {}
+    this.#fsync = options.fsync ?? false
     this.#newTransactionId = options.newTransactionId ?? defaultTransactionId
   }
 
@@ -452,11 +464,11 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
 
     const removed = (request.removedDocumentIds ?? []).map(toPublishedId)
 
-    /* Step 1 — immutable artifacts. Unreachable until the manifest names them. */
-    const writes: ImmutableWrite[] = []
-    for (const record of request.records) {
-      writes.push(await this.#writeImmutable(overlayId, record))
-    }
+    /* Step 1 — immutable artifacts. Unreachable until the manifest names them,
+     * and mutually independent, so they are written concurrently. */
+    const writes: ImmutableWrite[] = await Promise.all(
+      request.records.map((record) => this.#writeImmutable(overlayId, record)),
+    )
 
     /* Step 2 — the immutable transaction record (PRD §13.10). */
     const revisionBefore = manifest.revision
@@ -1314,21 +1326,21 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   }
 
   async #scaffold(): Promise<void> {
-    for (const dir of [
-      this.layout.root,
-      this.layout.documentsDir,
-      this.layout.snapshotsDir,
-      this.layout.runtimeDir,
-      this.layout.materializedDir,
-      this.layout.transactionsDir,
-      this.layout.revisionsDir,
-      this.layout.indexesDir,
-    ]) {
-      await mkdir(dir, {recursive: true})
-    }
-    await this.#writeIfAbsent(this.layout.resolve(GITATTRIBUTES_FILE), GITATTRIBUTES_CONTENT)
-    await this.#writeIfAbsent(this.layout.resolve(GITIGNORE_FILE), GITIGNORE_CONTENT)
-    await this.#writeIfAbsent(this.layout.resolve(README_FILE), README_CONTENT)
+    await Promise.all(
+      [
+        this.layout.documentsDir,
+        this.layout.snapshotsDir,
+        this.layout.materializedDir,
+        this.layout.transactionsDir,
+        this.layout.revisionsDir,
+        this.layout.indexesDir,
+      ].map((dir) => mkdir(dir, {recursive: true})),
+    )
+    await Promise.all([
+      this.#writeIfAbsent(this.layout.resolve(GITATTRIBUTES_FILE), GITATTRIBUTES_CONTENT),
+      this.#writeIfAbsent(this.layout.resolve(GITIGNORE_FILE), GITIGNORE_CONTENT),
+      this.#writeIfAbsent(this.layout.resolve(README_FILE), README_CONTENT),
+    ])
   }
 
   async #writeIfAbsent(path: string, contents: string): Promise<void> {
@@ -1349,17 +1361,21 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     await mkdir(dir, {recursive: true})
     const tempPath = join(dir, `${TEMP_PREFIX}${randomUUID()}`)
     try {
-      const handle = await open(tempPath, 'wx', 0o644)
-      try {
-        await handle.writeFile(contents, 'utf8')
+      if (this.#fsync) {
+        const handle = await open(tempPath, 'wx', 0o644)
         try {
-          await handle.sync()
-        } catch {
-          /* Some filesystems reject fsync on a regular file; the rename still
-           * gives atomicity, only the durability guarantee weakens. */
+          await handle.writeFile(contents, 'utf8')
+          try {
+            await handle.sync()
+          } catch {
+            /* Some filesystems reject fsync on a regular file; the rename still
+             * gives atomicity, only the durability guarantee weakens. */
+          }
+        } finally {
+          await handle.close()
         }
-      } finally {
-        await handle.close()
+      } else {
+        await writeFile(tempPath, contents, {encoding: 'utf8', mode: 0o644, flag: 'wx'})
       }
       if (this.#hooks.beforeRename !== undefined) {
         await this.#hooks.beforeRename({tempPath, targetPath})
@@ -1529,20 +1545,21 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     const logicalId = toPublishedId(record.logicalId)
     const normalized = clone({...record, logicalId})
 
-    let snapshotRef: string | undefined
     const snapshot = baseSnapshotFrom(normalized)
-    if (snapshot !== null) {
-      snapshotRef = canonicalChecksum(snapshot)
-      const path = this.layout.snapshotPath(snapshotRef)
-      /* Content-addressed and therefore immutable: an existing file already holds
-       * identical bytes (PRD §14.3 "one immutable snapshot per captured base state"). */
-      if (!(await exists(path))) await this.#writeJson(path, snapshot)
-    }
-
+    const snapshotRef = snapshot === null ? undefined : canonicalChecksum(snapshot)
     const recordChecksum = canonicalChecksum(normalized)
     const revisionPath = this.layout.revisionPath(logicalId, recordChecksum)
-    if (!(await exists(revisionPath))) await this.#writeJson(revisionPath, normalized)
     const storageRef = this.layout.relative(revisionPath)
+
+    /* Both artifacts are content-addressed and therefore immutable: an existing
+     * file already holds identical bytes, so writing is skipped rather than
+     * repeated (PRD §14.3 "one immutable snapshot per captured base state"). */
+    await Promise.all([
+      snapshot === null
+        ? undefined
+        : this.#writeIfAbsent(this.layout.snapshotPath(snapshotRef!), serialize(snapshot)),
+      this.#writeIfAbsent(revisionPath, serialize(normalized)),
+    ])
 
     const head = documentHeadFromRecord(normalized, {storageRef, checksum: recordChecksum})
 
@@ -1562,10 +1579,10 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     const options = write.snapshotRef === undefined ? {} : {snapshotRef: write.snapshotRef}
     const intent = intentFromRecord(write.record, options)
     const path = this.layout.intentPath(write.logicalId)
-    const bytes = await this.#writeJson(path, intent)
+    const bytes = serialize(intent)
     this.#lastValidIntents.set(write.logicalId, {intent, bytes})
     this.#conflictCounts.set(write.logicalId, countConflicts(intent))
-    await this.#writeMaterialized(write.record)
+    await Promise.all([this.#writeText(path, bytes), this.#writeMaterialized(write.record)])
   }
 
   async #writeMaterialized(record: OverlayDocumentRecord): Promise<void> {
