@@ -26,7 +26,7 @@
 import {mkdtemp, readFile, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import {parse} from '../../sanity-overlay-core/src/index'
 import {
   createEchoProtocol,
@@ -35,6 +35,35 @@ import {
 } from '../../../examples/kitchen-sink/spikeA/echoProtocol'
 import {translateDocumentActions} from '../../../examples/kitchen-sink/spikeA/overlayTranslate'
 import {startOverlayServer} from '../../../examples/kitchen-sink/spikeA/overlayServer.mjs'
+
+/**
+ * Per-test budget for the §3 persistence block (ms).
+ *
+ * Those tests are not waiting on a duration — they do real work: each one boots
+ * an overlay server, drives two or three HTTP round-trips through it, and then
+ * boots a SECOND server to re-read the result off disk, because the assertion
+ * discipline at the top of this file forbids believing the response body of the
+ * write that made the claim.
+ *
+ * Measured on this repo (vitest default `testTimeout` is 5 s):
+ *
+ *   publish (first test in the block, so it also pays the one-off cost of the
+ *   first `fetch`, the first `listen` and the first store write)
+ *     - idle full-suite run          4.00 s
+ *     - full-suite run, CPU-loaded   median 4.03 s, max 5.65 s
+ *     - observed failure             1 of 6 idle full-suite runs, "Test timed
+ *                                    out in 5000ms" at 5.40 s
+ *
+ * So the default budget sits inside the normal spread of this test's honest
+ * runtime, and the whole repository shares one worker pool — a full-suite run is
+ * exactly when it loses. The only failure mode a larger budget hides is "the
+ * machine was busy", which is not a claim this file makes. Every assertion is
+ * unchanged; nothing here is timing-sensitive once it is allowed to finish.
+ *
+ * 30 s is ~5x the worst runtime ever measured. `hookTimeout` matches because
+ * `afterEach` closes the servers and recursively removes the temp roots.
+ */
+vi.setConfig({testTimeout: 30_000, hookTimeout: 30_000})
 
 const OVERLAY_ID = 'spike-a-actions-00000000000000'
 const STUDIO_ORIGIN = 'http://localhost:3333'

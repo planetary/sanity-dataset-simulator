@@ -130,6 +130,9 @@ export * from './merge/index'
 /* W3 — perspective resolution (PRD §18.1-§18.3). */
 export * from './perspectives/index'
 
+/* W3 — batch virtual-document reads (PRD §18.1, §18.2, §22.2 candidate sets). */
+export * from './read/index'
+
 /* W3 — conflict creation and resolution (PRD §13.11, §17.4, §28.1-§28.6). */
 export * from './conflicts/index'
 

@@ -8,11 +8,18 @@
 // exists on disk and survives both a browser reload and a server restart.
 //
 // SHAPE
-// Three endpoints, JSON in / JSON out, CORS'd for the Studio dev origin:
+// Four endpoints, JSON in / JSON out, CORS'd for the Studio dev origin:
 //
 //   GET  /health   liveness plus which overlay root is in play
 //   GET  /state    full overlay state, for boot-time hydration of the echo layer
 //   POST /commit   one intercepted write batch, committed as one transaction
+//   POST /resolve  a batch READ — the virtual documents for a set of IDs
+//
+// `/resolve` is the read half. Until it existed, Studio could save into a store
+// the rest of it could not see: a renamed document still listed under its old
+// title, a branch-created document appeared nowhere, and reference pickers showed
+// staging values. It resolves the on-disk records through core's §18.1/§18.2
+// batch read and answers with virtual documents.
 //
 // LAYERING
 // The server owns *no* semantics. Translation is `overlayTranslate.ts` (pure);
@@ -38,7 +45,10 @@ import {
   discardDraft,
   duplicate,
   isSyntheticRev,
+  overlayDocumentIds,
   publish,
+  resolveDocumentBatch,
+  resolveVersionBatch,
   restore,
   toPublishedId,
   unpublish,
@@ -514,6 +524,113 @@ export async function startOverlayServer(options = {}) {
   }
 
   /* ---------------------------------------------------------------- *
+   * Reads (PRD §18.1, §18.2, §22.2)
+   * ---------------------------------------------------------------- *
+   *
+   * `POST /resolve` answers "what do these IDs look like in the branch?".
+   *
+   * The caller supplies the base documents it already holds, because core never
+   * fetches base (§16.1) and this server has no Sanity credentials of its own —
+   * the browser has just read them, so it ships them along. Anything the caller
+   * omits is simply absent base, which is exactly right for a branch-created
+   * document.
+   *
+   * SYNCHRONOUS AND UNQUEUED, both deliberately:
+   *
+   *   - synchronous, because the resolution is a pure function of the in-memory
+   *     projection. Nothing is started here that could outlive the request — the
+   *     bug class `/commit` was fixed for.
+   *   - unqueued, because a read is not a write. Putting it on the commit mutex
+   *     would stall every pane behind an autosave, and it would gain nothing:
+   *     `state` is replaced by a single assignment *after* the store has passed
+   *     its commit point, so a read either sees a transaction whole or not at
+   *     all.
+   */
+
+  const RESOLVE_PERSPECTIVES = new Set(['published', 'drafts'])
+
+  function requireStringArray(value, field) {
+    if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || item.length === 0)) {
+      throw new HttpError(
+        400,
+        'INVALID_REQUEST',
+        `resolve requires \`${field}\` to be an array of non-empty strings`,
+      )
+    }
+    return value
+  }
+
+  function resolveRead(body) {
+    if (!isRecord(body)) {
+      throw new HttpError(400, 'INVALID_REQUEST', 'resolve body must be a JSON object')
+    }
+
+    const mode = body.mode ?? 'perspective'
+    if (mode !== 'perspective' && mode !== 'version') {
+      throw new HttpError(
+        400,
+        'INVALID_REQUEST',
+        'resolve `mode` must be "perspective" (§18.1/§18.2) or "version" (getDocument semantics)',
+      )
+    }
+
+    const requested = requireStringArray(body.ids, 'ids')
+    const perspective = body.perspective ?? 'drafts'
+    if (mode === 'perspective' && !RESOLVE_PERSPECTIVES.has(perspective)) {
+      throw new HttpError(
+        400,
+        'INVALID_REQUEST',
+        'resolve `perspective` must be "published" or "drafts" (§18.3 raw is not a batch read)',
+      )
+    }
+    const types = body.types === undefined ? undefined : requireStringArray(body.types, 'types')
+
+    /* §22.2 "add branch-created and modified candidates": a base query can never
+     * return an ID base has never held, so the overlay's own documents of the
+     * requested types are added to the set here. Reported separately, because a
+     * caller that merges this into a base result has to know which IDs it did
+     * not ask for. */
+    const added = []
+    if (types !== undefined) {
+      const seen = new Set(requested.map(toPublishedId))
+      for (const logicalId of overlayDocumentIds(state.documents, {types})) {
+        if (seen.has(logicalId)) continue
+        seen.add(logicalId)
+        added.push(logicalId)
+      }
+    }
+
+    const request = {
+      ids: [...requested, ...added],
+      now: now(),
+      records: state.documents,
+      /* Same filter the write path uses: a base document with no `_rev`, or one
+       * carrying a synthetic overlay `_rev` (§13.9), cannot be a merge ancestor.
+       * Accepting an echoed-back overlay document as base would make the overlay
+       * its own ancestor. */
+      base: createBaseSource(usableBaseDocuments(body.baseDocuments)),
+    }
+
+    const result =
+      mode === 'version'
+        ? resolveVersionBatch(request)
+        : resolveDocumentBatch({...request, perspective})
+
+    return {
+      ok: true,
+      overlayId,
+      revision: state.revision,
+      mode,
+      perspective: result.perspective,
+      entries: result.entries,
+      documents: result.documents,
+      missing: result.missing,
+      addedIds: added,
+      conflicts: result.conflicts,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
    * HTTP
    * ---------------------------------------------------------------- */
 
@@ -577,11 +694,11 @@ export async function startOverlayServer(options = {}) {
       return
     }
 
-    if (request.method === 'POST' && route === '/commit') {
-      let body
+    /** Parse a JSON request body, or answer 400 and return `undefined`. */
+    async function jsonBody(label) {
       try {
         const raw = await readBody(request)
-        body = raw.length === 0 ? {} : JSON.parse(raw)
+        return raw.length === 0 ? {} : JSON.parse(raw)
       } catch (error) {
         const failure =
           error instanceof HttpError
@@ -589,15 +706,40 @@ export async function startOverlayServer(options = {}) {
             : new HttpError(
                 400,
                 'INVALID_JSON',
-                `commit body is not valid JSON: ${error?.message ?? error}`,
+                `${label} body is not valid JSON: ${error?.message ?? error}`,
               )
-        log('error', `overlay commit rejected [${failure.code}]: ${failure.message}`)
+        log('error', `overlay ${label} rejected [${failure.code}]: ${failure.message}`)
         send(request, response, failure.status, {
           ok: false,
           error: {code: failure.code, message: failure.message},
         })
-        return
+        return undefined
       }
+    }
+
+    if (request.method === 'POST' && route === '/resolve') {
+      const body = await jsonBody('resolve')
+      if (body === undefined) return
+
+      try {
+        /* Not enqueued: see `resolveRead`. Synchronous, so nothing this request
+         * starts can outlive it. */
+        send(request, response, 200, resolveRead(body))
+      } catch (error) {
+        const status = error instanceof HttpError ? error.status : error?.code ? 400 : 500
+        const code = error?.code ?? 'INTERNAL'
+        log('error', `overlay resolve failed [${code}]: ${error?.message ?? error}`)
+        send(request, response, status, {
+          ok: false,
+          error: {code, message: String(error?.message ?? error)},
+        })
+      }
+      return
+    }
+
+    if (request.method === 'POST' && route === '/commit') {
+      const body = await jsonBody('commit')
+      if (body === undefined) return
 
       try {
         send(request, response, 200, await enqueue(() => commit(body)))

@@ -1,0 +1,16 @@
+{
+  "name": "sanity-overlay-query",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./parity": "./parity/index.ts"
+  },
+  "scripts": {
+    "test": "echo 'tested via sanity-overlay-testkit'"
+  },
+  "dependencies": {
+    "groq-js": "2.0.0"
+  }
+}

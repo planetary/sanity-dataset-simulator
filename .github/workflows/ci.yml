@@ -1,0 +1,135 @@
+name: CI
+
+# Discharges plan §10 "serializer output is byte-identical for the same logical
+# state ... verified across platforms and Node versions in CI", and makes the
+# dependency-boundary lint (packages/sanity-overlay-testkit/test/core-boundaries.test.ts)
+# a gate that actually runs on every push instead of a test nobody executes.
+
+on:
+  # `push` is unfiltered on purpose: work here lands directly on branches (and
+  # on main) without always going through a PR, and the audit's complaint was
+  # precisely that these tests run on nobody's push. `pull_request` additionally
+  # covers fork contributions, which `push` never sees. Same-repo PRs therefore
+  # get one run per event; the concurrency group below keeps that from piling up.
+  push:
+  pull_request:
+
+# A superseded push has nothing to tell us; cancel it rather than pay for it.
+# `cancel-in-progress` is NOT a retry -- a run that finishes red stays red.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      # Report every leg. One red leg must not hide the state of the others --
+      # a platform- or version-specific serializer drift is exactly the failure
+      # this matrix exists to surface, and we want to see which legs it hits.
+      fail-fast: false
+      matrix:
+        # Two genuinely different platforms: Linux (ext4, case-sensitive) and
+        # macOS (APFS, case-insensitive by default). Windows is deliberately
+        # absent for now -- the repo has no .gitattributes, so a Windows
+        # checkout would rewrite committed LF fixtures (e.g.
+        # examples/kitchen-sink/spikeB-proxy/proxy-log.jsonl, which the replay
+        # tests split on '\n') to CRLF and fail for reasons that have nothing
+        # to do with the code. Add `* text=auto eol=lf` first, then add
+        # windows-latest here.
+        os: [ubuntu-latest, macos-latest]
+        # 22.22.2 is the version pinned for local development (see
+        # `packageManager` in package.json and the nvm-installed toolchain);
+        # it stays in the matrix exactly. 24 is the next line up, so a
+        # forward-incompatibility shows up here rather than on someone's laptop.
+        node: ['22.22.2', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Must precede setup-node: `cache: pnpm` below needs pnpm on PATH.
+      # No `version:` input on purpose -- action-setup@v4 reads pnpm@10.33.2
+      # from the root package.json `packageManager` field, so the workflow
+      # cannot drift from the repo's pinned package manager.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      # Frozen: CI installs what the lockfile says or fails. It never resolves
+      # fresh versions, so a green run is reproducible from the commit alone.
+      # The whole workspace is installed (not just the testkit) because the
+      # suite imports examples/kitchen-sink -- both its spike sources and its
+      # @sanity/client.
+      - run: pnpm install --frozen-lockfile
+
+      # NO secrets and NO env block, by design. The only credentialed suite is
+      # test/hosted-parity.test.ts; it is wrapped in `describe.skipIf(!cfg)`
+      # where cfg comes from hostedConfigFromEnv(), which returns null unless
+      # SANITY_PROJECT_ID + SANITY_BASE_DATASET + SANITY_API_READ_TOKEN are all
+      # set. src/env.ts only reads a repo-root .env, which is gitignored and so
+      # never present in CI. Verified locally: with those three vars blanked the
+      # suite is 39 files passed / 1 skipped, 2637 passed / 13 skipped -- the 13
+      # being exactly hosted-parity's cases. Do not add a token here.
+      #
+      # NO retries, deliberately. Two suites (test/action-echo.test.ts,
+      # test/proxy-concurrency.test.ts) are known to flake under parallel load.
+      # A flake is a real defect in a suite whose whole job is proving
+      # concurrency invariants -- retrying it would delete the only signal we
+      # have. Do not add `--retry`, and do not add `retry:` to a vitest config.
+      - run: pnpm --filter sanity-overlay-testkit test
+
+  # ---------------------------------------------------------------------------
+  # DISABLED: typecheck
+  #
+  # `tsc --noEmit` cannot gate anything yet. @types/node is not installed
+  # anywhere in this workspace -- it appears in pnpm-lock.yaml only as an
+  # unsatisfied optional peer, and there is no node_modules/@types directory --
+  # so `node:fs`, `node:crypto`, `Buffer`, `process` and the `NodeJS` namespace
+  # are all unresolved. That is ~155 of the ~180 errors `tsc` currently reports
+  # for sanity-overlay-testkit, which means typechecking today proves nothing
+  # and the test suite is the only real gate.
+  #
+  # BLOCKING INSTALL (dependency changes are out of this workflow's scope):
+  #
+  #   pnpm --filter sanity-overlay-testkit  add -D -E "@types/node@^22"
+  #   pnpm --filter sanity-overlay-store-fs add -D -E "@types/node@^22"
+  #
+  # ^22 tracks the pinned Node 22.22.2 runtime; -E writes the resolved exact
+  # version, matching this repo's exact-pin convention. sanity-overlay-core
+  # needs nothing -- it typechecks clean today. Both commands update
+  # pnpm-lock.yaml; commit it, or `pnpm install --frozen-lockfile` above breaks.
+  #
+  # Even after that install this job would still be red: measured with a
+  # borrowed @types/node, 11 genuine errors remain, all in files this workflow
+  # does not own -- 6x TS2322 in spike-d/scanner.ts, 3x TS7016 for untyped
+  # .mjs imports from examples/kitchen-sink, 1x TS2339 in core-boundaries.test.ts,
+  # 1x TS2578 unused @ts-expect-error in write-guard.test.ts. Fix those, then
+  # uncomment. Shipping it now would just paint every run red.
+  #
+  # typecheck:
+  #   name: typecheck
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 15
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: pnpm/action-setup@v4
+  #     - uses: actions/setup-node@v4
+  #       with:
+  #         node-version: '22.22.2'
+  #         cache: pnpm
+  #     - run: pnpm install --frozen-lockfile
+  #     # tsc is invoked from the testkit for every project: it is the only
+  #     # package that pins typescript. `-p <dir>` still uses each project's own
+  #     # tsconfig, and each project's own node_modules/@types is still found.
+  #     - run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-core
+  #     - run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-store-fs
+  #     - run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit

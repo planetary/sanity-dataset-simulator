@@ -1,5 +1,5 @@
 import {writeFileSync} from 'node:fs'
-import {beforeAll, describe, expect, it} from 'vitest'
+import {beforeAll, describe, expect, it, vi} from 'vitest'
 import {type FixtureDocument, loadFixtureDataset, publishedPerspective} from '../src/fixtures'
 import {runGroq} from '../src/groq'
 import {OVERLAY_FIXTURES, type SpikeOverlay, applyOverlay} from '../spike-c/overlay'
@@ -71,6 +71,21 @@ import {REGISTRY, byId} from '../spike-c/registry'
 //    Wall clock is recorded as evidence (p50/p95, printed below) and reported
 //    in docs/plans/evidence/phase-1/spike-c-groq-corpus/latency-2026-08-04.md.
 // ===========================================================================
+
+/**
+ * Per-test budget (ms).
+ *
+ * This is a RUNNER budget, not a gate. The deliberate absence of a wall-clock
+ * *assertion* in this file stands — measured margins were too thin to gate on,
+ * because a small query absorbs GC pauses from the 5 MiB candidate sets built in
+ * the same process. Nothing below is reintroduced as a pass/fail time threshold;
+ * the budget only decides when vitest gives up on a test that is still working.
+ *
+ * The work is genuine: every case runs groq-js over a 5 000-article corpus.
+ * Measured worst case over six full-suite runs: 3.62 s against vitest's 5 s
+ * default — 72 % of budget on an otherwise idle machine.
+ */
+vi.setConfig({testTimeout: 60_000, hookTimeout: 60_000})
 
 const fixtureBase = publishedPerspective(loadFixtureDataset())
 const representative = scaleToRepresentative(fixtureBase, REPRESENTATIVE_ARTICLE_COUNT)

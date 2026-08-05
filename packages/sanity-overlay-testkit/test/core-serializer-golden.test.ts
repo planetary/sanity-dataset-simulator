@@ -22,10 +22,11 @@
  * - non-ASCII and well-formed surrogate pairs emitted raw, `\\` and `\t` escaped.
  *
  * The §10 checklist also asks for verification "across platforms and Node
- * versions in CI". There is no CI in this repository (no `.github/`, no workflow
- * file of any kind), so that half cannot be satisfied here and is **not** claimed
- * by this file. A committed golden closes the cross-run and cross-checkout half
- * without one.
+ * versions in CI". This file closes the cross-run and cross-checkout half on its
+ * own; the platform/version half is discharged by running this same golden on
+ * the `.github/workflows/ci.yml` matrix (ubuntu + macos × Node 22.22.2 + 24).
+ * A Windows leg is deliberately absent until the repository carries a
+ * `.gitattributes` pinning `eol=lf` — see that workflow's comments.
  */
 import {createHash} from 'node:crypto'
 import {describe, expect, it} from 'vitest'

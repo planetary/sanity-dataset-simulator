@@ -54,6 +54,48 @@ function summarize(arg: unknown): string | undefined {
 const PASSTHROUGH_RESULT = new Set(['withConfig', 'clone'])
 const MAX_LOG = 5000
 
+/**
+ * The object-valued properties `instrument` descends into.
+ *
+ * GATE E CHANGE — read this before assuming the old comment still holds. Until
+ * now `instrument` descended into `observable` and NOTHING else, and
+ * `test/spike-a-client-identity.test.ts` pinned that ("leaves the client.%s
+ * namespace un-instrumented"). The pin has been flipped, deliberately.
+ *
+ * Why it changed: Spike F gaps 21/22 (`client.assets.*`), 23
+ * (`client.agent.action.*`) and 24 (`client.datasets.*` / `client.releases.*`)
+ * are all namespace objects, and the §36.1 call inventory is the evidence that
+ * says which client surfaces the Studio actually touches. With the namespaces
+ * invisible, the inventory could never have shown an asset upload or an Agent
+ * Action happening — the exact blind spot Spike F's method lesson warns about.
+ * Descending is observation only: `instrument` logs and delegates, it blocks
+ * nothing (the write block lives in `localEcho.ts`).
+ *
+ * The list is the own properties `SanityClient`'s constructor assigns
+ * (`SanityClient.ts:1189-1200`), plus the two nested one level down —
+ * `agent.action` and `mediaLibrary.video`, which are plain object literals.
+ *
+ * IDENTITY: every one of these is a stable own property, and `instrument`
+ * memoises per target in `instrumentedCache`, so `client.live` is the same proxy
+ * on every access. That is load-bearing — Studio reads `client.live` in a React
+ * effect dependency array on every render — and it is asserted at 20 000 renders
+ * in the identity test.
+ */
+const INSTRUMENTED_NAMESPACES = new Set([
+  'observable',
+  'assets',
+  'datasets',
+  'live',
+  'mediaLibrary',
+  'projects',
+  'users',
+  'agent',
+  'releases',
+  /* nested: agent.action, mediaLibrary.video */
+  'action',
+  'video',
+])
+
 // CRITICAL LESSON (Spike A finding): wrappers MUST be identity-stable.
 // A naive Proxy returning a fresh function per property access gives Studio's
 // reactive layer a new method identity on every render -> infinite
@@ -83,8 +125,8 @@ function instrument<T extends object>(target: T, path: string): T {
     get(t, prop, receiver) {
       const value = Reflect.get(t, prop, receiver)
       const name = String(prop)
-      if (name === 'observable' && value && typeof value === 'object') {
-        return instrument(value as object, `${path}.observable`)
+      if (INSTRUMENTED_NAMESPACES.has(name) && value && typeof value === 'object') {
+        return instrument(value as object, `${path}.${name}`)
       }
       if (typeof value !== 'function') return value
       let perTarget = wrapperCache.get(t)

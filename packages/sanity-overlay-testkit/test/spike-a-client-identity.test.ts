@@ -339,6 +339,29 @@ describe('spike A · spikeClientFactory is identity-stable (Track A / echo topol
     },
   )
 
+  /**
+   * PIN FLIPPED AT GATE E — this used to assert the opposite.
+   *
+   * The old assertion was "leaves the client.<ns> namespace un-instrumented",
+   * pinning the fact that `instrument` descended into `observable` and nothing
+   * else. It was explicitly "pinned, not endorsed": the same shape is Spike F
+   * gaps 21/22 (`client.assets.*`), 23 (`client.agent.action.*`) and 24
+   * (`client.datasets.*`), and while those namespaces were invisible to the
+   * instrumentation the §36.1 call inventory could not have recorded an asset
+   * upload or an Agent Action even if the Studio had performed one — the exact
+   * blind spot Spike F's method lesson is about.
+   *
+   * Gate E descends into them (`instrumentedClient.ts`
+   * `INSTRUMENTED_NAMESPACES`). `instrument` still only observes; the write
+   * block lives in `localEcho.ts` and is covered by
+   * `test/spike-a-facade-gaps.test.ts`.
+   *
+   * The identity bound is unchanged and is the reason this test still lives
+   * here: every namespace is a stable own property and `instrument` memoises per
+   * target, so `client.live` — read into a React effect dependency array on
+   * every render — is still one object forever. The 20 000-render bound above
+   * covers the same guarantee end to end.
+   */
   it.each([
     ['live', 'events'],
     ['assets', 'upload'],
@@ -346,24 +369,61 @@ describe('spike A · spikeClientFactory is identity-stable (Track A / echo topol
     ['releases', 'get'],
     ['projects', 'list'],
     ['users', 'getById'],
-  ])('leaves the client.%s namespace un-instrumented', (member, method) => {
+  ])('instruments the client.%s namespace, identity-stably', (member, method) => {
     const source = client as unknown as Record<string, unknown>
     expect(typeof source[member]).toBe('object')
+    /* The bound that made the old behaviour safe, and still has to hold. */
     expect(distinct(() => source[member], 5_000).size).toBe(1)
-    /* `instrument` descends into `observable` and nothing else, so these
-     * namespaces are raw objects with raw methods. That is why
-     * `client.assets.upload` sits OUTSIDE the facade — the open item recorded
-     * against D01, and Spike F gap 21. Pinned, not endorsed.
-     *
-     * Oracle: an instrumented method is the closure named `wrapped`
-     * (`instrumentedClient.ts:82`); a raw one keeps its own name. */
-    expect(isProxy(source[member])).toBe(false)
+    /* Oracle: an instrumented method is the closure named `wrapped`
+     * (`instrumentedClient.ts`); a raw one keeps its own name. */
+    expect(isProxy(source[member])).toBe(true)
     const namespace = source[member] as Record<string, unknown>
     expect(typeof namespace[method]).toBe('function')
-    expect((namespace[method] as {name: string}).name).not.toBe('wrapped')
-    /* Contrast, so the oracle is not vacuous: the client's own methods ARE. */
-    expect((client.fetch as unknown as {name: string}).name).toBe('wrapped')
-    expect(isProxy(client)).toBe(true)
+    expect((namespace[method] as {name: string}).name).toBe('wrapped')
+    expect(distinct(() => namespace[method], 5_000).size).toBe(1)
+    /* Contrast, so the oracle is not vacuous: an UNWRAPPED client's namespace
+     * methods keep their own names and its namespaces are not proxies. */
+    const raw = createClient(CONFIG) as unknown as Record<string, unknown>
+    const rawNamespace = raw[member] as Record<string, unknown>
+    expect(isProxy(raw[member])).toBe(false)
+    expect((rawNamespace[method] as {name: string}).name).not.toBe('wrapped')
+  })
+
+  it('descends the nested agent.action and mediaLibrary.video namespaces', () => {
+    /* `agent` and `mediaLibrary` are plain object literals built in the
+     * SanityClient constructor, so the real methods sit one level further down —
+     * `agent.action.patch` is Spike F gap 23. */
+    const agent = (client as unknown as Record<string, Record<string, unknown>>).agent
+    expect(isProxy(agent)).toBe(true)
+    const action = agent.action as Record<string, unknown>
+    expect(isProxy(action)).toBe(true)
+    for (const method of ['generate', 'transform', 'translate', 'prompt', 'patch']) {
+      expect((action[method] as {name: string}).name).toBe('wrapped')
+      expect(distinct(() => action[method], 2_000).size).toBe(1)
+    }
+    const video = (
+      (client as unknown as Record<string, Record<string, unknown>>).mediaLibrary as Record<
+        string,
+        unknown
+      >
+    ).video as Record<string, unknown>
+    expect(isProxy(video)).toBe(true)
+    expect((video.getPlaybackInfo as {name: string}).name).toBe('wrapped')
+  })
+
+  it('logs a namespace call into the §36.1 inventory it was invisible to before', () => {
+    /* The point of descending: the inventory can now SEE an asset upload. The
+     * call still delegates — `instrument` observes, it does not block. */
+    const before = win.__SPIKE_A__?.calls.length ?? 0
+    const assets = (client as unknown as Record<string, Record<string, unknown>>).assets
+    try {
+      ;(assets.upload as (...a: unknown[]) => unknown)('image', 'not-a-real-body')
+    } catch {
+      /* the real client may reject the body; the log entry is what matters */
+    }
+    const calls = win.__SPIKE_A__?.calls as Array<{path: string; method: string}> | undefined
+    expect(calls?.length).toBeGreaterThan(before)
+    expect(calls?.some((c) => c.path.endsWith('.assets') && c.method === 'upload')).toBe(true)
   })
 
   it('is stable through the withConfig chain Studio uses for the Actions API', () => {

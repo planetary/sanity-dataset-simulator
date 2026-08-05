@@ -26,10 +26,32 @@
  *      the proxy verifies, because a `rejectUnauthorized: false` would 101.
  *   3. an injected dial that adds only `ca` to the spec the proxy produced, so
  *      the certificate verifies and the whole upgrade completes over genuine
- *      TLS: `secureConnect`, ALPN, SNI, handshake, frames, teardown.
+ *      TLS: handshake, ALPN, request head, server frame, teardown.
  *
- * WHAT REMAINS UNPROVEN
- * ---------------------
+ * WHAT THIS FILE DOES *NOT* PROVE — SEE `proxy-tls-live.test.ts`
+ * -------------------------------------------------------------
+ * Three things below are asserted against the OBJECT `upstreamDialSpec()`
+ * returns, never against a socket, and the descriptions above must not be read
+ * as claiming otherwise:
+ *
+ *   - `dialFromSpec` — the production default `dialUpstream` — is never
+ *     observed SUCCEEDING. Route 2 reaches only `tls.connect`'s failure path;
+ *     route 3 injects a dial and so does not run `dialFromSpec` at all.
+ *   - "SNI carries the hostname `resolveUpstreamHostname` DERIVED" is read off
+ *     `spec.options.servername` in route 1. The live read in route 3 observes
+ *     `localhost`, which is the configured upstream host — no derivation
+ *     happens in that test, so it cannot be evidence that derivation reaches
+ *     SNI.
+ *   - `connectEvent: 'secureConnect'` is a string compared to a string. Both
+ *     events fire on a real TLSSocket, and a pre-handshake write is buffered by
+ *     the TLS layer rather than lost, so the distinction is invisible to every
+ *     functional assertion here.
+ *
+ * `proxy-tls-live.test.ts` closes all three against live sockets, with no
+ * `dialUpstream` injection anywhere.
+ *
+ * WHAT REMAINS UNPROVEN IN BOTH FILES
+ * -----------------------------------
  * That `tls.connect` succeeds against the real `<project>.api.sanity.io:443`
  * with the public root store and Sanity's own ALPN behaviour. Only a live run
  * shows that, and no test in this repository can substitute for it.
@@ -543,7 +565,13 @@ describe('spikeB-proxy · a complete upgrade over genuine TLS', () => {
     expect(seen.headers.upgrade?.toLowerCase()).toBe('websocket')
     expect(seen.headers.connection?.toLowerCase()).toBe('upgrade')
 
-    // SNI: sent, and equal to the derived upstream hostname.
+    // SNI: sent, and equal to the CONFIGURED upstream hostname. This is not the
+    // derived-hostname case — `resolveUpstreamHostname` returns the base host
+    // unchanged here, because the request's `Host` is `127.0.0.1:<port>` and the
+    // configured upstream (`localhost`) has only one label. The claim that SNI
+    // carries a DERIVED name is proven in `proxy-tls-live.test.ts` (CLAIM 2),
+    // where the upstream presents a certificate that only validates when SNI
+    // names the derived host.
     expect(seen.servername).toBe('localhost')
     // ALPN: the upstream offered h2 first and got http/1.1 anyway, because the
     // proxy offered nothing else. Remove the pin and this becomes `false`.

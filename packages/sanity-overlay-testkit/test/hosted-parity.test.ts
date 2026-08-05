@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {loadEnv} from '../src/env'
 import {hostedConfigFromEnv, hostedQuery} from '../src/hosted'
 import {draftsPerspective, loadFixtureDataset, publishedPerspective} from '../src/fixtures'
@@ -8,6 +8,21 @@ import {runGroq} from '../src/groq'
 // hosted Content Lake result vs pinned groq-js over the same fixture dataset.
 // Projection-only queries so no metadata normalization is needed yet.
 // Skips cleanly when no credentials are present (inner loop stays offline).
+
+/**
+ * Per-test budget (ms).
+ *
+ * Every case here makes a real HTTPS round-trip to the hosted Content Lake, so
+ * its runtime is set by someone else's network and someone else's server, not by
+ * anything this repository controls. Measured worst case over six full-suite
+ * runs: 4.77 s — 95 % of vitest's 5 s default, i.e. a single slow response away
+ * from a red suite that says nothing about parity.
+ *
+ * A timeout here could only ever mean "the network was slow", which is not the
+ * claim these tests make; the parity assertions themselves are untouched and
+ * still fail on any result mismatch.
+ */
+vi.setConfig({testTimeout: 30_000, hookTimeout: 30_000})
 
 loadEnv()
 const cfg = hostedConfigFromEnv()

@@ -1,0 +1,30 @@
+# Pin line endings to LF for every text file.
+#
+# Two things in this repository depend on it:
+#
+#   1. Pinned evidence logs. `examples/kitchen-sink/spikeB-proxy/proxy-log.jsonl`
+#      is committed evidence whose line count (730) is asserted by the Spike F
+#      re-verification checklist, and the replay harness splits it on '\n'.
+#      A CRLF checkout would produce false failures against real evidence.
+#
+#   2. The canonical serializer golden. PRD §14.3 fixes a trailing newline and
+#      byte-identical output; `core-serializer-golden.test.ts` pins a SHA-256
+#      over those exact bytes, and CI verifies it across platforms.
+#
+# Verified at the time of writing: zero tracked files contain CRLF, so this is a
+# no-op for the current tree rather than a mass renormalization.
+#
+# With this in place a `windows-latest` leg can be added to
+# .github/workflows/ci.yml — see that file's matrix comments.
+* text=auto eol=lf
+
+# Binary-ish assets: never touch these.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary

@@ -41,7 +41,7 @@
  *
  * Everything is hand-rolled on node built-ins. No dependency is introduced.
  */
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import fs from 'node:fs'
 import http from 'node:http'
 import http2 from 'node:http2'
@@ -199,6 +199,13 @@ interface Attempt {
   completed: boolean
   status?: number
   ms: number
+  /**
+   * How many long-lived streams the upstream still held open at the instant this
+   * attempt settled. Sampled inside the completion callback, not afterwards, so
+   * it is a statement about the moment of service rather than about the end of
+   * the test.
+   */
+  streamsOpenAtCompletion?: number
 }
 
 /**
@@ -207,16 +214,25 @@ interface Attempt {
  * Returns a verdict instead of throwing, because both outcomes are meaningful
  * here: "completed" is the invariant we want, "did not complete" is the defect
  * we are pinning. A helper that threw would force one of them to be an error.
+ *
+ * `probe` is the upstream's open-stream count. Passing it turns "the request was
+ * served" into the stronger "the request was served WHILE the streams were still
+ * held", which is the property every positive test in this file actually means.
  */
-function attemptOrdinaryRequest(port: number, agent: http.Agent, budgetMs: number): Promise<Attempt> {
+function attemptOrdinaryRequest(
+  port: number,
+  agent: http.Agent,
+  budgetMs: number,
+  probe?: () => number,
+): Promise<Attempt> {
   return new Promise((resolve) => {
     const startedAt = Date.now()
     let settled = false
-    const finish = (attempt: Omit<Attempt, 'ms'>) => {
+    const finish = (attempt: Omit<Attempt, 'ms' | 'streamsOpenAtCompletion'>) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      resolve({...attempt, ms: Date.now() - startedAt})
+      resolve({...attempt, ms: Date.now() - startedAt, streamsOpenAtCompletion: probe?.()})
     }
 
     const req = http.request(
@@ -243,8 +259,45 @@ function browserLikeAgent(maxSockets: number): http.Agent {
   return agent
 }
 
-/** How long to wait before calling a request starved. */
+/**
+ * How long to wait before calling a request starved.
+ *
+ * Used ONLY by assertions that expect a request NOT to complete. A starved
+ * request here is starved forever — the listener streams that fill the pool are
+ * never closed — so this is a lower bound on the claim, and a short value keeps
+ * the file fast without weakening it.
+ */
 const STARVATION_BUDGET_MS = 1500
+
+/**
+ * How long a request that IS being served is allowed to take (ms).
+ *
+ * Used by every assertion that expects completion. It is deliberately far larger
+ * than any latency this proxy produces, and that costs nothing: a request queued
+ * behind a full connection pool never completes at all, because the streams
+ * holding the pool are never closed. So no budget, however generous, can make a
+ * starved request look served — the two outcomes are separated by "finite vs
+ * never", not by "fast vs slow".
+ *
+ * Measured on this repo against the real proxy, six streams open, unbounded
+ * pool, sampling the same `attempt.ms` these tests assert on:
+ *
+ *   idle                       n=60   p50 4 ms    max 64 ms
+ *   under CPU oversubscription n=200  p50 8 ms    max 736 ms
+ *
+ * and across those 200 loaded samples the request completed 200/200 times with
+ * all six streams still open. The old `expect(attempt.ms).toBeLessThan(500)`
+ * failed 2 of those 200 — it was measuring how promptly the OS rescheduled this
+ * process, not whether the proxy multiplexed. That is why the timing bound below
+ * is coarse and the real claim is made structurally, by
+ * `streamsOpenAtCompletion`.
+ */
+const SERVED_BUDGET_MS = 15_000
+
+/* `SERVED_BUDGET_MS` exceeds vitest's 5 s default, so a genuinely starved
+ * request must be allowed to exhaust its budget and fail on the assertion rather
+ * than on the runner. */
+vi.setConfig({testTimeout: 60_000, hookTimeout: 30_000})
 
 /* ------------------------------------------------------------------ *
  * 1. the control — the proxy itself is not the bottleneck
@@ -267,13 +320,22 @@ describe('spikeB-proxy · concurrency · where the constraint actually lives', (
     expect(streams).toHaveLength(BROWSER_MAX_SOCKETS_PER_HOST)
     expect(upstream.openStreams()).toBe(BROWSER_MAX_SOCKETS_PER_HOST)
 
-    const attempt = await attemptOrdinaryRequest(proxy.port, agent, STARVATION_BUDGET_MS)
+    const attempt = await attemptOrdinaryRequest(
+      proxy.port,
+      agent,
+      SERVED_BUDGET_MS,
+      upstream.openStreams,
+    )
 
     expect(attempt.completed).toBe(true)
     expect(attempt.status).toBe(200)
-    // Not merely "eventually": it is not even slow. Anything near the budget
-    // would mean the proxy was queueing rather than serving concurrently.
-    expect(attempt.ms).toBeLessThan(500)
+    // Not merely "eventually, once something freed up": it was served WHILE the
+    // upstream still held all six streams. That is the concurrency claim stated
+    // structurally rather than as a stopwatch reading, and it is strictly
+    // stronger than the latency bound it replaces — a proxy that queued and only
+    // answered after a listener died would satisfy "fast" on a lucky run but can
+    // never satisfy this.
+    expect(attempt.streamsOpenAtCompletion).toBe(BROWSER_MAX_SOCKETS_PER_HOST)
 
     for (const stream of streams) stream.close()
   })
@@ -294,9 +356,16 @@ describe('spikeB-proxy · concurrency · where the constraint actually lives', (
     )
     expect(upstream.openStreams()).toBe(BROWSER_MAX_SOCKETS_PER_HOST - 1)
 
-    const attempt = await attemptOrdinaryRequest(proxy.port, agent, STARVATION_BUDGET_MS)
+    const attempt = await attemptOrdinaryRequest(
+      proxy.port,
+      agent,
+      SERVED_BUDGET_MS,
+      upstream.openStreams,
+    )
     expect(attempt.completed).toBe(true)
     expect(attempt.status).toBe(200)
+    // Served on the one spare slot, with the other five still held.
+    expect(attempt.streamsOpenAtCompletion).toBe(BROWSER_MAX_SOCKETS_PER_HOST - 1)
 
     for (const stream of streams) stream.close()
   })
@@ -315,8 +384,8 @@ describe('spikeB-proxy · concurrency · the HTTP/1.1 starvation defect', () => 
     //
     // Read it together with the two tests above, which are what make it a
     // statement about the transport:
-    //   - unbounded pool, same six streams  -> completes in < 500 ms
-    //   - pool of 6, five streams           -> completes
+    //   - unbounded pool, same six streams  -> completes, six still open
+    //   - pool of 6, five streams           -> completes, five still open
     //   - pool of 6, six streams            -> never completes   <- HERE
     //
     // This is the live failure of 2026-08-04 reproduced exactly: six listeners
@@ -375,9 +444,17 @@ describe('spikeB-proxy · concurrency · the HTTP/1.1 starvation defect', () => 
     streams[0].close()
     await new Promise((resolve) => setTimeout(resolve, 100))
 
-    const afterSettling = await attemptOrdinaryRequest(proxy.port, agent, STARVATION_BUDGET_MS)
+    const afterSettling = await attemptOrdinaryRequest(
+      proxy.port,
+      agent,
+      SERVED_BUDGET_MS,
+      upstream.openStreams,
+    )
     expect(afterSettling.completed).toBe(true)
     expect(afterSettling.status).toBe(200)
+    // Exactly one listener went away, and the other five are still held — so the
+    // recovery is the freed SLOT, not the streams having quietly all died.
+    expect(afterSettling.streamsOpenAtCompletion).toBe(BROWSER_MAX_SOCKETS_PER_HOST - 1)
 
     for (const stream of streams.slice(1)) stream.close()
   })
@@ -450,13 +527,14 @@ describe('spikeB-proxy · concurrency · HTTP/2 multiplexing is the fix', () => 
     expect(streams).toHaveLength(BROWSER_MAX_SOCKETS_PER_HOST)
     expect(held.size).toBe(BROWSER_MAX_SOCKETS_PER_HOST)
 
-    const startedAt = Date.now()
-    const status = await new Promise<number>((resolve, reject) => {
+    const served = await new Promise<{status: number; openAtResponse: number}>((resolve, reject) => {
       const stream = client.request({':path': ORDINARY_PATH})
-      const timer = setTimeout(() => reject(new Error('h2 request starved')), STARVATION_BUDGET_MS)
+      const timer = setTimeout(() => reject(new Error('h2 request starved')), SERVED_BUDGET_MS)
       stream.on('response', (headers) => {
         clearTimeout(timer)
-        resolve(Number(headers[':status']))
+        // Sampled in the response handler: the six listeners are still live at
+        // the moment the seventh request is answered.
+        resolve({status: Number(headers[':status']), openAtResponse: held.size})
       })
       stream.on('error', (err) => {
         clearTimeout(timer)
@@ -465,8 +543,8 @@ describe('spikeB-proxy · concurrency · HTTP/2 multiplexing is the fix', () => 
       stream.resume()
     })
 
-    expect(status).toBe(200)
-    expect(Date.now() - startedAt).toBeLessThan(500)
+    expect(served.status).toBe(200)
+    expect(served.openAtResponse).toBe(BROWSER_MAX_SOCKETS_PER_HOST)
 
     // THE LOAD-BEARING ASSERTION. Seven concurrent requests, ONE TCP connection.
     // This is precisely what the browser's six-per-host HTTP/1.1 budget counts,

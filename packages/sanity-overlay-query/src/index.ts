@@ -1,0 +1,52 @@
+/**
+ * `sanity-overlay-query` — the GROQ query layer (PRD §10 package layout, §22).
+ *
+ * Scope of this package as it stands: the `[M-LOCAL]` slice defined by PRD §37
+ * Phase 2 and roadmap §5.3 — a reduced registry of ID and slug lookups with
+ * their candidate planners, a pinned `groq-js` evaluator, and structured
+ * diagnostics. Ordered slices, aggregates and filter-through-reference planning
+ * remain PRD §37 Phase 5.
+ *
+ * PRD §10.1 `[MUST]`: this package runs in Node.js without browser globals, and
+ * it is also free of Node-only globals so it can run in a browser. It takes no
+ * dependency on Next.js, Vercel, `node:fs` or the hosted Sanity client; the
+ * base dataset arrives through the {@link QueryBaseSource} port.
+ *
+ * Milestone note (PRD §1.4): landing this slice does not complete PRD §37
+ * Phase 5 and claims no `[M-PROD]` acceptance.
+ */
+
+export type {
+  CandidatePlan,
+  OverlayQueryDefinition,
+  OverlayQueryDiagnostics,
+  OverlayQueryResult,
+  QueryCaller,
+  QueryDocument,
+  QueryPerspective,
+  QueryTier,
+  SystemTimestampPolicy,
+} from './types'
+
+export {OverlayQueryError, httpStatusForQueryErrorCode} from './errors'
+export type {OverlayQueryErrorCode, OverlayQueryErrorDetails} from './errors'
+
+export {createQueryRegistry, defineOverlayQuery, queryTextChecksum} from './registry'
+export type {OverlayQueryRegistry} from './registry'
+
+export {M_LOCAL_QUERIES} from './mLocalRegistry'
+
+export {createMemoryBaseSource} from './baseSource'
+export type {BaseCandidateRequest, QueryBaseSource} from './baseSource'
+
+export {emptyOverlaySource, resolveVirtualDocument} from './overlaySource'
+export type {OverlaySource} from './overlaySource'
+
+export {planCandidateRequests} from './planner'
+export type {CandidatePlanRequests} from './planner'
+
+export {analyzeDerefPaths, collectReferenceTargets} from './derefPaths'
+export type {DerefPaths} from './derefPaths'
+
+export {evaluateOverlayQuery} from './evaluate'
+export type {EvaluateOverlayQueryOptions} from './evaluate'

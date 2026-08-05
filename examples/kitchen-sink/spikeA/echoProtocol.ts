@@ -297,18 +297,180 @@ export function requestPath(target: unknown): string {
   return `/${segments.join('/')}`.toLowerCase()
 }
 
-/** `/data/mutate` and `/data/actions` — the write endpoints, at any API version. */
-const MUTATION_PATH_RE = /(^|\/)data\/(mutate|actions)(\/|$)/
+/**
+ * The four resource bases `resourceDataBase()` can build (dataMethods.ts:835).
+ *
+ * Gate E gap 7: a `resource:`-configured client mutates through
+ * `<resourceBase>/mutate` and `<resourceBase>/actions` — **with no `/data/`
+ * prefix at all**. Every `/data/`-anchored guard misses them, so the write left
+ * the facade, missed local echo, and the pane diverged from the overlay.
+ */
+const RESOURCE_BASE = String.raw`(?:projects\/[^/]+\/datasets\/[^/]+|canvases\/[^/]+|media-libraries\/[^/]+|dashboards\/[^/]+)`
+
+/**
+ * Document writes: `/data/(mutate|actions)/<ds>` and the resource-scoped forms.
+ * Both are echoable — the body is a mutations/actions array the protocol can
+ * plan from — which is why they are one plane and not four.
+ */
+const DOCUMENT_WRITE_RE = new RegExp(
+  String.raw`(^|\/)(?:data\/(?:mutate|actions)|` + RESOURCE_BASE + String.raw`\/(?:mutate|actions))(\/|$)`,
+)
+
+/**
+ * Asset uploads. `buildAssetUploadUrl()` (assets/AssetsClient.ts:194) emits
+ * `assets/images/<ds>` with NO leading slash for the default config, and
+ * `/canvases/<id>/assets/<kind>`, `/dashboards/<id>/assets/<kind>` or
+ * `/media-libraries/<id>/upload` for resource configs. The bare
+ * `assets/(images|files)` alternative covers the first three at once.
+ */
+const ASSET_WRITE_RE = /(^|\/)(?:assets\/(?:images|files)|media-libraries\/[^/]+\/upload)(\/|$)/
+
+/** The five Agent Actions endpoints (agent/actions/*.ts). */
+const AGENT_ACTION_RE = /(^|\/)agent\/action\/(?:generate|transform|translate|prompt|patch)(\/|$)/
+
+/**
+ * Dataset administration: `/datasets/<name>` and its `settings/*` children,
+ * optionally under a `/projects/<id>` host (DatasetsClient `_modify`).
+ *
+ * Anchored at `$` on purpose so `/projects/<p>/datasets/<d>/query` — a READ on
+ * the resource data plane — is not swept up with it.
+ */
+const DATASET_ADMIN_RE = /(^|\/)(?:projects\/[^/]+\/)?datasets\/[^/]+(?:\/settings(?:\/[^/]+)*)?$/
 
 /** `/auth/logout` — sanity 6.8.0's own logout call (`WorkspaceLoader`, `logout()`). */
 const LOGOUT_PATH_RE = /(^|\/)auth\/logout(\/|$)/
 
+/**
+ * The two endpoints sanity 6.8.0 treats as PROOF OF A LIVE CREDENTIAL:
+ * `/users/me` (`getCurrentUser` → `authenticated: !!currentUser?.id`,
+ * WorkspaceLoader-BRx2afZV.js:2439-2545) and `/auth/id` (`probeCurrentUser`,
+ * :2465). See {@link identityProofFrom} for why the endpoint alone is not enough.
+ */
+const IDENTITY_PROBE_RE = /(^|\/)(?:users\/me|auth\/id)(\/|$)/
+
+/**
+ * The write planes, split by what the local echo can DO with each one:
+ * `documents` is echoable (the body is a mutations/actions array the protocol
+ * can plan from); the other three have no overlay spelling and can only be
+ * refused honestly.
+ */
+export type WritePlane = 'documents' | 'asset' | 'agent-action' | 'dataset-admin'
+
+/**
+ * Which write plane, if any, a request URL belongs to.
+ *
+ * The families come from grepping every URL-construction site in
+ * `@sanity/client@7.26.0` — `uri:` literals, `_getDataUrl`, `_getUrl`,
+ * `buildAssetUploadUrl`, `resourceDataBase` — rather than from observed traffic,
+ * which is Spike F's stated method lesson.
+ *
+ * NOT a security classifier. The proxy owns enforcement and is default-deny;
+ * this exists so the local echo can tell "a write I can echo" from "a write I
+ * cannot" from "a read", and answer each honestly.
+ */
+export function classifyWriteEndpoint(target: unknown): WritePlane | undefined {
+  const path = requestPath(target)
+  if (DOCUMENT_WRITE_RE.test(path)) return 'documents'
+  if (ASSET_WRITE_RE.test(path)) return 'asset'
+  if (AGENT_ACTION_RE.test(path)) return 'agent-action'
+  if (DATASET_ADMIN_RE.test(path)) return 'dataset-admin'
+  return undefined
+}
+
 export function isMutationEndpoint(target: unknown): boolean {
-  return MUTATION_PATH_RE.test(requestPath(target))
+  return classifyWriteEndpoint(target) === 'documents'
 }
 
 export function isLogoutEndpoint(target: unknown): boolean {
   return LOGOUT_PATH_RE.test(requestPath(target))
+}
+
+export function isIdentityProbeEndpoint(target: unknown): boolean {
+  return IDENTITY_PROBE_RE.test(requestPath(target))
+}
+
+/**
+ * The user id inside an identity-probe response, or `undefined`.
+ *
+ * This is the whole of the anti-credulity rule for the token-refresh signal.
+ * `/users/me` answers an **unauthenticated** caller with HTTP 200 and a `null`
+ * body — so "the request succeeded" proves nothing, and a layer that restored a
+ * session on a bare 200 would resurrect it on every anonymous page load. Studio
+ * itself only calls the session authenticated when `typeof user?.id ===
+ * 'string'` (WorkspaceLoader-BRx2afZV.js:2457, :2465, :2542), and this is that
+ * predicate, so the facade and Studio cannot disagree about who is logged in.
+ */
+export function identityProofFrom(value: unknown): string | undefined {
+  if (!isRec(value)) return undefined
+  const id = value.id
+  return typeof id === 'string' && id.length > 0 ? id : undefined
+}
+
+/* ------------------------------------------------------------------ *
+ * The client namespaces the facade has to descend into
+ * ------------------------------------------------------------------ */
+
+export interface NamespacePolicy {
+  read: readonly string[]
+  write: readonly string[]
+}
+
+/**
+ * Every method on every namespace object `@sanity/client@7.26.0` hangs off a
+ * client, split into "reaches the network to read" and "reaches the network to
+ * write". Read off the prototypes, and pinned against them in
+ * `test/spike-a-facade-gaps.test.ts` so a client upgrade that adds a method goes
+ * red rather than quietly reopening Spike F gaps 21–24.
+ *
+ * `agent.action` and `mediaLibrary.video` are nested one level down (`agent` and
+ * `mediaLibrary` are plain object literals built in the SanityClient
+ * constructor, SanityClient.ts:1197 and :1192) and are keyed by their full path.
+ *
+ * WHY `prompt` COUNTS AS A WRITE. It is the one Agent Action that does not
+ * necessarily persist a document, but it is indistinguishable from its four
+ * siblings at the transport layer (`POST /agent/action/prompt/<ds>`), the proxy
+ * classifies it as a write, and letting it through would mean the facade and the
+ * proxy disagree about the same request — which is exactly the confusing
+ * mid-edit 403 this work exists to remove.
+ */
+export const CLIENT_NAMESPACE_POLICY: Record<string, NamespacePolicy> = {
+  assets: {read: [], write: ['upload']},
+  datasets: {
+    read: ['list', 'getEmbeddingsSettings'],
+    write: ['create', 'edit', 'delete', 'editEmbeddingsSettings'],
+  },
+  agent: {read: [], write: []},
+  'agent.action': {read: [], write: ['generate', 'transform', 'translate', 'prompt', 'patch']},
+  releases: {
+    read: ['get', 'fetchDocuments'],
+    write: [
+      'create',
+      'edit',
+      'publish',
+      'archive',
+      'unarchive',
+      'schedule',
+      'unschedule',
+      'delete',
+    ],
+  },
+  projects: {read: ['list', 'getById'], write: []},
+  users: {read: ['getById'], write: []},
+  live: {read: ['events'], write: []},
+  mediaLibrary: {read: [], write: []},
+  'mediaLibrary.video': {read: ['getPlaybackInfo'], write: []},
+}
+
+/**
+ * Read or write? **Anything not declared a read is a write.**
+ *
+ * The asymmetry is deliberate and it is not a security stance: an unrecognised
+ * method that is really a read fails loudly at the call site, in one place, the
+ * first time it is used; an unrecognised method that is really a write escapes
+ * local echo silently and the user loses an edit they were told was saved.
+ */
+export function namespaceMethodKind(namespace: string, method: string): 'read' | 'write' {
+  return CLIENT_NAMESPACE_POLICY[namespace]?.read.includes(method) ? 'read' : 'write'
 }
 
 /* ------------------------------------------------------------------ *

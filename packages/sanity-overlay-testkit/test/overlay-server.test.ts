@@ -22,14 +22,28 @@
 import {mkdtemp, readFile, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
-import {afterEach, describe, expect, it} from 'vitest'
-import {parse} from '../../sanity-overlay-core/src/index'
+import {afterEach, describe, expect, it, vi} from 'vitest'
+import {isSyntheticRev, parse} from '../../sanity-overlay-core/src/index'
 import type {CheckpointDocumentIntent} from '../../sanity-overlay-store-fs/src/index'
 import {
   parseSanityPath,
   translateInterceptedWrite,
 } from '../../../examples/kitchen-sink/spikeA/overlayTranslate'
 import {startOverlayServer} from '../../../examples/kitchen-sink/spikeA/overlayServer.mjs'
+
+/**
+ * Per-test budget (ms).
+ *
+ * These tests boot a real overlay server on a real port, drive real HTTP through
+ * it and write to a real temp directory. Measured worst case over six full-suite
+ * runs: 3.28 s against vitest's 5 s default — 66 % of budget with the machine
+ * otherwise idle, and the whole repository shares one worker pool.
+ *
+ * Nothing here waits on a guessed duration: `until()` below polls a predicate and
+ * `settle()` drains the task queue, so a bigger budget changes no assertion — it
+ * only stops a busy machine from being reported as a server defect.
+ */
+vi.setConfig({testTimeout: 30_000, hookTimeout: 30_000})
 
 const OVERLAY_ID = 'spike-a-overlay-000000000000000'
 const STUDIO_ORIGIN = 'http://localhost:3333'
@@ -954,5 +968,366 @@ describe('spikeA overlay server — no store work outlives its request', () => {
       baseDocuments: [BASE_ARTICLE],
     })
     expect(retry.json).toMatchObject({ok: true, committed: true})
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * Reads — resolving the overlay, not merely recording it
+ * ------------------------------------------------------------------ *
+ *
+ * Writes were solved first, and the result was a Studio that could *save* into a
+ * store the rest of it could not *see*: rename a document and the list pane still
+ * showed the old title, a branch-created document appeared nowhere, and every
+ * reference picker showed staging values. `POST /resolve` closes that: given the
+ * IDs a reader is asking about and whatever base documents it already holds, the
+ * server answers with the virtual documents — core's own §18.1/§18.2 resolution
+ * run over the records on disk.
+ *
+ * The server owns no read semantics either. `resolveDocumentBatch` /
+ * `resolveVersionBatch` do the resolving; this endpoint is HTTP plus the base
+ * source, exactly as `/commit` is HTTP plus the store.
+ */
+
+interface ResolveEntry {
+  requestedId: string
+  logicalId: string
+  documentId: string
+  document: Record<string, any> | null
+  source: string
+  absence: string | null
+  origin: string
+}
+
+interface ResolveResponse {
+  ok?: boolean
+  mode?: string
+  perspective?: string
+  revision?: number
+  entries?: ResolveEntry[]
+  documents?: Record<string, any>[]
+  missing?: string[]
+  addedIds?: string[]
+  conflicts?: unknown[]
+  error?: {code: string; message: string}
+}
+
+async function postResolve(
+  server: Booted,
+  body: Record<string, unknown>,
+): Promise<{status: number; json: ResolveResponse; headers: Headers}> {
+  const response = await fetch(`${server.url}/resolve`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', origin: STUDIO_ORIGIN},
+    body: JSON.stringify(body),
+  })
+  return {
+    status: response.status,
+    json: (await response.json()) as ResolveResponse,
+    headers: response.headers,
+  }
+}
+
+/** Commit one Studio-shaped field edit and assert it landed. */
+async function editTitle(server: Booted, key: string, title: string): Promise<void> {
+  const {json} = await postCommit(server, {
+    idempotencyKey: key,
+    kind: 'actions',
+    payload: editAction(title),
+    baseDocuments: [BASE_ARTICLE],
+  })
+  expect(json).toMatchObject({ok: true, committed: true})
+}
+
+describe('spikeA overlay server — POST /resolve', () => {
+  it('returns the branch title for a document the branch renamed', async () => {
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-r:1', 'Renamed in the branch')
+
+    const {status, json} = await postResolve(server, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(status).toBe(200)
+    expect(json.ok).toBe(true)
+    expect(json.entries?.[0]?.document?.title).toBe('Renamed in the branch')
+    expect(json.entries?.[0]?.origin).toBe('overlay')
+    /* Base still says "Article 1" — the server did not simply echo what it was
+     * handed. */
+    expect(BASE_ARTICLE.title).toBe('Article 1')
+  })
+
+  it('passes an untouched document straight through from the supplied base', async () => {
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-r:1', 'Renamed in the branch')
+
+    const other = {...BASE_ARTICLE, _id: 'article-9', _rev: 'lake-rev-9', title: 'Untouched nine'}
+    const {json} = await postResolve(server, {
+      ids: ['article-9'],
+      perspective: 'drafts',
+      baseDocuments: [other],
+    })
+
+    expect(json.entries?.[0]?.document?.title).toBe('Untouched nine')
+    expect(json.entries?.[0]?.origin).toBe('untouched')
+  })
+
+  it('reports a locally deleted document as absent, never as stale base content', async () => {
+    const server = await boot(await makeRoot())
+
+    const {json: deleted} = await postCommit(server, {
+      idempotencyKey: 'session-r:del',
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.delete',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+        },
+      ],
+      baseDocuments: [BASE_ARTICLE],
+    })
+    expect(deleted).toMatchObject({ok: true, committed: true})
+
+    for (const perspective of ['published', 'drafts']) {
+      const {json} = await postResolve(server, {
+        ids: ['article-1'],
+        perspective,
+        baseDocuments: [BASE_ARTICLE],
+      })
+
+      expect(json.entries?.[0]?.document).toBeNull()
+      expect(json.entries?.[0]?.absence).toBe('tombstone')
+      expect(json.missing).toEqual(['article-1'])
+      expect(json.documents).toEqual([])
+      expect(JSON.stringify(json)).not.toContain('Article 1')
+    }
+  })
+
+  it('returns a branch-created document that base has never held', async () => {
+    const server = await boot(await makeRoot())
+
+    const {json: created} = await postCommit(server, {
+      idempotencyKey: 'session-r:new',
+      kind: 'mutations',
+      payload: [
+        {create: {_id: 'drafts.article-new', _type: 'article', title: 'Born in the branch'}},
+      ],
+      baseDocuments: [],
+    })
+    expect(created).toMatchObject({ok: true, committed: true})
+
+    const {json} = await postResolve(server, {
+      ids: ['article-new'],
+      perspective: 'drafts',
+      baseDocuments: [],
+    })
+
+    expect(json.entries?.[0]?.document?.title).toBe('Born in the branch')
+    expect(json.entries?.[0]?.origin).toBe('branch-created')
+  })
+
+  it('widens a read with the overlay documents of a requested type', async () => {
+    /* The list-pane fix: base can never return an ID it has never held, so the
+     * *server* has to add branch-created candidates to the set. */
+    const server = await boot(await makeRoot())
+    await postCommit(server, {
+      idempotencyKey: 'session-r:new',
+      kind: 'mutations',
+      payload: [
+        {create: {_id: 'drafts.article-new', _type: 'article', title: 'Born in the branch'}},
+        {create: {_id: 'drafts.author-new', _type: 'author', name: 'Nobody'}},
+      ],
+      baseDocuments: [],
+    })
+
+    const {json} = await postResolve(server, {
+      ids: ['article-1'],
+      types: ['article'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(json.addedIds).toEqual(['article-new'])
+    expect(json.documents?.map((document) => document._id).sort()).toEqual([
+      'article-1',
+      'drafts.article-new',
+    ])
+    /* The author is a different type and must not be smuggled in. */
+    expect(JSON.stringify(json)).not.toContain('author-new')
+  })
+
+  it('answers by-version IDs the way getDocument does — no draft fallback', async () => {
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-r:1', 'Renamed in the branch')
+
+    const {json} = await postResolve(server, {
+      mode: 'version',
+      ids: ['article-1', 'drafts.article-1', 'drafts.article-9'],
+      baseDocuments: [
+        BASE_ARTICLE,
+        {...BASE_ARTICLE, _id: 'article-9', _rev: 'lake-rev-9', title: 'Untouched nine'},
+      ],
+    })
+
+    expect(json.mode).toBe('version')
+    /* published untouched, draft carries the branch edit, and a draft that does
+     * not exist is null rather than a published document in disguise. */
+    expect(json.entries?.map((entry) => entry.document?.title ?? null)).toEqual([
+      'Article 1',
+      'Renamed in the branch',
+      null,
+    ])
+    expect(json.entries?.[1]?.documentId).toBe('drafts.article-1')
+  })
+
+  it('ignores a base document carrying a synthetic overlay revision', async () => {
+    /* PRD §13.9: a synthetic `_rev` is something this overlay produced. Feeding
+     * it back as base would make the overlay its own merge ancestor. The overlay
+     * record must answer instead — silently trusting the echo would be a loop. */
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-r:1', 'Renamed in the branch')
+
+    /* The §13.9 spelling, written out rather than computed — and checked against
+     * core's own recogniser, so a format change fails here loudly instead of
+     * quietly turning this into a test of nothing. */
+    const SYNTHETIC = 'overlay.1.0123456789ab'
+    expect(isSyntheticRev(SYNTHETIC)).toBe(true)
+
+    const echoed = await postResolve(server, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [{...BASE_ARTICLE, _rev: SYNTHETIC, title: 'Echoed back'}],
+    })
+
+    expect(echoed.json.entries?.[0]?.document?.title).toBe('Renamed in the branch')
+    expect(JSON.stringify(echoed.json)).not.toContain('Echoed back')
+  })
+
+  it('reads the overlay off disk after a restart', async () => {
+    const root = await makeRoot()
+    const first = await boot(root)
+    await editTitle(first, 'session-r:1', 'Survives the restart')
+    await first.close()
+    running.length = 0
+
+    const second = await boot(root)
+    const {json} = await postResolve(second, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+    expect(json.entries?.[0]?.document?.title).toBe('Survives the restart')
+  })
+
+  it('reports the overlay revision the answer was resolved at', async () => {
+    const server = await boot(await makeRoot())
+    const before = await postResolve(server, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+    await editTitle(server, 'session-r:1', 'Bumped')
+    const after = await postResolve(server, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(before.json.revision).toBe(0)
+    expect(after.json.revision).toBeGreaterThan(0)
+  })
+
+  it('grants CORS to the Studio origin and answers the preflight', async () => {
+    const server = await boot(await makeRoot())
+    const {status, headers} = await postResolve(server, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+    /* Status asserted too: a 404 also carries CORS headers, so the header check
+     * alone would pass against a server with no `/resolve` route at all. */
+    expect(status).toBe(200)
+    expect(headers.get('access-control-allow-origin')).toBe(STUDIO_ORIGIN)
+
+    const preflight = await fetch(`${server.url}/resolve`, {
+      method: 'OPTIONS',
+      headers: {origin: STUDIO_ORIGIN},
+    })
+    expect(preflight.status).toBe(204)
+    expect(preflight.headers.get('access-control-allow-origin')).toBe(STUDIO_ORIGIN)
+  })
+
+  it('rejects a malformed resolve request with a structured error', async () => {
+    const server = await boot(await makeRoot())
+
+    const noIds = await postResolve(server, {perspective: 'drafts'})
+    expect(noIds.status).toBe(400)
+    expect(noIds.json.ok).toBe(false)
+    expect(noIds.json.error?.code).toBe('INVALID_REQUEST')
+
+    const badPerspective = await postResolve(server, {ids: ['article-1'], perspective: 'sideways'})
+    expect(badPerspective.status).toBe(400)
+    expect(badPerspective.json.error?.code).toBe('INVALID_REQUEST')
+
+    const broken = await fetch(`${server.url}/resolve`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json', origin: STUDIO_ORIGIN},
+      body: '{not json',
+    })
+    expect(broken.status).toBe(400)
+  })
+
+  it('accepts an empty ID list without inventing a result', async () => {
+    const server = await boot(await makeRoot())
+    const {status, json} = await postResolve(server, {
+      ids: [],
+      perspective: 'drafts',
+      baseDocuments: [],
+    })
+    expect(status).toBe(200)
+    expect(json.entries).toEqual([])
+    expect(json.documents).toEqual([])
+  })
+
+  it('does not queue behind an in-flight commit, and never sees a half-applied one', async () => {
+    /* A read is not a write: making it wait on the commit mutex would stall every
+     * pane behind an autosave. What it must never do is observe a transaction
+     * that has not reached its commit point. */
+    const root = await makeRoot()
+    const gate = manifestGate()
+    const server = await boot(root, gate.hooks)
+    gate.arm()
+
+    const commitPromise = watch(
+      postCommit(server, {
+        idempotencyKey: 'session-r:gated',
+        kind: 'actions',
+        payload: editAction('Only after the commit point'),
+        baseDocuments: [BASE_ARTICLE],
+      }),
+    )
+    await until(gate.reached, 'the store to reach the manifest commit point')
+
+    const during = await postResolve(server, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+    /* Answered — not blocked — and carrying pre-commit state. */
+    expect(during.status).toBe(200)
+    expect(during.json.entries?.[0]?.document?.title).toBe('Article 1')
+    expect(commitPromise.settled()).toBe(false)
+
+    gate.release()
+    await commitPromise.promise
+
+    const after = await postResolve(server, {
+      ids: ['article-1'],
+      perspective: 'drafts',
+      baseDocuments: [BASE_ARTICLE],
+    })
+    expect(after.json.entries?.[0]?.document?.title).toBe('Only after the commit point')
   })
 })

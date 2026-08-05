@@ -69,11 +69,16 @@
 import type {SanityClient} from '@sanity/client'
 import {
   authStatusOf,
+  classifyWriteEndpoint,
   createEchoProtocol,
+  identityProofFrom,
+  isIdentityProbeEndpoint,
   isLogoutEndpoint,
   isMutationEndpoint,
+  namespaceMethodKind,
   type EchoMutationEvent,
   type EchoPlan,
+  type EchoSessionState,
   type PlannedEvent,
 } from './echoProtocol'
 
@@ -129,6 +134,13 @@ export interface EchoPersistLog {
   failed: number
 }
 
+/** Where the session stands, mirrored onto `window.__SPIKE_ECHO__.session`. */
+export interface EchoSessionLog {
+  state: EchoSessionState
+  /** How many times an identity probe brought a dead session back to life. */
+  restored: number
+}
+
 export interface EchoLog {
   enabled: boolean
   blocked: EchoBlockedEntry[]
@@ -138,6 +150,7 @@ export interface EchoLog {
   revs: Record<string, string | undefined>
   errors: string[]
   persist: EchoPersistLog
+  session: EchoSessionLog
 }
 
 declare global {
@@ -247,8 +260,17 @@ function echoLog(): EchoLog | null {
       unsupported: [],
       failed: 0,
     },
+    session: {state: 'active', restored: 0},
   }
   return window.__SPIKE_ECHO__
+}
+
+/** Mirror the protocol's session state into the browser-readable log. */
+function syncSessionLog(restored = false): void {
+  const log = echoLog()
+  if (!log) return
+  log.session.state = protocol.sessionState()
+  if (restored) log.session.restored += 1
 }
 
 /**
@@ -784,6 +806,7 @@ async function postCommit(
         source: 'write',
         message: `POST /commit ${idempotencyKey} (${kind}) responded ${status}`,
       })
+      syncSessionLog()
     }
     persistFailure(`POST /commit ${idempotencyKey} (${kind}) did not land`, error)
   }
@@ -1001,6 +1024,7 @@ function noteAuthFailureFrom(error: unknown, source: 'listener' | 'read' | 'writ
     source,
     message: error instanceof Error ? error.message : String(error),
   })
+  syncSessionLog()
 }
 
 function tapRead(result: unknown, keepDocuments: boolean, requestedIds: string[] = []): unknown {
@@ -1125,9 +1149,88 @@ function wrapListen(realListen: (...args: unknown[]) => unknown, self: object) {
 const fluentCache = new WeakMap<object, object>()
 
 /**
+ * Is this the sort of object `blockFluentCommit` must own?
+ *
+ * `commit` + `serialize` is the shape of both `Patch`/`ObservablePatch`
+ * (`data/patch.ts`) and `Transaction`/`ObservableTransaction`
+ * (`data/transaction.ts`), and neither class is exported from `@sanity/client`,
+ * so a structural test is the only one available. It is checked on every value a
+ * wrapped builder method returns — which is what closes Spike F gaps 18/19.
+ */
+function isFluentBuilder(value: unknown): value is object {
+  return (
+    isRec(value) && typeof value.commit === 'function' && typeof value.serialize === 'function'
+  )
+}
+
+/**
+ * The mutations a builder is about to commit.
+ *
+ * `Patch.serialize()` returns one `PatchMutationOperation` (`{id, set, …}`);
+ * `Transaction.serialize()` returns the whole `Mutation[]`. Reading them is what
+ * turns "the commit was blocked" into "the edit happened locally" — a commit the
+ * facade catches but cannot echo still loses the user's work, which is the
+ * failure mode this whole exercise is about.
+ */
+function serializeBuilder(target: object, label: string): Rec[] {
+  const serialize = (target as Rec).serialize
+  if (typeof serialize !== 'function') return []
+  try {
+    const value = (serialize as () => unknown).call(target)
+    /* A Transaction serialises to the mutation array itself; a Patch serialises
+     * to the bare patch operation, which is one mutation once it is named. The
+     * shape of the return value is the discriminator — no need to know which
+     * builder produced it. */
+    if (Array.isArray(value)) return value.filter(isRec)
+    return isRec(value) ? [{patch: value}] : []
+  } catch (error) {
+    noteError(`${label}.serialize() failed: ${String(error)}`)
+    return []
+  }
+}
+
+/** A `Transaction`'s own id, if it was given one (`BaseTransaction.transactionId`). */
+function builderTransactionId(target: object): string | undefined {
+  const read = (target as Rec).transactionId
+  if (typeof read !== 'function') return undefined
+  try {
+    const value = (read as () => unknown).call(target)
+    return typeof value === 'string' && value.length > 0 ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Turn any builder in a `client.mutate()` argument into the mutations it stands
+ * for, so the planner can see the edit.
+ *
+ * `client.mutate(client.patch(id).set(…))` is documented `@sanity/client` usage
+ * and `_mutate` serialises the builder on the way out (`data/dataMethods.ts`).
+ * The facade already intercepted `mutate`, so nothing escaped — but the planner
+ * only understands plain `{patch|create|delete: …}` mutations, so a builder
+ * argument produced an EMPTY plan: blocked, acknowledged, never echoed, edit
+ * gone. Same failure as gaps 18/19, reached from the other end of the builder.
+ */
+function normalizeBuilderArg(method: string, arg: unknown): unknown {
+  if (method !== 'mutate') return arg
+  const expand = (value: unknown): unknown[] =>
+    isFluentBuilder(value) ? serializeBuilder(value, 'mutate') : [value]
+  if (Array.isArray(arg)) return arg.flatMap(expand)
+  return isFluentBuilder(arg) ? expand(arg) : arg
+}
+
+/**
  * `client.patch(id)` / `client.transaction()` return builders bound to the REAL
  * client, so their `commit()` would bypass the facade entirely. Wrap them and
- * re-wrap the fluent `this` returns so the chain can never escape.
+ * re-wrap every builder they hand back so the chain can never escape.
+ *
+ * GATE E, gaps 18/19. This used to re-wrap only `result === t` — the fluent
+ * `this` returns. `clone()` returns a **new** builder still bound to the real
+ * client (`patch.ts:284`, `transaction.ts:148`), so `patch(id).clone().commit()`
+ * walked straight out of the facade and the edit never reached local echo.
+ * Every builder-shaped return is now re-wrapped, which covers `clone()`,
+ * `clone().clone()`, chains taken off a clone, and any future copy method.
  */
 function blockFluentCommit<T extends object>(target: T, label: string, kind: Kind): T {
   const cached = fluentCache.get(target)
@@ -1142,14 +1245,33 @@ function blockFluentCommit<T extends object>(target: T, label: string, kind: Kin
       const name = String(prop)
       const wrapped = (...args: unknown[]): unknown => {
         if (name === 'commit') {
-          const transactionId = transactionIdFromOptions(args[0]) ?? nextTransactionId()
-          const entry = recordBlocked(`${label}.commit`, args[0], transactionId, false)
-          noteError(`${label}.commit blocked without echo (unsupported write path)`)
-          return blockedResult(kind, syntheticResult(transactionId, true), () => {}, undefined, entry)
+          const mutations = serializeBuilder(t, label)
+          const transactionId =
+            transactionIdFromOptions(args[0]) ?? builderTransactionId(t) ?? nextTransactionId()
+          const plan = protocol.planMutations(mutations)
+          const entry = recordBlocked(
+            `${label}.commit`,
+            mutations,
+            transactionId,
+            plan.plans.length > 0,
+          )
+          if (plan.plans.length === 0) {
+            noteError(`${label}.commit blocked without echo (nothing serialisable to echo)`)
+          }
+          return blockedResult(
+            kind,
+            syntheticResult(transactionId, true),
+            () => scheduleEcho(plan.plans, transactionId),
+            () => persistPlan(plan, transactionId),
+            entry,
+          )
         }
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const result = (value as any).apply(t, args)
-        return result === t ? proxy : result
+        if (result === t) return proxy
+        /* `clone()` and friends: a new builder, same real client. Wrap it or the
+         * next `commit()` is outside the facade. */
+        return isFluentBuilder(result) ? blockFluentCommit(result as object, label, kind) : result
       }
       methods.set(prop, wrapped)
       return wrapped
@@ -1157,6 +1279,192 @@ function blockFluentCommit<T extends object>(target: T, label: string, kind: Kin
   }) as T
   fluentCache.set(target, proxy)
   return proxy
+}
+
+/* ------------------------------------------------- un-echoable write refusal */
+
+/**
+ * Answer a write the overlay cannot represent with an error instead of a lie.
+ *
+ * Asset uploads, Agent Actions and dataset administration have no overlay
+ * spelling: there is nothing to echo and nothing to persist. The previous
+ * behaviour was worse than either option here — the call was not intercepted at
+ * all, so it reached the network, moved staging, and left the overlay behind
+ * (or, with the proxy in front, died on an opaque 403 halfway through an edit).
+ *
+ * A synthetic success would be worse still: `assets.upload` resolving to
+ * `{transactionId}` hands Studio a value shaped nothing like the asset document
+ * it awaits. An error is the one answer that is true, and it names the layer
+ * that produced it so the failure is not mistaken for a Content Lake outage.
+ */
+function refuseUnechoable(kind: Kind, label: string, arg: unknown, reason: string): unknown {
+  const entry = recordBlocked(label, arg, undefined, false)
+  if (entry) entry.handled = false
+  const error = new Error(
+    `[spike-a] local echo blocked ${label}: ${reason}. The overlay cannot represent this ` +
+      'write, so letting it through would put the editor and the overlay out of sync.',
+  )
+  noteError(error.message)
+  console.error(error.message)
+  return kind === 'observable' ? observableThrowing<Rec>(error) : Promise.reject(error)
+}
+
+const UNECHOABLE_REASON: Record<string, string> = {
+  asset: 'asset uploads are binary and live outside the document overlay',
+  'agent-action': 'Agent Actions mutate documents server-side, where the overlay cannot follow',
+  'dataset-admin': 'dataset administration is a project-plane operation, not a document edit',
+}
+
+/* --------------------------------------------------------- the identity tap */
+
+/**
+ * Watch an identity probe go by and, if it proves a live credential, bring the
+ * session back.
+ *
+ * GATE E follow-up: `restoreSession()` existed and was tested, but nothing ever
+ * called it — a session that 401'd stayed write-refusing until a full reload.
+ * Fail-closed and deliberate, but a real limitation, and one the user cannot do
+ * anything about from inside the editor.
+ *
+ * The signal is Studio's own: after a 401 Studio calls `refreshWorkbenchToken()`
+ * and the reissued token arrives on the `auth.token` subscription, which drives
+ * `probeAuthState` → `GET /users/me` (or `probeCurrentUser` → `GET /auth/id`).
+ * So the facade piggybacks on a round trip that already happens at exactly the
+ * right moment, and adds no polling of its own.
+ *
+ * It is a TAP: the response is forwarded untouched, errors included.
+ */
+function tapIdentityProbe(result: unknown, label: string): unknown {
+  const observed = (value: unknown): void => {
+    if (identityProofFrom(value) === undefined) return
+    if (protocol.sessionState() !== 'unauthenticated') return
+    protocol.restoreSession()
+    syncSessionLog(true)
+    const message =
+      `[spike-a] ${label} returned a live identity — the session is authenticated again ` +
+      'and writes resume'
+    noteError(message)
+    console.info(message)
+  }
+
+  if (isRec(result) && typeof (result as Rec).subscribe === 'function') {
+    captureObservableCtor(result)
+    const source = result as unknown as MinimalObservable<unknown>
+    return makeObservable<unknown>((subscriber) =>
+      source.subscribe({
+        next: (value) => {
+          observed(value)
+          subscriber.next(value)
+        },
+        error: (err) => subscriber.error(err),
+        complete: () => subscriber.complete(),
+      }),
+    )
+  }
+  if (isRec(result) && typeof (result as Rec).then === 'function') {
+    return (result as unknown as Promise<unknown>).then((value) => {
+      observed(value)
+      return value
+    })
+  }
+  observed(result)
+  return result
+}
+
+/* -------------------------------------------------------- namespace proxies */
+
+/**
+ * The object-valued namespaces a `SanityClient` hangs off itself
+ * (`SanityClient.ts:1189-1200`), and the ones nested inside them.
+ *
+ * Until Gate E the echo proxy descended into `observable` and nothing else, so
+ * `client.assets`, `client.agent.action`, `client.datasets` and
+ * `client.releases` were returned untouched — Spike F gaps 21/22, 23 and 24.
+ * They do not route through `client.request` either: every namespace client
+ * holds its own `#httpRequest` and calls it directly, so guarding `request` was
+ * never going to reach them.
+ */
+const NAMESPACE_ROOTS = new Set([
+  'assets',
+  'datasets',
+  'projects',
+  'users',
+  'releases',
+  'live',
+  'agent',
+  'mediaLibrary',
+])
+
+/** namespace path -> the property under it that is itself a namespace. */
+const NESTED_NAMESPACES: Record<string, string> = {agent: 'action', mediaLibrary: 'video'}
+
+const namespaceCache = new WeakMap<object, object>()
+const namespaceMethods = new WeakMap<object, Map<PropertyKey, unknown>>()
+
+/**
+ * Identity-stable, exactly like {@link echoProxy}: one proxy per namespace
+ * object, one wrapper per method. Studio reads `client.live` inside a React
+ * effect dependency array on every render (`LiveQueries-rJao7vYj.js:36-45`), so
+ * a fresh proxy per access is the ~40 000-call resubscribe storm again — pinned
+ * at 20 000 renders in `test/spike-a-client-identity.test.ts`.
+ */
+function echoNamespace<T extends object>(target: T, path: string, kind: Kind): T {
+  const cached = namespaceCache.get(target)
+  if (cached) return cached as T
+
+  const proxy = new Proxy(target, {
+    get(t, prop) {
+      const value = Reflect.get(t, prop)
+      const name = String(prop)
+
+      if (NESTED_NAMESPACES[path] === name && isRec(value)) {
+        return echoNamespace(value as object, `${path}.${name}`, kind)
+      }
+      if (typeof value !== 'function') return value
+
+      let perTarget = namespaceMethods.get(t)
+      if (!perTarget) {
+        perTarget = new Map()
+        namespaceMethods.set(t, perTarget)
+      }
+      const existing = perTarget.get(prop)
+      if (existing) return existing
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const fn = value as (...args: any[]) => unknown
+      const label = `${path}.${name}`
+      let wrapped: (...args: unknown[]) => unknown
+
+      if (namespaceMethodKind(path, name) === 'write') {
+        wrapped = (...args: unknown[]): unknown =>
+          refuseUnechoable(kind, label, args[0], namespaceRefusalReason(path))
+      } else if (path === 'users' && name === 'getById') {
+        /* `client.users.getById('me')` is the same credential proof as
+         * `request({uri: '/users/me'})` — it builds that exact URL — so the
+         * refresh signal must not depend on which spelling the caller picked. */
+        wrapped = (...args: unknown[]): unknown =>
+          args[0] === 'me' ? tapIdentityProbe(fn.apply(t, args), label) : fn.apply(t, args)
+      } else {
+        wrapped = (...args: unknown[]): unknown => fn.apply(t, args)
+      }
+
+      perTarget.set(prop, wrapped)
+      return wrapped
+    },
+  }) as T
+
+  namespaceCache.set(target, proxy)
+  return proxy
+}
+
+function namespaceRefusalReason(path: string): string {
+  if (path === 'assets') return UNECHOABLE_REASON.asset as string
+  if (path === 'agent.action') return UNECHOABLE_REASON['agent-action'] as string
+  if (path === 'datasets') return UNECHOABLE_REASON['dataset-admin'] as string
+  if (path === 'releases') {
+    return 'release administration is not a document edit the overlay can represent'
+  }
+  return 'this namespace method is not one the overlay knows how to echo'
 }
 
 /* ---------------------------------------------------------- the echo proxy */
@@ -1178,6 +1486,9 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
 
       if (name === 'observable' && isRec(value)) {
         return echoProxy(value as object, 'observable')
+      }
+      if (NAMESPACE_ROOTS.has(name) && isRec(value)) {
+        return echoNamespace(value as object, name, kind)
       }
       if (typeof value !== 'function') return value
 
@@ -1254,11 +1565,30 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
             protocol.logout()
             const log = echoLog()
             if (log) Object.assign(log.revs, protocol.revisions())
+            syncSessionLog()
             return fn.apply(t, args)
           }
 
-          const isWrite = isMutationEndpoint(url) && method !== 'GET' && method !== 'HEAD'
+          /* The token-refresh signal (Gate E follow-up). Forwarded untouched;
+           * see `tapIdentityProbe` for why a bare 200 is not enough. */
+          if (isIdentityProbeEndpoint(url)) {
+            return tapIdentityProbe(fn.apply(t, args), `request(${String(url)})`)
+          }
+
+          const plane = classifyWriteEndpoint(url)
+          const isWrite = plane !== undefined && method !== 'GET' && method !== 'HEAD'
           if (!isWrite) return fn.apply(t, args)
+          /* Asset / Agent Action / dataset-admin URLs reach the network through
+           * `request` too (gaps 21/23/24 and gap 7's non-`/data/` spellings) and
+           * there is nothing to echo for any of them. */
+          if (plane !== 'documents') {
+            return refuseUnechoable(
+              kind,
+              `request(${String(url)})`,
+              options,
+              UNECHOABLE_REASON[plane] as string,
+            )
+          }
           const body = isRec(options) ? options.body : undefined
           const transactionId =
             (isRec(body) && typeof body.transactionId === 'string' ? body.transactionId : undefined) ??
@@ -1280,7 +1610,7 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
           /* `args[1]` carries the `tag`, which is the only trace of §18.9
            * duplicate on the wire: Studio's duplicate is
            * `client.create(copy, {tag: 'document.duplicate'})`, not an action. */
-          const plan = protocol.planWrite(name, args[0], args[1])
+          const plan = protocol.planWrite(name, normalizeBuilderArg(name, args[0]), args[1])
           const entry = recordBlocked(name, args[0], transactionId, plan.plans.length > 0)
           return blockedResult(
             kind,

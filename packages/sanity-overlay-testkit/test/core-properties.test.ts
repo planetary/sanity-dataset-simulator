@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {
   MAX_ENCODED_ID_LENGTH,
   applyTransaction,
@@ -46,6 +46,25 @@ import {MERGE_SEED_CORPUS, createRng, type Rng} from '../src/mergeFixtures'
  * every assertion embeds its seed, so a failure names its own reproducer. Seeds
  * are append-only — adding one is always safe, removing one loses coverage.
  */
+
+/**
+ * Per-test budget (ms).
+ *
+ * Each property replays a whole recorded seed corpus, which is thousands of
+ * generated documents, paths and operation sequences per test — real CPU, no
+ * waiting. Measured worst case over six full-suite runs: 4.84 s for the checksum
+ * property against vitest's 5 s default, i.e. 97 % of budget consumed on a
+ * machine doing nothing else.
+ *
+ * That margin is the most likely explanation for the previously unreproduced
+ * intermittent failure in this file: under a full-suite run the whole repository
+ * shares one worker pool, and a CPU-bound property with 3 % headroom is the
+ * first thing to lose. Raising the budget cannot mask a property violation —
+ * a violated property fails on its assertion, and the assertion names its seed.
+ *
+ * Seeds and assertions are unchanged.
+ */
+vi.setConfig({testTimeout: 60_000, hookTimeout: 30_000})
 
 /* ------------------------------------------------------------------ *
  * Recorded seed corpus
