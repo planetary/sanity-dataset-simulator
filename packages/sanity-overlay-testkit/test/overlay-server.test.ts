@@ -1331,3 +1331,262 @@ describe('spikeA overlay server — POST /resolve', () => {
     expect(after.json.entries?.[0]?.document?.title).toBe('Only after the commit point')
   })
 })
+
+/* ------------------------------------------------------------------ *
+ * POST /query/plan and POST /query — the GROQ read path (PRD §22)
+ * ------------------------------------------------------------------ *
+ *
+ * WHY THESE LIVE ON THE SERVER AND NOT IN THE BROWSER
+ * `sanity-overlay-query` enforces §22.9 `CANDIDATE_LIMIT_EXCEEDED` inside
+ * `evaluateOverlayQuery`, and derives the candidate plan that decides what may
+ * be fetched at all. Boundedness decided in a browser tab is boundedness a
+ * reload can lose, so both sit next to the overlay store. The browser keeps the
+ * one job only it can do — it holds the Sanity credential, so it executes the
+ * base requests the plan asks for and posts the documents back.
+ *
+ * The split is visible in these tests: `/query/plan` is asked what to fetch,
+ * `/query` is given the documents and returns the answer.
+ */
+
+interface PlanResponse {
+  ok?: boolean
+  supported?: boolean
+  reason?: string
+  queryId?: string
+  baseRequests?: Array<Record<string, unknown>>
+  error?: {code: string; message: string}
+}
+
+interface QueryResponse {
+  ok?: boolean
+  result?: unknown
+  diagnostics?: Record<string, any>
+  error?: {code: string; message: string}
+}
+
+async function postJson<T>(
+  server: Booted,
+  route: string,
+  body: Record<string, unknown>,
+): Promise<{status: number; json: T}> {
+  const response = await fetch(`${server.url}${route}`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', origin: STUDIO_ORIGIN},
+    body: JSON.stringify(body),
+  })
+  return {status: response.status, json: (await response.json()) as T}
+}
+
+const BASE_DRAFT = {...BASE_ARTICLE, _id: 'drafts.article-1', _rev: 'lake-rev-1d'}
+const BASE_ARTICLE_9 = {
+  _id: 'article-9',
+  _type: 'article',
+  _rev: 'lake-rev-9',
+  _createdAt: '2025-12-01T00:00:00.000Z',
+  _updatedAt: '2025-12-01T00:00:00.000Z',
+  title: 'Article 9',
+}
+
+/** The shape a live Studio Article list pane actually issues (observed 2026-08-04). */
+const LIST_PANE_QUERY =
+  '[*[_id in ["drafts.article-1","article-9"]][0...23]{_id,_type,title}][0...1]'
+
+describe('spikeA overlay server — POST /query/plan', () => {
+  it('answers with the base requests the credential holder must fetch', async () => {
+    const server = await boot(await makeRoot())
+
+    const {status, json} = await postJson<PlanResponse>(server, '/query/plan', {
+      query: LIST_PANE_QUERY,
+    })
+
+    expect(status).toBe(200)
+    expect(json.ok).toBe(true)
+    expect(json.supported).toBe(true)
+    expect(json.baseRequests).toEqual([{kind: 'ids', ids: ['drafts.article-1', 'article-9']}])
+  })
+
+  it('resolves a parameterised plan against the call parameters', async () => {
+    const server = await boot(await makeRoot())
+    const {json} = await postJson<PlanResponse>(server, '/query/plan', {
+      query: '*[_id == $id][0]',
+      params: {id: 'article-1'},
+    })
+    expect(json.baseRequests).toEqual([{kind: 'ids', ids: ['article-1']}])
+  })
+
+  it('reports an unsupported query as data, with a reason — not as an HTTP error', async () => {
+    /* §22.5 "[MUST] log unregistered queries" needs the reason to reach the
+     * caller so it can be recorded and shown. A 4xx would be indistinguishable
+     * from a broken server, and the caller would stop distinguishing "the
+     * overlay cannot answer this" from "the overlay is down". */
+    const server = await boot(await makeRoot())
+    const {status, json} = await postJson<PlanResponse>(server, '/query/plan', {
+      query: '*[_type in $t && [@, _id] match text::query($q)]{_id}',
+      params: {t: ['article'], q: 'x'},
+    })
+
+    expect(status).toBe(200)
+    expect(json.ok).toBe(true)
+    expect(json.supported).toBe(false)
+    expect(json.reason).toMatch(/text::query/)
+    expect(json.baseRequests).toBeUndefined()
+  })
+
+  it('rejects a body with no query', async () => {
+    const server = await boot(await makeRoot())
+    const {status, json} = await postJson<PlanResponse>(server, '/query/plan', {})
+    expect(status).toBe(400)
+    expect(json.ok).toBe(false)
+  })
+})
+
+describe('spikeA overlay server — POST /query', () => {
+  it('answers the real list-pane shape with the BRANCH title', async () => {
+    /* The load-bearing one: a projection, a slice and an outer array wrapper
+     * over an ID set the query names literally. Before this, the pane rendered
+     * "Article 1" while the overlay held the rename. */
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-q:1', 'RENAMED IN THE BRANCH')
+
+    const {status, json} = await postJson<QueryResponse>(server, '/query', {
+      query: LIST_PANE_QUERY,
+      baseDocuments: [BASE_DRAFT, BASE_ARTICLE_9],
+    })
+
+    expect(status).toBe(200)
+    expect(json.ok).toBe(true)
+    expect(json.result).toEqual([
+      [
+        {_id: 'article-9', _type: 'article', title: 'Article 9'},
+        {_id: 'drafts.article-1', _type: 'article', title: 'RENAMED IN THE BRANCH'},
+      ],
+    ])
+  })
+
+  it('includes a branch-created document a base fetch could never return', async () => {
+    const server = await boot(await makeRoot())
+    await postCommit(server, {
+      idempotencyKey: 'session-q:create',
+      kind: 'mutations',
+      payload: [{create: {_id: 'drafts.article-0', _type: 'article', title: 'BRANCH CREATED'}}],
+      baseDocuments: [],
+    })
+
+    const {json} = await postJson<QueryResponse>(server, '/query', {
+      query: '*[_type == "article"]{_id, title}',
+      baseDocuments: [BASE_ARTICLE_9],
+    })
+
+    expect(json.result).toEqual([
+      {_id: 'article-9', title: 'Article 9'},
+      {_id: 'drafts.article-0', title: 'BRANCH CREATED'},
+    ])
+  })
+
+  it('orders a type list by `_id`, not base-then-branch', async () => {
+    /* `evaluate.ts` admits base candidates first and branch-created ones after,
+     * and an unordered `*[…]` observes that order. A branch-created document
+     * whose ID sorts FIRST must still come first, or the pane is reporting where
+     * a document came from rather than what it is. */
+    const server = await boot(await makeRoot())
+    await postCommit(server, {
+      idempotencyKey: 'session-q:create-first',
+      kind: 'mutations',
+      payload: [{create: {_id: 'article-0', _type: 'article', title: 'BRANCH CREATED'}}],
+      baseDocuments: [],
+    })
+
+    const {json} = await postJson<QueryResponse>(server, '/query', {
+      query: '*[_type == "article"]{_id}',
+      baseDocuments: [BASE_ARTICLE_9],
+    })
+
+    expect(json.result).toEqual([{_id: 'article-0'}, {_id: 'article-9'}])
+  })
+
+  it('drops a document the branch deleted, instead of its stale base body', async () => {
+    const server = await boot(await makeRoot())
+    await postCommit(server, {
+      idempotencyKey: 'session-q:delete',
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.delete',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+        },
+      ],
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    const {json} = await postJson<QueryResponse>(server, '/query', {
+      query: '*[_type == "article"]{_id}',
+      baseDocuments: [BASE_ARTICLE, BASE_DRAFT, BASE_ARTICLE_9],
+    })
+
+    expect(json.result).toEqual([{_id: 'article-9'}])
+  })
+
+  it('reports the package’s diagnostics, so the candidate set is inspectable', async () => {
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-q:diag', 'Renamed')
+
+    const {json} = await postJson<QueryResponse>(server, '/query', {
+      query: '*[_type == "article"]{_id}',
+      baseDocuments: [BASE_ARTICLE, BASE_ARTICLE_9],
+    })
+
+    expect(json.diagnostics?.candidateIds).toEqual(['article-1', 'article-9', 'drafts.article-1'])
+    expect(json.diagnostics?.evaluatorInvocations).toBe(1)
+    expect(json.diagnostics?.exact).toBe(true)
+  })
+
+  it('answers an ordered slice exactly, because the candidate set is the whole type', async () => {
+    /* An `order()[0…K]` is only exact when nothing outside the candidate set
+     * could have sorted into the window. A `types` plan materialises the whole
+     * type, so it can — which is why the ordering is left to `groq-js` on the
+     * complete set rather than approximated over a base answer. */
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-q:ordered', 'ZZZ LAST')
+
+    const {json} = await postJson<QueryResponse>(server, '/query', {
+      query: '*[_type == "article"] | order(title asc) [0...2]{title}',
+      baseDocuments: [BASE_ARTICLE, BASE_DRAFT, BASE_ARTICLE_9],
+    })
+
+    expect(json.result).toEqual([{title: 'Article 1'}, {title: 'Article 9'}])
+  })
+
+  it('refuses a query with no derivable candidate plan, with a structured error', async () => {
+    /* §22.2: what cannot be evaluated exactly MUST fail structurally. The
+     * passthrough licence of §22.5 belongs to the CALLER — it still holds the
+     * credential and can ask staging itself — and is not this endpoint's to
+     * grant. */
+    const server = await boot(await makeRoot())
+    const {status, json} = await postJson<QueryResponse>(server, '/query', {
+      query: '*',
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(status).toBe(400)
+    expect(json.ok).toBe(false)
+    expect(json.error?.code).toBe('UNSUPPORTED_QUERY')
+    expect(json.error?.message).toMatch(/unconstrained/)
+  })
+
+  it('never lets a base document carrying a synthetic overlay revision act as base', async () => {
+    /* Same guard the write path uses (§13.9): a document this overlay produced
+     * cannot be its own merge ancestor. Here it would also let the browser feed
+     * an already-overlaid document back in as if staging had said so. */
+    const server = await boot(await makeRoot())
+    await editTitle(server, 'session-q:synthetic', 'BRANCH')
+
+    const echoed = {...BASE_DRAFT, _rev: 'overlay-local-1', title: 'ECHOED BACK'}
+    const {json} = await postJson<QueryResponse>(server, '/query', {
+      query: '*[_id == "drafts.article-1"][0]{title}',
+      baseDocuments: [echoed],
+    })
+
+    expect(json.result).toEqual({title: 'BRANCH'})
+  })
+})

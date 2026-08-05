@@ -1,0 +1,10 @@
+{
+  "name": "sanity-overlay-client",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {".": "./src/index.ts"},
+  "scripts": {
+    "test": "echo 'tested via sanity-overlay-testkit'"
+  }
+}

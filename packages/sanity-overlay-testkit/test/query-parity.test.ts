@@ -218,6 +218,42 @@ describe('§35.11: the behaviours the overlay exists for', () => {
     expect(list.map((d) => d._id)).toContain('article-branch-1')
   })
 
+  // Redundancy, added because a mutation audit found the "never silently
+  // approximate" rule was killed by exactly ONE test file. A parity suite is
+  // where an approximation would be most tempting — it is the file that would
+  // go green if an unsupported query started returning "close enough" — so the
+  // refusal is pinned here as well, across the whole parity matrix.
+  it.each(
+    Object.keys(M_LOCAL_PARITY_OVERLAYS).flatMap((overlayName) =>
+      (['published', 'drafts'] as const).map((perspective) => [overlayName, perspective] as const),
+    ),
+  )(
+    'the Tier C entry refuses to produce ANY result (%s | %s)',
+    async (overlayName, perspective) => {
+      const dataset = DATASETS[perspective]
+      const def = registry.get('unconstrained-star')
+      let resolved = false
+      let thrown: unknown
+      try {
+        await evaluateOverlayQuery({
+          registry,
+          queryId: 'unconstrained-star',
+          query: def.query,
+          params: {},
+          base: createMemoryBaseSource(dataset),
+          overlay: M_LOCAL_PARITY_OVERLAYS[overlayName](dataset),
+          caller: 'test',
+          perspective: 'published',
+        })
+        resolved = true
+      } catch (error) {
+        thrown = error
+      }
+      expect(resolved, 'an unsupported query must never return a result').toBe(false)
+      expect(thrown).toMatchObject({code: 'UNSUPPORTED_GROQ'})
+    },
+  )
+
   it('the empty overlay reproduces the base answer exactly', async () => {
     const overlay = M_LOCAL_PARITY_OVERLAYS['empty'](base)
     const {result} = await evaluate('article-type-list', {}, overlay)

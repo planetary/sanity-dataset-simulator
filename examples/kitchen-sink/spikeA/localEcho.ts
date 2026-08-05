@@ -66,6 +66,12 @@
 // `packages/sanity-overlay-testkit/test/{action-echo,listener-matrix}.test.ts`.
 // This file is what is left once that is taken out: flags, logging, rxjs, the
 // identity-stable proxies, and the HTTP round-trip to the overlay server.
+// READ QUERIES: this file deliberately imports NOTHING from `readQueries.ts`.
+// That module and `sanity-overlay-query` decide which GROQ can be answered
+// exactly and how many candidates it may materialise, and both live on the
+// overlay server — see the `/query/plan` + `/query` notes further down. The
+// browser's job is the one only it can do: it holds the Sanity credential, so it
+// executes the base requests the plan names.
 import type {SanityClient} from '@sanity/client'
 import {
   authStatusOf,
@@ -141,6 +147,44 @@ export interface EchoSessionLog {
   restored: number
 }
 
+/** One query shape the overlay could not answer exactly, and how often it was seen. */
+export interface EchoUnsupportedQuery {
+  query: string
+  reason: string
+  count: number
+}
+
+/**
+ * The read side of the ledger, mirrored onto `window.__SPIKE_ECHO__.reads`.
+ *
+ * This is the object that makes PRD §5.5's "no silent query approximation" true.
+ * The read layer *does* pass unsupported queries through to staging by default —
+ * refusing every one of them would break Studio's own structure lists, previews
+ * and search — but never silently: each one is counted here with the query text
+ * and the reason it could not be answered, so "the branch is not reflected in
+ * this pane" is a fact a user can read rather than a discrepancy they must
+ * notice. §22.5 is the licence: *log* unregistered queries, *reject* them in
+ * strict mode, and allow a warning mode during migration.
+ */
+export interface EchoReadLog {
+  /** Overlay resolutions that came back — successful `/resolve` or `/query` round trips. */
+  resolved: number
+  /** Documents the overlay actually replaced or suppressed in a read. */
+  substituted: number
+  /** Queries answered exactly against the overlay. */
+  exact: number
+  /** Queries passed through to staging because the overlay cannot answer them. */
+  approximated: number
+  /** Queries refused outright because strict mode is on. */
+  refused: number
+  /** Distinct unsupported query shapes, with the reason and a call count. */
+  unsupported: EchoUnsupportedQuery[]
+  /** `localStorage.SPIKE_OVERLAY_STRICT_QUERIES === '1'` */
+  strict: boolean
+  /** Resolutions that did not land — the read degraded to staging content. */
+  failed: number
+}
+
 export interface EchoLog {
   enabled: boolean
   blocked: EchoBlockedEntry[]
@@ -151,6 +195,7 @@ export interface EchoLog {
   errors: string[]
   persist: EchoPersistLog
   session: EchoSessionLog
+  reads: EchoReadLog
 }
 
 declare global {
@@ -215,16 +260,41 @@ let persistCache: boolean | undefined
 
 export function isPersistEnabled(): boolean {
   if (persistCache !== undefined) return persistCache
-  let value = false
+  persistCache = readFlag('SPIKE_OVERLAY_PERSIST')
+  return persistCache
+}
+
+function readFlag(key: string): boolean {
   try {
-    value =
-      typeof window !== 'undefined' &&
-      window.localStorage.getItem('SPIKE_OVERLAY_PERSIST') === '1'
+    return typeof window !== 'undefined' && window.localStorage.getItem(key) === '1'
   } catch {
-    value = false
+    /* private mode / blocked storage — the flag is simply off */
+    return false
   }
-  persistCache = value
-  return value
+}
+
+/**
+ * `localStorage.SPIKE_OVERLAY_STRICT_QUERIES === '1'` turns an unanswerable query
+ * from a *reported* passthrough into an *error*.
+ *
+ * PRD §22.5: "[MUST] Reject unregistered queries in strict preview mode",
+ * "[SHOULD] Allow a local development warning mode during migration". Default off
+ * for exactly the reason §22.5 allows a warning mode: Studio issues queries this
+ * layer will never answer exactly (hosted search via `text::query`, the releases
+ * system query, `sanity::versionOf`), and failing all of them produces an editor
+ * that cannot open a pane — a different failure, not a safer one. Turn it on to
+ * find out which of *your own* queries are not overlay-exact.
+ *
+ * It also refuses when the overlay cannot be ASKED. Strict mode's guarantee is
+ * that no unverified query reaches the network, and "the server is down" leaves
+ * a query exactly as unverified as "this shape is unsupported".
+ */
+let strictQueriesCache: boolean | undefined
+
+export function isStrictQueriesEnabled(): boolean {
+  if (strictQueriesCache !== undefined) return strictQueriesCache
+  strictQueriesCache = readFlag('SPIKE_OVERLAY_STRICT_QUERIES')
+  return strictQueriesCache
 }
 
 const DEFAULT_OVERLAY_URL = 'http://localhost:3998'
@@ -261,6 +331,16 @@ function echoLog(): EchoLog | null {
       failed: 0,
     },
     session: {state: 'active', restored: 0},
+    reads: {
+      resolved: 0,
+      substituted: 0,
+      exact: 0,
+      approximated: 0,
+      refused: 0,
+      unsupported: [],
+      strict: false,
+      failed: 0,
+    },
   }
   return window.__SPIKE_ECHO__
 }
@@ -838,6 +918,605 @@ async function persistPlan(plan: EchoPlan, transactionId: string): Promise<void>
   }
 }
 
+/* --------------------------------------------------------- overlay reads */
+//
+// THE GAP THIS CLOSES
+// Writes were owned first, and the result was a Studio that could *save* into a
+// store the rest of it could not *see*. `fetch`, `getDocument` and `getDocuments`
+// were tapped — observed for their `_rev`, never resolved. The open pane looked
+// right only because the listener echo replayed mutations into it; every other
+// surface still read staging. Rename a document and the list pane kept the old
+// title; delete one and it stayed; create one and nothing returned it.
+//
+// Reads now go through `POST /resolve`, where the server runs core's §18.1/§18.2
+// batch resolution over the records on disk. Inert unless
+// `SPIKE_OVERLAY_PERSIST === '1'`, and a failure degrades to the staging answer,
+// loudly — the same contract the write path already keeps.
+
+/** One resolved slot from `POST /resolve`. */
+interface ResolveEntry {
+  requestedId: string
+  logicalId: string
+  documentId: string
+  document: Rec | null
+  origin: 'untouched' | 'overlay' | 'branch-created'
+  absence: string | null
+}
+
+interface ResolveResponse {
+  ok?: boolean
+  entries?: ResolveEntry[]
+  documents?: Rec[]
+  error?: {message?: string}
+}
+
+/**
+ * A read that could not be resolved is not the same failure as a write that did
+ * not land, so it is counted separately — but it is just as loud. A pane showing
+ * staging content while the user believes they are looking at their branch is the
+ * exact confusion this whole layer exists to remove.
+ */
+function readFailure(message: string, error?: unknown): void {
+  const detail = error === undefined ? message : `${message}: ${String(error)}`
+  const log = echoLog()
+  if (log) log.reads.failed += 1
+  noteError(`overlay read: ${detail}`)
+  console.error(
+    `[spike-a] overlay read FAILED — this answer is staging content, not the branch. ${detail}`,
+  )
+}
+
+/** POST one JSON body to the overlay. Never rejects; reports via {@link readFailure}. */
+async function postOverlay(route: string, body: Rec, describe: string): Promise<Rec | null> {
+  try {
+    const response = await fetch(`${overlayUrl()}${route}`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify(body),
+    })
+    const result = (await response.json().catch(() => null)) as Rec | null
+    const error = isRec(result?.error) ? (result.error as Rec) : undefined
+    if (!response.ok || result?.ok !== true) {
+      throw new Error(
+        (typeof error?.message === 'string' ? error.message : undefined) ??
+          `POST ${route} responded ${response.status}`,
+      )
+    }
+    return result
+  } catch (error) {
+    readFailure(`POST ${route} did not answer for ${describe}`, error)
+    return null
+  }
+}
+
+/** POST one `/resolve` batch. Never rejects; reports through {@link readFailure}. */
+async function postResolve(body: Rec): Promise<ResolveResponse | null> {
+  const result = await postOverlay('/resolve', body, JSON.stringify(body.ids ?? []))
+  if (result === null) return null
+  const log = echoLog()
+  if (log) log.reads.resolved += 1
+  return result as ResolveResponse
+}
+
+/**
+ * Base documents this read can anchor a merge on.
+ *
+ * Core never fetches base (PRD §16.1) and the server holds no Sanity credentials,
+ * so the browser — which has just read them — ships what it knows. Synthetic
+ * revisions are excluded for the same reason the write path excludes them: a
+ * document this overlay produced cannot be its own ancestor (§13.9).
+ */
+function knownBaseDocuments(ids: readonly string[]): Rec[] {
+  const seen = new Set<string>()
+  const documents: Rec[] = []
+  for (const id of ids) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    const known = protocol.getDocState(id)
+    if (known?.doc && known.synthetic !== true) documents.push(known.doc)
+  }
+  return documents
+}
+
+/** Every `_id`-bearing record inside a read result (a document, or an array of them). */
+function documentsIn(value: unknown): Rec[] {
+  if (Array.isArray(value)) return value.filter((item): item is Rec => isRec(item) && typeof item._id === 'string')
+  return isRec(value) && typeof value._id === 'string' ? [value] : []
+}
+
+/**
+ * Map a one-shot read result — promise or observable — through an async transform.
+ *
+ * The observable branch buffers the single value and transforms it on `complete`
+ * rather than inside `next`. `fetch` / `getDocument(s)` observables are
+ * request-shaped (one value, then complete), so buffering costs nothing and it
+ * removes the whole class of "completed before the transform resolved" ordering
+ * bugs — the async-work-outliving-its-caller shape that already bit the commit
+ * path once.
+ *
+ * `onError` is **observation only**: the error is always forwarded unchanged.
+ * It exists because this wrapper replaced `tapRead`, whose error handler noted
+ * 401/403s on the session — a signal the write path depends on to stop
+ * acknowledging edits that can never land. Forwarding an error while silently
+ * dropping that observation is worse than not wrapping at all.
+ */
+function mapOneShot(
+  result: unknown,
+  transform: (value: unknown) => Promise<unknown>,
+  onError?: (error: unknown) => void,
+): unknown {
+  const observed = (error: unknown): void => {
+    if (onError === undefined) return
+    try {
+      onError(error)
+    } catch {
+      /* an observer must never turn a read failure into a different one */
+    }
+  }
+
+  if (isRec(result) && typeof (result as Rec).subscribe === 'function') {
+    captureObservableCtor(result)
+    const source = result as unknown as MinimalObservable<unknown>
+    return makeObservable<unknown>((subscriber) => {
+      let cancelled = false
+      let seen: unknown
+      let got = false
+      const subscription = source.subscribe({
+        next: (value) => {
+          seen = value
+          got = true
+        },
+        error: (err) => {
+          observed(err)
+          subscriber.error(err)
+        },
+        complete: () => {
+          if (!got) {
+            subscriber.complete()
+            return
+          }
+          void transform(seen).then(
+            (mapped) => {
+              if (cancelled) return
+              subscriber.next(mapped)
+              subscriber.complete()
+            },
+            (err: unknown) => {
+              if (!cancelled) subscriber.error(err)
+            },
+          )
+        },
+      })
+      return () => {
+        cancelled = true
+        try {
+          subscription.unsubscribe()
+        } catch {
+          /* ignore */
+        }
+      }
+    })
+  }
+  if (isRec(result) && typeof (result as Rec).then === 'function') {
+    return (result as unknown as Promise<unknown>).then(transform, (err: unknown) => {
+      observed(err)
+      throw err
+    })
+  }
+  return transform(result)
+}
+
+/* ---------------------------------------------------- getDocument(s) */
+
+/**
+ * Replace one slot of a `getDocument` / `getDocuments` answer with the overlay's.
+ *
+ * TWO RULES, BOTH LOAD-BEARING.
+ *
+ * 1. **The upstream `_rev` is kept.** Studio's pair listener seeds
+ *    `sequentializeListenerEvents` from this very snapshot and then requires an
+ *    unbroken `previousRev → resultRev` chain (see header note 2). Handing back
+ *    the overlay's synthetic `_rev` would break the chain and park every later
+ *    frame until the 30 s deadline throws.
+ *
+ * 2. **A slot staging answered `null` for is left `null`.** A branch-created
+ *    document has no upstream revision to chain from, and inventing one is the
+ *    same hazard from the other side. That case is already owned by
+ *    `scheduleHydrationReplay`, which emits it as an `appear` frame — the path
+ *    that is proven to work. `fetch` has no such constraint and *does* return
+ *    branch-created documents.
+ */
+function substituteVersion(upstream: unknown, entry: ResolveEntry | undefined): unknown {
+  /* No record at all: the overlay has no opinion, so staging's answer stands. */
+  if (entry === undefined || entry.origin === 'untouched') return upstream
+
+  if (entry.document === null) {
+    /* Tombstoned, or absent in this version. Suppressing it is the point: a
+     * document the branch deleted must not keep answering with base content. */
+    if (!isRec(upstream)) return upstream
+    const log = echoLog()
+    if (log) log.reads.substituted += 1
+    return null
+  }
+
+  if (!isRec(upstream)) return upstream
+
+  const merged: Rec = {...entry.document, _id: upstream._id}
+  if (upstream._rev === undefined) delete merged._rev
+  else merged._rev = upstream._rev
+  if (upstream._createdAt !== undefined) merged._createdAt = upstream._createdAt
+
+  const log = echoLog()
+  if (log) log.reads.substituted += 1
+  return merged
+}
+
+/**
+ * The overlay-aware `getDocument` / `getDocuments`.
+ *
+ * Still a tap first: `seedFromResult` learns the real revision chain from the
+ * *unsubstituted* upstream value, and `scheduleHydrationReplay` still runs, so
+ * the listener behaviour this facade already depended on is unchanged. Only the
+ * value handed to the caller is resolved.
+ */
+function overlayVersionRead(result: unknown, requestedIds: string[]): unknown {
+  return mapOneShot(
+    result,
+    async (value) => {
+      try {
+        seedFromResult(value, true)
+      } catch (err) {
+        noteError(`rev seed failed: ${String(err)}`)
+      }
+      scheduleHydrationReplay(requestedIds)
+
+      if (!isPersistEnabled() || requestedIds.length === 0) return value
+
+      const resolved = await postResolve({
+        mode: 'version',
+        ids: requestedIds,
+        baseDocuments: [...documentsIn(value), ...knownBaseDocuments(requestedIds)],
+      })
+      if (resolved === null) return value
+
+      const entries = new Map<string, ResolveEntry>()
+      for (const entry of resolved.entries ?? []) entries.set(entry.requestedId, entry)
+
+      if (Array.isArray(value)) {
+        if (value.length !== requestedIds.length) {
+          noteError(
+            `overlay read: ${requestedIds.length} ids but ${value.length} results — left unresolved`,
+          )
+          return value
+        }
+        return value.map((document, index) =>
+          substituteVersion(document, entries.get(requestedIds[index] as string)),
+        )
+      }
+      return substituteVersion(value, entries.get(requestedIds[0] as string))
+    },
+    /* The observation `tapRead(…, keepDocuments = true)` used to make. A 401/403
+     * on the pair listener's own snapshot read is the session expiring mid-edit,
+     * and it is what stops the write path acknowledging edits that can never
+     * land. Forwarded unchanged — this is a tap, not a filter. */
+    (error) => noteAuthFailureFrom(error, 'read'),
+  )
+}
+
+/* ------------------------------------------------------------- fetch */
+
+/** Record a query the overlay cannot answer exactly, and say so once per shape. */
+function noteUnsupportedQuery(query: unknown, reason: string, strict: boolean): void {
+  const text = typeof query === 'string' ? query : String(query)
+  const log = echoLog()
+  if (log) {
+    if (strict) log.reads.refused += 1
+    else log.reads.approximated += 1
+  }
+
+  const existing = log?.reads.unsupported.find((entry) => entry.query === text)
+  if (existing) {
+    existing.count += 1
+    return
+  }
+  if (log && log.reads.unsupported.length < 200) {
+    log.reads.unsupported.push({query: text, reason, count: 1})
+  }
+
+  /* Once per distinct shape. Studio re-issues the same query on every render;
+   * a per-call warning would bury the signal in its own noise. */
+  console.warn(
+    strict
+      ? `[spike-a] overlay REFUSED a query (strict mode): ${reason} — query: ${text}`
+      : `[spike-a] overlay cannot answer this query exactly, so it was passed through to ` +
+          `staging and the result does not reflect the branch: ${reason} — query: ${text}`,
+  )
+}
+
+/** The strict-mode refusal, shaped like the write path's. */
+function refusalError(query: unknown, reason: string): Error {
+  const error = new Error(
+    `[spike-a] overlay refused this query: ${reason}. Strict query mode ` +
+      '(SPIKE_OVERLAY_STRICT_QUERIES) is on, so an approximate answer is not offered. ' +
+      `Query: ${typeof query === 'string' ? query : String(query)}`,
+  )
+  noteError(error.message)
+  return error
+}
+
+/* ------------------------------------------------------- the read plan cache */
+
+/**
+ * What the overlay decided about one `(query, params)` pair.
+ *
+ * `null` from {@link planFor} is a THIRD state and not the same as
+ * `supported: false`: it means the overlay could not be asked at all, so nothing
+ * is known about the query. Collapsing the two would turn "the server is down"
+ * into "this query is unsupported" and quietly poison the §22.5 ledger with
+ * queries that are perfectly answerable.
+ */
+interface ReadDecision {
+  supported: boolean
+  reason?: string
+  baseRequests?: Rec[]
+}
+
+/**
+ * Key a decision by query text AND parameters.
+ *
+ * Parameters are part of the key because a plan can depend on them: `_id in
+ * $ids` has no template form in `sanity-overlay-query`'s `CandidatePlan` (it
+ * names one parameter per ID, and each must be a string), so the ID set is
+ * resolved per call. Studio re-issues the same query with the same parameters on
+ * every render, so the cache still collapses a pane's re-renders to one round
+ * trip; only a genuinely new parameter set pays for a second.
+ */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (isRec(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(',')}}`
+  }
+  try {
+    return JSON.stringify(value) ?? 'null'
+  } catch {
+    return '"<unserialisable>"'
+  }
+}
+
+const planCache = new Map<string, ReadDecision>()
+const MAX_PLAN_CACHE = 500
+
+/**
+ * Ask the overlay how — or whether — this query can be answered exactly.
+ *
+ * THE DECISION IS NOT MADE HERE, and that is the point. `readQueries.ts` derives
+ * the candidate plan and `sanity-overlay-query` enforces its ceiling, both on
+ * the server, so there is exactly one implementation of "which documents can
+ * this query observe" and boundedness is not something a browser tab decides.
+ */
+async function planFor(query: unknown, params: Rec): Promise<ReadDecision | null> {
+  if (typeof query !== 'string' || query.trim().length === 0) {
+    return {supported: false, reason: 'not a GROQ string, so there is nothing to plan'}
+  }
+
+  const key = `${query} ${stableStringify(params)}`
+  const cached = planCache.get(key)
+  if (cached !== undefined) return cached
+
+  const response = await postOverlay('/query/plan', {query, params}, query.slice(0, 120))
+  if (response === null) return null
+
+  const decision: ReadDecision =
+    response.supported === true
+      ? {supported: true, baseRequests: Array.isArray(response.baseRequests) ? (response.baseRequests as Rec[]) : []}
+      : {
+          supported: false,
+          reason:
+            typeof response.reason === 'string'
+              ? response.reason
+              : 'the overlay declined to plan this query and gave no reason',
+        }
+
+  if (planCache.size < MAX_PLAN_CACHE) planCache.set(key, decision)
+  return decision
+}
+
+/* ------------------------------------------- the hosted base-candidate adapter */
+
+/*
+ * `BaseCandidateRequest` is `sanity-overlay-query`'s deliberately small, closed
+ * set of request SHAPES (§22.6 step 5) — never a GROQ string, so a request
+ * cannot be assembled out of user input into something the registry never
+ * approved. `baseSource.ts` names the hosted adapter that turns them back into
+ * GROQ and does not ship one, because the package must not depend on a Sanity
+ * client. This IS that adapter, and it is the only piece of query handling left
+ * in the browser: it exists here because only the browser holds a credential.
+ */
+const BASE_IDS_PARAM = '__spikeAIds'
+const BASE_TYPES_PARAM = '__spikeATypes'
+const BASE_VALUE_PARAM = '__spikeAValue'
+
+/** A path is interpolated into GROQ, so it must be plain attribute segments. */
+const SAFE_PATH = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/
+
+function baseRequestQuery(request: Rec): {query: string; params: Rec} | null {
+  if (request.kind === 'ids' && Array.isArray(request.ids)) {
+    return {query: `*[_id in $${BASE_IDS_PARAM}]`, params: {[BASE_IDS_PARAM]: request.ids}}
+  }
+  if (request.kind === 'types' && Array.isArray(request.types)) {
+    return {query: `*[_type in $${BASE_TYPES_PARAM}]`, params: {[BASE_TYPES_PARAM]: request.types}}
+  }
+  if (request.kind === 'field-equality' && Array.isArray(request.types) && Array.isArray(request.path)) {
+    const path = request.path.join('.')
+    if (!SAFE_PATH.test(path)) return null
+    return {
+      query: `*[_type in $${BASE_TYPES_PARAM} && ${path} == $${BASE_VALUE_PARAM}]`,
+      params: {[BASE_TYPES_PARAM]: request.types, [BASE_VALUE_PARAM]: request.value},
+    }
+  }
+  return null
+}
+
+/** Await a one-shot read, whichever surface it came back on. */
+function awaitOneShot(result: unknown): Promise<unknown> {
+  if (isRec(result) && typeof (result as Rec).subscribe === 'function') {
+    const source = result as unknown as MinimalObservable<unknown>
+    return new Promise((resolve, reject) => {
+      let seen: unknown
+      let got = false
+      source.subscribe({
+        next: (value) => {
+          seen = value
+          got = true
+        },
+        error: reject,
+        complete: () => resolve(got ? seen : undefined),
+      })
+    })
+  }
+  if (isRec(result) && typeof (result as Rec).then === 'function') {
+    return result as unknown as Promise<unknown>
+  }
+  return Promise.resolve(result)
+}
+
+/**
+ * Run the plan's base requests against staging.
+ *
+ * Errors are NOT swallowed: a read that cannot see base cannot be answered
+ * exactly, and answering it from the overlay alone would be the approximation
+ * this layer exists to prevent. Revisions are still seeded from what comes back,
+ * so the listener chain learns the same `_rev`s it used to learn from the
+ * passthrough.
+ */
+async function fetchBaseCandidates(
+  fn: (...args: unknown[]) => unknown,
+  self: object,
+  requests: readonly Rec[],
+): Promise<Rec[]> {
+  const byId = new Map<string, Rec>()
+  for (const request of requests) {
+    const translated = baseRequestQuery(request)
+    if (translated === null) {
+      throw new Error(
+        `[spike-a] the overlay asked for a base candidate request this client cannot issue: ${JSON.stringify(request)}`,
+      )
+    }
+    const value = await awaitOneShot(fn.apply(self, [translated.query, translated.params]))
+    try {
+      seedFromResult(value, false)
+    } catch (err) {
+      noteError(`rev seed failed: ${String(err)}`)
+    }
+    for (const document of documentsIn(value)) {
+      const id = document._id
+      if (typeof id === 'string' && !byId.has(id)) byId.set(id, document)
+    }
+  }
+  return [...byId.values()]
+}
+
+/** An observable that runs `factory` on subscribe and emits its single value. */
+function observableFromPromise<T>(factory: () => Promise<T>): MinimalObservable<T> {
+  return makeObservable<T>((subscriber) => {
+    let cancelled = false
+    void factory().then(
+      (value) => {
+        if (cancelled) return
+        subscriber.next(value)
+        subscriber.complete()
+      },
+      (error: unknown) => {
+        if (!cancelled) subscriber.error(error)
+      },
+    )
+    return () => {
+      cancelled = true
+    }
+  })
+}
+
+/**
+ * The overlay-aware `fetch`.
+ *
+ * THE POLICY, UNCHANGED FROM THE DAY IT WAS WRITTEN — only the thing that
+ * decides it has moved:
+ *
+ *   exact       the overlay planned the query, so the answer comes from
+ *               `sanity-overlay-query` over a candidate set the branch has been
+ *               resolved into. The caller's query never goes to staging; the
+ *               plan's base requests do.
+ *   passthrough the overlay cannot answer it. The query goes to staging
+ *               untouched and is RECORDED on `__SPIKE_ECHO__.reads.unsupported`
+ *               with its reason, warned once per shape. §5.5 bans *silent*
+ *               approximation; this is the "not silent" (PRD §22.5 warning mode).
+ *   refusal     strict mode. The same refusal becomes an error and the query
+ *               never reaches the network at all (§22.5 strict preview mode).
+ *
+ * A THIRD CASE, and it is not the second one: when the overlay cannot be
+ * reached, nothing is known about the query. That degrades to staging **loudly**
+ * (`reads.failed`, `console.error`) rather than being filed as unsupported — and
+ * in strict mode it refuses, because strict mode's guarantee is that no
+ * unverified query reaches the network.
+ */
+function overlayFetch(
+  kind: Kind,
+  fn: (...args: unknown[]) => unknown,
+  self: object,
+  args: unknown[],
+): unknown {
+  /* Persistence off means the overlay is not consulted at all — the flag has to
+   * mean *nothing changed*, reads included. Checked first so a downed or absent
+   * server cannot even delay a read. */
+  if (!isPersistEnabled()) return tapRead(fn.apply(self, args), false, [])
+
+  const query = args[0]
+  const params = isRec(args[1]) ? (args[1] as Rec) : {}
+  const passthrough = (): Promise<unknown> => awaitOneShot(tapRead(fn.apply(self, args), false, []))
+
+  const run = async (): Promise<unknown> => {
+    const decision = await planFor(query, params)
+
+    if (decision === null) {
+      if (isStrictQueriesEnabled()) {
+        throw refusalError(
+          query,
+          'the overlay could not be reached, so the query could not be checked against the ' +
+            'read policy — strict mode does not let an unverified query reach the network',
+        )
+      }
+      return passthrough()
+    }
+
+    if (!decision.supported) {
+      const strict = isStrictQueriesEnabled()
+      noteUnsupportedQuery(query, decision.reason ?? 'no reason given', strict)
+      if (strict) throw refusalError(query, decision.reason ?? 'no reason given')
+      return passthrough()
+    }
+
+    const log = echoLog()
+    if (log) log.reads.exact += 1
+
+    const baseDocuments = await fetchBaseCandidates(fn, self, decision.baseRequests ?? [])
+    const answered = await postOverlay(
+      '/query',
+      {query, params, baseDocuments},
+      typeof query === 'string' ? query.slice(0, 120) : String(query),
+    )
+    /* A `/query` that did not land is reported by `postOverlay` and degrades to
+     * the staging answer — usable, and never quietly wrong. */
+    if (answered === null) return passthrough()
+    if (log) log.reads.resolved += 1
+    return answered.result
+  }
+
+  return kind === 'observable' ? observableFromPromise(run) : run()
+}
+
 /* ------------------------------------------------------------- interception */
 
 type Kind = 'promise' | 'observable'
@@ -1001,14 +1680,6 @@ function blockedResult(
 }
 
 /**
- * Pass a read through untouched, but learn `_rev` from whatever it returns.
- *
- * `requestedIds` are the ids the caller ASKED for, which is not the same as the
- * ids that came back: a draft the Content Lake has never seen returns `null`.
- * Those are precisely the documents the overlay has to replay, so the replay is
- * driven from the request, not from the response.
- */
-/**
  * Record a 401/403 hiding in whatever the transport threw.
  *
  * Only called from the session's own plumbing — the pair listener, its snapshot
@@ -1027,6 +1698,22 @@ function noteAuthFailureFrom(error: unknown, source: 'listener' | 'read' | 'writ
   syncSessionLog()
 }
 
+/**
+ * Pass a read through untouched, learning `_rev` from whatever it returns.
+ *
+ * SCOPE, since the read layer landed: this is the **passthrough** tap only — the
+ * `fetch` queries the overlay cannot answer exactly, and every `fetch` when
+ * persistence is off. `getDocument` / `getDocuments` go through
+ * {@link overlayVersionRead} instead, which does the same seeding and replay and
+ * then resolves the answer.
+ *
+ * `keepDocuments` marks a read whose result is *authoritative* about the
+ * revision chain, and whose failures are the session's own (so a 401 there ends
+ * the session — a 403 on an arbitrary query may just be a dataset ACL).
+ * `requestedIds` are the ids the caller ASKED for, which is not the same as the
+ * ids that came back: a draft the Content Lake has never seen returns `null`,
+ * and those are precisely the ones the overlay has to replay.
+ */
 function tapRead(result: unknown, keepDocuments: boolean, requestedIds: string[] = []): unknown {
   if (!result) return result
   const observed = (value: unknown): void => {
@@ -1633,10 +2320,15 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
           const result = fn.apply(t, args)
           return isRec(result) ? echoProxy(result as object, kind) : result
         }
-      } else if (READ_TAP_METHODS.has(name) || name === 'fetch') {
-        const authoritative = READ_TAP_METHODS.has(name)
+      } else if (READ_TAP_METHODS.has(name)) {
+        /* No longer a tap: `getDocument` / `getDocuments` answer with the virtual
+         * document. Revision seeding and the hydration replay still run first,
+         * on the unsubstituted upstream value. */
         wrapped = (...args: unknown[]): unknown =>
-          tapRead(fn.apply(t, args), authoritative, authoritative ? requestedIdsFrom(args) : [])
+          overlayVersionRead(fn.apply(t, args), requestedIdsFrom(args))
+      } else if (name === 'fetch') {
+        wrapped = (...args: unknown[]): unknown =>
+          overlayFetch(kind, fn as (...a: unknown[]) => unknown, t, args)
       } else {
         wrapped = (...args: unknown[]): unknown => fn.apply(t, args)
       }
@@ -1663,6 +2355,7 @@ export function wrapWithLocalEcho(client: SanityClient): SanityClient {
     log.enabled = true
     log.persist.enabled = isPersistEnabled()
     log.persist.url = overlayUrl()
+    log.reads.strict = isStrictQueriesEnabled()
   }
   probeObservableCtor(client as unknown as Rec)
   /* Start the overlay read before Studio opens a pane: the replay is gated on

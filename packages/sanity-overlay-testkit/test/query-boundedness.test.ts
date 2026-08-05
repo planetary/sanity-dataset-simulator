@@ -435,6 +435,30 @@ describe('§22.8: reported work matches the work this file observed', () => {
       1 + def.maxReferenceDepth,
     )
     expect(d.exact).toBe(true)
+    // Redundancy for the §22.9 capacity gate, added because a mutation audit
+    // found it was killed by exactly one test in one file. Every case in this
+    // sweep must respect the limit the registration declares.
+    expect(d.candidateCount, `${def.id}: registered maxCandidates`).toBeLessThanOrEqual(
+      def.maxCandidates,
+    )
+  })
+
+  it('the capacity gate is reachable, not merely respected', async () => {
+    // A limit no registered query can approach would make the assertion above
+    // vacuous. Proven by shrinking the limit and requiring the refusal.
+    const tight: OverlayQueryDefinition = {...registry.get('article-type-list'), maxCandidates: 2}
+    await expect(
+      evaluateOverlayQuery({
+        registry: createQueryRegistry([tight]),
+        queryId: tight.id,
+        query: tight.query,
+        params: {},
+        base: createMemoryBaseSource(base),
+        overlay: overlayFor('empty', base),
+        caller: 'test',
+        perspective: 'published',
+      }),
+    ).rejects.toMatchObject({code: 'CANDIDATE_LIMIT_EXCEEDED', httpStatus: 413})
   })
 })
 

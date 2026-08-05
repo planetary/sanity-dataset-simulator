@@ -60,6 +60,7 @@ const win: Record<string, unknown> = {localStorage: storage}
 interface EchoWindow {
   __SPIKE_ECHO__?: {
     errors: string[]
+    session: {state: string; restored: number}
     persist: {failed: number; hydrated: boolean | null}
     reads: {
       resolved: number
@@ -239,6 +240,8 @@ function observableOf<T>(value: T): TestObservable<T> {
 interface StubUpstream {
   documents?: Record<string, Rec | null>
   fetch?: (query: string, params?: unknown) => unknown
+  /** When set, every read fails with this error instead of answering. */
+  readError?: unknown
 }
 
 interface StubClient extends Rec {
@@ -256,14 +259,24 @@ function stubClient(upstream: StubUpstream = {}): StubClient {
   const documents = upstream.documents ?? {}
   const fetchCalls: StubClient['fetchCalls'] = []
 
+  const failing = upstream.readError !== undefined
+
   const getDocument = (id: string): Promise<Rec | null> =>
-    Promise.resolve(documents[id] ?? null)
+    failing ? Promise.reject(upstream.readError) : Promise.resolve(documents[id] ?? null)
   const getDocuments = (ids: string[]): Promise<Array<Rec | null>> =>
-    Promise.resolve(ids.map((id) => documents[id] ?? null))
+    failing
+      ? Promise.reject(upstream.readError)
+      : Promise.resolve(ids.map((id) => documents[id] ?? null))
   const doFetch = (query: string, params?: unknown): unknown => {
     fetchCalls.push({query, params})
+    if (failing) return Promise.reject(upstream.readError)
     return Promise.resolve(upstream.fetch?.(query, params) ?? null)
   }
+
+  const observableFailing = <T>(): TestObservable<T> =>
+    new TestObservable<T>((subscriber) => {
+      setTimeout(() => subscriber.error(upstream.readError), 0)
+    })
 
   const client: StubClient = {
     fetchCalls,
@@ -275,10 +288,13 @@ function stubClient(upstream: StubUpstream = {}): StubClient {
     observable: {
       fetch: (query: string, params?: unknown) => {
         fetchCalls.push({query, params})
+        if (failing) return observableFailing()
         return observableOf(upstream.fetch?.(query, params) ?? null)
       },
-      getDocument: (id: string) => observableOf(documents[id] ?? null),
-      getDocuments: (ids: string[]) => observableOf(ids.map((id) => documents[id] ?? null)),
+      getDocument: (id: string) =>
+        failing ? observableFailing() : observableOf(documents[id] ?? null),
+      getDocuments: (ids: string[]) =>
+        failing ? observableFailing() : observableOf(ids.map((id) => documents[id] ?? null)),
       listen: () => observableOf({type: 'welcome'}),
     },
   }
@@ -522,6 +538,80 @@ describe('read resolution degrades loudly when the overlay is unreachable', () =
 })
 
 /* ================================================================== *
+ * 2b. The upstream error path the new wrapper must not swallow
+ * ================================================================== *
+ *
+ * REGRESSION CLASS, found while reviewing the read wrapper: `getDocument(s)`
+ * used to run through `tapRead(..., keepDocuments = true)`, whose error handler
+ * called `noteAuthFailureFrom(err, 'read')`. That is the signal that ends the
+ * session, and it is what stops the write path acknowledging edits that can
+ * provably never land. A new wrapper that forwards the error but drops the
+ * *observation* is silently worse than the old one: the pane keeps saying
+ * "saved" while every write 401s.
+ *
+ * The class is "an error path the new wrapper reroutes", so all four members are
+ * pinned: promise and observable, and both directions of the deliberate
+ * asymmetry — a 401 on the session's own read plumbing counts, a 403 on an
+ * arbitrary `fetch` does not (it may be a dataset ACL, and over-reporting stops
+ * every later write).
+ */
+
+describe('a failed read still reports what it used to report', () => {
+  function authError(status: number): Error {
+    const error = new Error(`Unauthorized (${status})`)
+    ;(error as unknown as Rec).statusCode = status
+    return error
+  }
+
+  it('notes a 401 from getDocument and ends the session', async () => {
+    const server = await bootServer()
+    const {client} = await wrap(server, {readError: authError(401)})
+
+    await expect(
+      (client.getDocument as (id: string) => Promise<unknown>)('drafts.article-1'),
+    ).rejects.toThrow(/Unauthorized/)
+
+    expect(echoLog().session.state).toBe('unauthenticated')
+  })
+
+  it('notes a 403 from getDocuments, through the observable surface too', async () => {
+    const server = await bootServer()
+    const {client} = await wrap(server, {readError: authError(403)})
+
+    const observable = (client.observable as Rec).getDocuments as (ids: string[]) => unknown
+    await expect(firstValue(observable(['article-1']))).rejects.toThrow(/Unauthorized/)
+
+    expect(echoLog().session.state).toBe('unauthenticated')
+  })
+
+  it('forwards a non-auth read failure unchanged, without ending the session', async () => {
+    const server = await bootServer()
+    const boom = new Error('the network went away')
+    const {client} = await wrap(server, {readError: boom})
+
+    await expect(
+      (client.getDocument as (id: string) => Promise<unknown>)('drafts.article-1'),
+    ).rejects.toBe(boom)
+    expect(echoLog().session.state).toBe('active')
+  })
+
+  it('does NOT end the session on a 403 from an arbitrary query', async () => {
+    /* Deliberate asymmetry, and it predates this change: a 403 on a query can be
+     * a dataset ACL rather than a dead token, and over-reporting it would refuse
+     * every later write. */
+    const server = await bootServer()
+    const {client} = await wrap(server, {readError: authError(403)})
+
+    await expect(
+      (client.fetch as (q: string, p?: unknown) => Promise<unknown>)('*[_id == $id][0]', {
+        id: 'article-1',
+      }),
+    ).rejects.toThrow(/Unauthorized/)
+    expect(echoLog().session.state).toBe('active')
+  })
+})
+
+/* ================================================================== *
  * 3. fetch — the exact slice, and an honest refusal for the rest
  * ================================================================== */
 
@@ -640,8 +730,137 @@ describe('fetch — queries the overlay can answer exactly', () => {
   })
 })
 
+/* ================================================================== *
+ * 3b. The Studio list pane — the shape a live session actually issues
+ * ================================================================== *
+ *
+ * Observed 2026-08-04 against a real Studio: the Article list pane does NOT
+ * issue `*[_type == "article"]{…}`. It issues a literal ID set wrapped in a
+ * projection, a slice and an outer array:
+ *
+ *   [*[_id in ["article-01",…]][0...23]{_id,_rev,_type,title,…}][0...1]
+ *
+ * The candidate set is as provable as it gets — the IDs are in the query text —
+ * so the only thing that ever blocked it was that the old ad-hoc classifier
+ * could not evaluate a projection. It now goes through `sanity-overlay-query`'s
+ * pinned `groq-js`, over a candidate set the overlay has already resolved.
+ */
+
+describe('fetch — the Studio list pane renders the branch, not staging', () => {
+  const OTHER: Rec = {
+    _id: 'article-9',
+    _type: 'article',
+    _rev: 'lake-rev-9',
+    title: 'ANOTHER STAGING TITLE',
+  }
+
+  /** The list pane's own shape, over the two documents these tests use. */
+  const LIST_PANE =
+    '[*[_id in ["article-9","drafts.article-1"]][0...23]{_id,_type,title}][0...1]'
+
+  it('renders the BRANCH title for a document renamed in the overlay', async () => {
+    const server = await bootServer()
+    await renameDraft(server, 'BRANCH TITLE')
+    const {client} = await wrap(server, {fetch: () => [OTHER, BASE_DRAFT]})
+
+    const result = (await (client.fetch as (q: string) => Promise<unknown[]>)(
+      LIST_PANE,
+    )) as Array<Array<Rec>>
+
+    expect(result[0]).toEqual([
+      {_id: 'article-9', _type: 'article', title: 'ANOTHER STAGING TITLE'},
+      {_id: 'drafts.article-1', _type: 'article', title: 'BRANCH TITLE'},
+    ])
+    expect(echoLog().reads.exact).toBeGreaterThan(0)
+    expect(echoLog().reads.approximated).toBe(0)
+  })
+
+  it('includes a branch-created document in a type list, in `_id` order', async () => {
+    /* Two claims at once, and the order one is the subtle half: `evaluate.ts`
+     * admits base candidates before branch-created ones, so an unordered list
+     * would append `article-0` at the end and the pane would be reporting where
+     * a document came from rather than what it is. */
+    const server = await bootServer()
+    await commit(server, {
+      idempotencyKey: 'create-first',
+      kind: 'mutations',
+      payload: [{create: {_id: 'article-0', _type: 'article', title: 'BRANCH CREATED'}}],
+      baseDocuments: [],
+    })
+    const {client} = await wrap(server, {fetch: () => [OTHER]})
+
+    const result = (await (client.fetch as (q: string) => Promise<unknown[]>)(
+      '*[_type == "article"]{_id, title}',
+    )) as Rec[]
+
+    expect(result).toEqual([
+      {_id: 'article-0', title: 'BRANCH CREATED'},
+      {_id: 'article-9', title: 'ANOTHER STAGING TITLE'},
+    ])
+  })
+
+  it('drops a tombstoned document from a list result', async () => {
+    const server = await bootServer()
+    await commit(server, {
+      idempotencyKey: 'delete-1',
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.delete',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+        },
+      ],
+      baseDocuments: [BASE_ARTICLE],
+    })
+    const {client} = await wrap(server, {fetch: () => [BASE_ARTICLE, BASE_DRAFT, OTHER]})
+
+    const result = (await (client.fetch as (q: string) => Promise<unknown[]>)(
+      '*[_type == "article"]{_id}',
+    )) as Rec[]
+
+    expect(result).toEqual([{_id: 'article-9'}])
+  })
+
+  it('asks staging for the candidate set the plan named, not for the original query', async () => {
+    /* The exact path stops passing the caller's query to staging: a projected,
+     * sliced answer is not a candidate set. It issues the plan's own base
+     * request instead — the `BaseCandidateRequest` shapes §22.6 step 5 defines —
+     * which is also why a projection no longer costs exactness. */
+    const server = await bootServer()
+    await renameDraft(server, 'BRANCH TITLE')
+    const {client, stub} = await wrap(server, {fetch: () => [BASE_DRAFT]})
+
+    await (client.fetch as (q: string) => Promise<unknown>)(LIST_PANE)
+
+    const issued = stub.fetchCalls
+      .map((call) => call.query)
+      .filter((query) => !query.includes('__spike_echo_probe__'))
+    expect(issued).toHaveLength(1)
+    expect(issued[0]).not.toBe(LIST_PANE)
+    expect(issued[0]).toMatch(/_id in \$/)
+    expect(stub.fetchCalls.at(-1)?.params).toMatchObject({
+      __spikeAIds: ['article-9', 'drafts.article-1'],
+    })
+  })
+
+  it('degrades to staging, loudly, when the overlay cannot answer the list', async () => {
+    const {client} = await wrap(null, {fetch: () => [BASE_DRAFT]})
+
+    const result = (await (client.fetch as (q: string) => Promise<unknown>)(LIST_PANE)) as unknown[]
+
+    expect(result).toEqual([BASE_DRAFT])
+    expect(echoLog().reads.failed).toBeGreaterThan(0)
+    expect(errors.join('\n')).toMatch(/overlay/i)
+  })
+})
+
 describe('fetch — queries the overlay cannot answer exactly', () => {
-  const LIST_QUERY = '*[_type == "article"] | order(_updatedAt desc) [0...100]'
+  /* Studio's own search/findability query. `text::query` is answered by the
+   * hosted search index, so no candidate set proves complete — the honest
+   * refusal, and the one the PRD degrades (§22.3 Tier C). */
+  const LIST_QUERY =
+    '*[_type in $__types && ([@, _id] match text::query($__query))]{_id} | order(_id asc)'
 
   it('passes the query through to staging rather than failing the pane', async () => {
     const server = await bootServer()
@@ -680,7 +899,7 @@ describe('fetch — queries the overlay cannot answer exactly', () => {
 
     await (client.fetch as (q: string) => Promise<unknown>)(LIST_QUERY)
     await (client.fetch as (q: string) => Promise<unknown>)(LIST_QUERY)
-    await (client.fetch as (q: string) => Promise<unknown>)('*[_type == "author"]')
+    await (client.fetch as (q: string) => Promise<unknown>)('*')
 
     const overlayWarnings = warnings.filter((line) => line.includes('overlay'))
     expect(overlayWarnings).toHaveLength(2)
@@ -690,11 +909,24 @@ describe('fetch — queries the overlay cannot answer exactly', () => {
   it('names the query and the reason in the warning', async () => {
     const server = await bootServer()
     const {client} = await wrap(server, {fetch: () => []})
-    await (client.fetch as (q: string) => Promise<unknown>)('*[_id == $id][0]{title}', {
-      id: 'a',
-    } as never)
+    await (client.fetch as (q: string) => Promise<unknown>)(
+      '*[_type == "system.release" && _id in path("_.releases.*")]{_id}',
+    )
 
-    expect(warnings.join('\n')).toContain('projection')
+    expect(warnings.join('\n')).toMatch(/path\(\)|system/)
+  })
+
+  it('refuses, rather than guessing, when a query parameter is missing', async () => {
+    /* The candidate set for `_id == $id` is the parameter. Absent, the honest
+     * answer is "cannot plan this", never "matches nothing" — which would be an
+     * approximation delivered with a straight face. */
+    const server = await bootServer()
+    const {client} = await wrap(server, {fetch: () => []})
+
+    await (client.fetch as (q: string, p?: unknown) => Promise<unknown>)('*[_id == $id][0]', {})
+
+    expect(echoLog().reads.unsupported[0]?.reason).toMatch(/\$id/)
+    expect(echoLog().reads.approximated).toBe(1)
   })
 
   it('rejects instead of approximating in strict mode', async () => {
@@ -706,8 +938,13 @@ describe('fetch — queries the overlay cannot answer exactly', () => {
     await expect(
       (client.fetch as (q: string) => Promise<unknown>)(LIST_QUERY),
     ).rejects.toThrow(/spike-a/)
-    /* And it never reached staging: a refusal is a refusal. */
-    expect(stub.fetchCalls).toHaveLength(0)
+    /* And it never reached staging: a refusal is a refusal. (The only call the
+     * stub sees is `localEcho`'s own cold rxjs-constructor probe, which runs
+     * against the unwrapped client at boot.) */
+    expect(stub.fetchCalls.map((call) => call.query)).not.toContain(LIST_QUERY)
+    expect(
+      stub.fetchCalls.filter((call) => !call.query.includes('__spike_echo_probe__')),
+    ).toHaveLength(0)
   })
 
   it('still answers the exact shapes in strict mode', async () => {

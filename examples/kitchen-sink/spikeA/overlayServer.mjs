@@ -55,6 +55,7 @@ import {
 } from '../../../packages/sanity-overlay-core/src/index.ts'
 import {FsOverlayStore} from '../../../packages/sanity-overlay-store-fs/src/index.ts'
 import {translateDocumentActions, translateInterceptedWrite} from './overlayTranslate.ts'
+import {deriveReadQuery, evaluateReadQuery} from './readQueries.ts'
 
 /* ------------------------------------------------------------------ *
  * Defaults
@@ -631,6 +632,153 @@ export async function startOverlayServer(options = {}) {
   }
 
   /* ---------------------------------------------------------------- *
+   * GROQ reads (PRD §22)
+   * ---------------------------------------------------------------- *
+   *
+   * `POST /query/plan` answers "what must be fetched from base to answer this
+   * query exactly, if it can be answered exactly at all?".
+   * `POST /query`      answers the query itself, given those documents.
+   *
+   * WHY THE WORK IS SPLIT ACROSS TWO PARTIES
+   * Only the browser holds a Sanity credential, so only the browser can fetch
+   * base candidates. Only this process holds the overlay, and — decisively —
+   * only this process should decide *how many* candidates a query may
+   * materialise: `sanity-overlay-query` enforces §22.9
+   * `CANDIDATE_LIMIT_EXCEEDED` inside `evaluateOverlayQuery`, and a limit
+   * enforced in a browser tab is a limit a reload can lose. So the plan is
+   * derived here, the fetch happens there, and the evaluation happens back here.
+   *
+   * The plan is re-derived on `/query` rather than trusted from the request: a
+   * caller that under-fetches gets a smaller candidate set, but it can never
+   * talk this endpoint into evaluating a plan the deriver would have refused.
+   *
+   * Like `/resolve`, this is unqueued — a read is not a write — and every
+   * candidate resolution is synchronous against the in-memory projection.
+   */
+
+  /**
+   * The branch as `sanity-overlay-query` consumes it (§22.6 steps 6, 7, 13),
+   * keyed by the ID Studio addresses a document by (PRD §13.9): `drafts.x` and
+   * `x` are separate addresses, exactly as they are in a raw dataset read.
+   *
+   * `documents` holds only versions the branch actually owns, so the overlay
+   * never claims a document it has no opinion about; `tombstones` is the ONLY
+   * place suppression is decided, so removing it is falsifiable by a test rather
+   * than silently compensated for somewhere else.
+   */
+  function overlayQuerySource(base) {
+    const documents = new Map()
+    const tombstones = new Set()
+    const addresses = []
+
+    for (const logicalId of Object.keys(state.documents).sort()) {
+      const record = state.documents[logicalId]
+      if (record.local.draftTombstone) tombstones.add(`drafts.${logicalId}`)
+      else if (record.local.draft) addresses.push(`drafts.${logicalId}`)
+      if (record.local.publishedTombstone) tombstones.add(logicalId)
+      else if (record.local.published) addresses.push(logicalId)
+    }
+
+    /* The full §17.3 merge, not the raw local materialization: a branch edit on
+     * top of a base document is only correct once the ancestor is folded in. */
+    const resolved = resolveVersionBatch({
+      ids: addresses,
+      now: now(),
+      records: state.documents,
+      base,
+    })
+
+    for (const entry of resolved.entries) {
+      if (entry.document === null) continue
+      documents.set(entry.documentId, {
+        ...entry.document,
+        /* Addressed identity wins: a `_type` is required by the query layer and
+         * a materialized body could in principle omit it. */
+        _id: entry.documentId,
+        _type: entry.document._type ?? state.documents[entry.logicalId]?.schemaType,
+      })
+    }
+
+    return {
+      documents,
+      tombstones,
+      conflicts: new Set(resolved.conflicts.map((conflict) => conflict.documentId)),
+    }
+  }
+
+  /** Shared front half of both query routes: validate, then derive. */
+  function deriveFromBody(body, label) {
+    if (!isRecord(body)) {
+      throw new HttpError(400, 'INVALID_REQUEST', `${label} body must be a JSON object`)
+    }
+    const {query} = body
+    if (typeof query !== 'string' || query.trim().length === 0) {
+      throw new HttpError(400, 'INVALID_REQUEST', `${label} requires a non-empty \`query\` string`)
+    }
+    const params = isRecord(body.params) ? body.params : {}
+    return {query, params, derivation: deriveReadQuery(query, params)}
+  }
+
+  function planQuery(body) {
+    const {derivation} = deriveFromBody(body, 'query/plan')
+
+    /* An unsupported query is DATA, not an HTTP failure. §22.5 requires the
+     * caller to log it, and a 4xx would be indistinguishable from "the overlay
+     * is down" — which is the one distinction the read policy rests on. */
+    if (!derivation.supported) {
+      return {ok: true, overlayId, revision: state.revision, supported: false, reason: derivation.reason}
+    }
+
+    const {definition, baseRequests} = derivation.plan
+    return {
+      ok: true,
+      overlayId,
+      revision: state.revision,
+      supported: true,
+      queryId: definition.id,
+      queryChecksum: definition.queryChecksum,
+      candidatePlan: definition.candidatePlan,
+      maxCandidates: definition.maxCandidates,
+      baseRequests,
+    }
+  }
+
+  async function runQuery(body) {
+    const {params, derivation} = deriveFromBody(body, 'query')
+
+    /* §22.2: what cannot be evaluated exactly fails structurally. The §22.5
+     * passthrough licence belongs to the caller — it holds the credential and
+     * can ask staging itself — and is not this endpoint's to grant. */
+    if (!derivation.supported) {
+      throw new HttpError(400, 'UNSUPPORTED_QUERY', derivation.reason)
+    }
+
+    /* Same filter the write path applies: a document with no `_rev`, or one
+     * carrying a synthetic overlay `_rev` (§13.9), is not base. Accepting an
+     * echoed-back overlay document here would let the overlay be its own
+     * ancestor AND let the browser smuggle branch content in as staging. */
+    const baseDocuments = usableBaseDocuments(body.baseDocuments)
+    const overlay = overlayQuerySource(createBaseSource(baseDocuments))
+
+    const evaluated = await evaluateReadQuery({
+      plan: derivation.plan,
+      params,
+      baseDocuments,
+      overlay,
+      ...(body.perspective === undefined ? {} : {perspective: body.perspective}),
+    })
+
+    return {
+      ok: true,
+      overlayId,
+      revision: state.revision,
+      queryId: derivation.plan.definition.id,
+      result: evaluated.result,
+      diagnostics: evaluated.diagnostics,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
    * HTTP
    * ---------------------------------------------------------------- */
 
@@ -729,6 +877,29 @@ export async function startOverlayServer(options = {}) {
         const status = error instanceof HttpError ? error.status : error?.code ? 400 : 500
         const code = error?.code ?? 'INTERNAL'
         log('error', `overlay resolve failed [${code}]: ${error?.message ?? error}`)
+        send(request, response, status, {
+          ok: false,
+          error: {code, message: String(error?.message ?? error)},
+        })
+      }
+      return
+    }
+
+    /* The two GROQ read routes. Unqueued, like `/resolve`: a read is not a
+     * write, and `state` is replaced by a single assignment after the store has
+     * passed its commit point, so a read sees a transaction whole or not at all. */
+    if (request.method === 'POST' && (route === '/query' || route === '/query/plan')) {
+      const label = route.slice(1)
+      const body = await jsonBody(label)
+      if (body === undefined) return
+
+      try {
+        const payload = route === '/query' ? await runQuery(body) : planQuery(body)
+        send(request, response, 200, payload)
+      } catch (error) {
+        const status = error instanceof HttpError ? error.status : error?.code ? 400 : 500
+        const code = error?.code ?? 'INTERNAL'
+        log('error', `overlay ${label} failed [${code}]: ${error?.message ?? error}`)
         send(request, response, status, {
           ok: false,
           error: {code, message: String(error?.message ?? error)},

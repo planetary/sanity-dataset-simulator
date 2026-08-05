@@ -1,499 +1,703 @@
-// SPIKE A — which GROQ the read facade answers EXACTLY, and what it refuses.
+// SPIKE A — turning the GROQ Studio actually writes into a `sanity-overlay-query`
+// candidate plan, and letting that package answer.
 //
-// THE JUDGEMENT CALL, WRITTEN DOWN
-// ────────────────────────────────
-// PRD §5.5 requires "no silent query approximation" and §22.2 requires "never
-// silently fall back to patching an already filtered or sliced result". Taken
-// alone those say: fail every query you cannot evaluate. But Studio issues its
-// own queries constantly — structure lists, previews, reference search — and
-// failing them all produces an editor that cannot open a pane. That is not a
-// safer failure, it is a different one.
+// WHAT THIS MODULE IS *NOT* ANY MORE
+// ──────────────────────────────────
+// It used to be a second implementation of a decision `sanity-overlay-query`
+// already owns: a lexical shape recogniser with its own plan type and its own
+// mini-evaluator (`applyReadPlan`) that filtered and sliced a candidate set by
+// hand. Two implementations of "which documents can this query observe, and what
+// is the answer" is the defect, not a convenience:
 //
-// §22.5 is where the PRD resolves it:
+//   - the ad-hoc one could not evaluate a projection, so it refused every Studio
+//     list pane and the pane rendered pre-branch staging content;
+//   - it re-derived tombstone suppression, branch-created admission and ordering
+//     that §22.6 already specifies, so the two could drift silently.
 //
-//     [MUST]   Log unregistered queries.
-//     [MUST]   Reject unregistered queries in strict preview mode.
-//     [SHOULD] Allow a local development warning mode during migration.
+// WHAT IS LEFT — the one decision the package genuinely does not make
+// The package's registry is by design a **static, pre-registered, checksummed
+// table** (PRD §22.5): a query is identified by a stable ID and its text is
+// version controlled. Studio composes its queries at runtime and has no such ID.
+// So this module derives a `CandidatePlan` from the parse tree, registers the
+// query ephemerally through the package's own `defineOverlayQuery` (checksum and
+// all), and hands the entire rest of the job over:
 //
-// So the rule this module enforces is **provable exactness or an explicit
-// refusal, never an approximation presented as an answer**:
+//   base request planning     planCandidateRequests   (§22.6 steps 4-5)
+//   branch-created admission  evaluateOverlayQuery    (§22.6 step 6)
+//   tombstone suppression     resolveVirtualDocument  (§22.6 step 7, 13)
+//   reference expansion       evaluateOverlayQuery    (§22.6 steps 8-11)
+//   boundedness               maxCandidates           (§22.9)
+//   the answer itself         pinned groq-js          (§22.6 step 14)
 //
-//   supported  — the result set is a pure function of a candidate set the read
-//                layer can prove complete, and the only work left is a predicate
-//                and a slice. Those get overlay-resolved answers.
-//   refused    — everything else, WITH A REASON. The caller logs it, counts it,
-//                and (in warning mode) passes the query through to base
-//                untouched, having recorded that it did so. Strict mode turns
-//                the same refusal into an error.
+// DERIVING A PLAN IS NOT THE SAME AS APPROXIMATING AN ANSWER. A plan is only
+// derived when the candidate set is provably complete — every `*` in the query
+// is constrained by a predicate whose matching documents a `BaseCandidateRequest`
+// can select in full. Anything else is refused **with a reason a human can
+// read**, and the caller passes it through to staging and records it (§22.5
+// "[MUST] log unregistered queries", "[SHOULD] allow a warning mode") or, in
+// strict mode, refuses outright (§22.5 "[MUST] reject in strict preview mode").
+// §5.5's ban is on *silent* approximation; a recorded passthrough is not silent.
 //
-// The supported set is exactly the PRD's `[M-LOCAL]` slice (§1.3 "§22 is
-// `[M-LOCAL]` for ID and slug queries", roadmap §5.3): document by ID, documents
-// by ID list, document by slug.
+// WHERE THIS RUNS: NODE, NOT THE BROWSER — and that is deliberate, twice over.
+//   1. `maxCandidates` is enforced inside `evaluateOverlayQuery`. Boundedness
+//      decided in the browser is boundedness a page can be reloaded out of; it
+//      belongs next to the overlay store, on the server (`overlayServer.mjs`).
+//   2. `groq-js` is not resolvable from `examples/kitchen-sink` at all — the
+//      Studio dev bundle has no path to it and installs are out of scope — so
+//      the browser could not evaluate even if it should.
+// `localEcho.ts` therefore imports NOTHING from here. It asks the server for a
+// plan, executes the base requests it is handed (it is the only party holding
+// Sanity credentials), and posts the documents back to be evaluated.
 //
-// WHY A SHAPE RECOGNISER AND NOT `groq-js`
-// A projection or an `order()` needs a real evaluator over a real candidate set —
-// that is the query package's job (PRD §22.6 planner, §22.7 evaluator). Trying it
-// here would mean guessing at a candidate set, which is the one thing §22.2
-// forbids. Refusing is the honest answer, and refusing *with a reason a human can
-// read* is what makes the gap visible instead of silent.
-//
-// Everything here is pure: no DOM, no network, no clock. It is unit-tested by
-// `packages/sanity-overlay-testkit/test/spike-a-read-queries.test.ts`.
+// Unit-tested by `packages/sanity-overlay-testkit/test/spike-a-read-queries.test.ts`.
+import {parse as parseGroq} from 'groq-js'
+
+import type {
+  BaseCandidateRequest,
+  QueryBaseSource,
+} from '../../../packages/sanity-overlay-query/src/baseSource'
+import {evaluateOverlayQuery} from '../../../packages/sanity-overlay-query/src/evaluate'
+import type {OverlaySource} from '../../../packages/sanity-overlay-query/src/overlaySource'
+import {planCandidateRequests} from '../../../packages/sanity-overlay-query/src/planner'
+import {createQueryRegistry, defineOverlayQuery, queryTextChecksum} from '../../../packages/sanity-overlay-query/src/registry'
+import type {
+  CandidatePlan,
+  OverlayQueryDefinition,
+  OverlayQueryDiagnostics,
+  QueryDocument,
+  QueryPerspective,
+} from '../../../packages/sanity-overlay-query/src/types'
 
 type Rec = Record<string, unknown>
 
-export type ReadPlanKind = 'by-id' | 'by-ids' | 'by-slug'
+/* ------------------------------------------------------------------ *
+ * Registration constants
+ * ------------------------------------------------------------------ */
 
-export interface ReadPlan {
-  kind: ReadPlanKind
-  /** The document IDs the shape names. Empty for a slug lookup. */
-  ids: string[]
-  /** `_type` constraint. Empty means "any type" — an unconstrained slug lookup. */
-  types: string[]
-  /** The slug value a `by-slug` plan matches. */
-  slug?: string
-  /** `[0]` was written: the answer is one document or `null`, not an array. */
-  single: boolean
-  /** Exclusive end of a written `[0...n]` slice. */
-  limit?: number
+/**
+ * §22.6 step 11. Mirrors every `[M-LOCAL]` registration; a deeper graph is a
+ * `REFERENCE_DEPTH_EXCEEDED` rather than an unbounded walk.
+ */
+export const SPIKE_A_MAX_REFERENCE_DEPTH = 3
+
+/**
+ * Per-plan candidate ceilings (PRD §11.1 `query.maxCandidateDocuments`, §22.9).
+ * Per-plan rather than global for the reason the Spike C latency evidence
+ * (§1.1) records: one number cannot serve a lookup and a list at once.
+ *
+ * `ids`  — the answer is the named documents plus whatever the dereference
+ *          walk pulls in. The largest fan-out measured in the Spike C corpus
+ *          was 9, so 64 of headroom on top of the named set fails long before
+ *          anything resembling a scan.
+ * `slug` — the base fetch returns the matches, but §22.6 step 6 unions in every
+ *          BRANCH record of the type, because an edit can make a document newly
+ *          match. That is bounded by the size of the branch, not the dataset.
+ * `types`— the answer IS the type, so the candidate set cannot be smaller than
+ *          the response. Not constant-bounded and not claimed to be; the
+ *          boundedness suite classifies this shape `result-proportional`.
+ */
+const ID_PLAN_HEADROOM = 64
+const SLUG_MAX_CANDIDATES = 512
+const TYPE_LIST_MAX_CANDIDATES = 4096
+
+/**
+ * The synthetic parameter a derived slug plan reads its value from.
+ *
+ * `CandidatePlan.slug` names a PARAMETER, not a value, so a query with a literal
+ * slug (`slug.current == "about"`) has nowhere to put it. Lifting the value into
+ * a reserved parameter keeps the package's planner in charge instead of
+ * special-casing literals here. The name is namespaced so it cannot collide with
+ * a caller's own parameter, and groq-js ignores parameters the query never reads.
+ */
+const SLUG_PLAN_PARAM = '__spikeAFieldValue'
+
+/** The shapes a refusal message can point at as the alternative. */
+export const SUPPORTED_READ_SHAPES =
+  'a filter naming `_id` (== / in), or a `_type` constraint, optionally with a local ' +
+  'field equality — projections, slices, array wrappers and dereferences are then free'
+
+/* ------------------------------------------------------------------ *
+ * Result types
+ * ------------------------------------------------------------------ */
+
+export interface ReadQueryPlan {
+  /** The ephemeral registration the package validates and evaluates against. */
+  definition: OverlayQueryDefinition
+  /**
+   * Parameters the CANDIDATE PLAN resolves against — the caller's own, plus any
+   * value this module had to lift out of the query text (see
+   * {@link SLUG_PLAN_PARAM}). Never the other way round: a caller parameter is
+   * never rewritten.
+   */
+  planParams: Record<string, unknown>
+  /** What the credential holder must fetch from base (§22.6 step 5). */
+  baseRequests: readonly BaseCandidateRequest[]
 }
 
-export type ReadQueryClassification =
-  | {supported: true; plan: ReadPlan}
+export type ReadQueryDerivation =
+  | {supported: true; plan: ReadQueryPlan}
   | {supported: false; reason: string}
 
-function isRec(value: unknown): value is Rec {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+export interface ReadQueryEvaluation {
+  result: unknown
+  diagnostics: OverlayQueryDiagnostics
 }
 
-function refuse(reason: string): ReadQueryClassification {
+/* ------------------------------------------------------------------ *
+ * AST helpers
+ * ------------------------------------------------------------------ */
+
+type Node = Rec & {type: string}
+
+function isNode(value: unknown): value is Node {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as Rec).type === 'string'
+  )
+}
+
+/** Visit every AST node, in no particular order. */
+function walk(value: unknown, visit: (node: Node) => void): void {
+  if (Array.isArray(value)) {
+    for (const item of value) walk(item, visit)
+    return
+  }
+  if (typeof value !== 'object' || value === null) return
+  if (isNode(value)) visit(value)
+  for (const child of Object.values(value as Rec)) walk(child, visit)
+}
+
+/** `a && b && c` as a flat list; anything else is a single conjunct. */
+function conjunctsOf(node: unknown): Node[] {
+  if (!isNode(node)) return []
+  if (node.type === 'And') return [...conjunctsOf(node.left), ...conjunctsOf(node.right)]
+  if (node.type === 'Group') return conjunctsOf(node.base)
+  return [node]
+}
+
+/**
+ * The attribute path an `AccessAttribute` chain names, rooted at the document.
+ *
+ * `slug.current` is `AccessAttribute{base: AccessAttribute{name:'slug'}, name:'current'}`.
+ * A chain rooted at anything other than the document itself (a `Parent`, a
+ * dereference) is not a local field and returns `null` — the base fetch could
+ * not push such a predicate down, and §22.6 step 10 is out of scope here.
+ */
+function attributePath(node: unknown): string[] | null {
+  if (!isNode(node) || node.type !== 'AccessAttribute') return null
+  const name = node.name
+  if (typeof name !== 'string') return null
+  const base = node.base
+  if (base === undefined || (isNode(base) && base.type === 'This')) return [name]
+  const parent = attributePath(base)
+  return parent === null ? null : [...parent, name]
+}
+
+/** A `Value` literal or a `Parameter` looked up in `params`. */
+function operandValue(node: unknown, params: Rec): {value: unknown} | {missing: string} | null {
+  if (!isNode(node)) return null
+  if (node.type === 'Value') return {value: node.value}
+  if (node.type === 'Group') return operandValue(node.base, params)
+  if (node.type === 'Parameter') {
+    const name = node.name
+    if (typeof name !== 'string') return null
+    if (!(name in params)) return {missing: name}
+    return {value: params[name]}
+  }
+  if (node.type === 'Array') {
+    const elements = node.elements
+    if (!Array.isArray(elements)) return null
+    const values: unknown[] = []
+    for (const element of elements) {
+      if (!isNode(element) || element.isSplat === true) return null
+      const resolved = operandValue(element.value, params)
+      if (resolved === null) return null
+      if ('missing' in resolved) return resolved
+      values.push(resolved.value)
+    }
+    return {value: values}
+  }
+  return null
+}
+
+/* ------------------------------------------------------------------ *
+ * Refusals
+ * ------------------------------------------------------------------ */
+
+function refuse(reason: string): ReadQueryDerivation {
   return {supported: false, reason}
 }
 
 /**
- * The shapes this layer can answer, spelled out for a refusal message.
+ * Functions whose evaluation or whose selection this layer cannot honour.
  *
- * Kept as one string so the reason a user sees names the alternative rather than
- * only the problem — "unsupported" with no exit is a dead end.
+ * These are refusals of *completeness*, not of syntax — each one names a set of
+ * documents no `BaseCandidateRequest` can enumerate, so a locally evaluated
+ * answer would be missing rows without saying so.
  */
-export const SUPPORTED_READ_SHAPES =
-  '*[_id == $id][0] · *[_id in $ids] · *[_type == "t" && slug.current == $slug][0]'
+function deniedFunction(node: Node): string | null {
+  const namespace = typeof node.namespace === 'string' ? node.namespace : 'global'
+  const name = typeof node.name === 'string' ? node.name : '?'
 
-/* ------------------------------------------------------------------ *
- * Lexical helpers
- * ------------------------------------------------------------------ */
-
-/**
- * Collapse the whitespace `defineQuery` and Studio's own template literals leave
- * behind, so one recogniser covers every indentation a caller might use.
- *
- * String literals are left alone: a slug containing a double space would
- * otherwise be silently rewritten, and this function's answer feeds a value
- * comparison.
- */
-function normalizeQuery(query: string): string {
-  let out = ''
-  let quote: string | null = null
-  for (let index = 0; index < query.length; index += 1) {
-    const char = query[index] as string
-    if (quote !== null) {
-      out += char
-      if (char === quote && query[index - 1] !== '\\') quote = null
-      continue
-    }
-    if (char === '"' || char === "'") {
-      quote = char
-      out += char
-      continue
-    }
-    if (/\s/.test(char)) {
-      if (!out.endsWith(' ')) out += ' '
-      continue
-    }
-    out += char
-  }
-  return out.trim()
-}
-
-const STRING_LITERAL = /^"((?:[^"\\]|\\.)*)"$|^'((?:[^'\\]|\\.)*)'$/
-
-/** A quoted GROQ string literal's value, or `undefined` when it is not one. */
-function stringLiteral(token: string): string | undefined {
-  const match = STRING_LITERAL.exec(token.trim())
-  if (match === null) return undefined
-  return (match[1] ?? match[2] ?? '').replace(/\\(.)/g, '$1')
-}
-
-/** A `$name` reference's parameter name, or `undefined`. */
-function parameterName(token: string): string | undefined {
-  const match = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(token.trim())
-  return match === null ? undefined : (match[1] as string)
-}
-
-/**
- * Resolve one operand to a string: a literal, or a `$param` looked up in `params`.
- *
- * A missing or non-string parameter is a refusal, not a `null` match. The query
- * *shape* was recognised; what failed is that the call did not supply a value
- * this layer can resolve — and answering it as "matches nothing" would be an
- * approximation with a straight face.
- */
-function resolveStringOperand(
-  token: string,
-  params: unknown,
-): {value: string} | {refusal: string} {
-  const literal = stringLiteral(token)
-  if (literal !== undefined) return {value: literal}
-
-  const name = parameterName(token)
-  if (name === undefined) {
-    return {refusal: `unsupported query shape: ${token} is neither a string literal nor a parameter`}
-  }
-  const value = isRec(params) ? params[name] : undefined
-  if (typeof value !== 'string') {
-    return {refusal: `parameter $${name} is not a string, so the query cannot be resolved exactly`}
-  }
-  return {value}
-}
-
-/** Resolve an operand to a string array: `$param`, or a literal `["a", "b"]`. */
-function resolveStringArrayOperand(
-  token: string,
-  params: unknown,
-): {value: string[]} | {refusal: string} {
-  const trimmed = token.trim()
-
-  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-    const inner = trimmed.slice(1, -1).trim()
-    if (inner.length === 0) return {value: []}
-    const parts = inner.split(',')
-    const values: string[] = []
-    for (const part of parts) {
-      const literal = stringLiteral(part)
-      if (literal === undefined) {
-        return {refusal: `unsupported query shape: ${part.trim()} is not a string literal`}
-      }
-      values.push(literal)
-    }
-    return {value: values}
-  }
-
-  const name = parameterName(trimmed)
-  if (name === undefined) {
-    return {refusal: `unsupported query shape: ${trimmed} is neither an array literal nor a parameter`}
-  }
-  const value = isRec(params) ? params[name] : undefined
-  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
-    return {
-      refusal: `parameter $${name} is not an array of strings, so the query cannot be resolved exactly`,
-    }
-  }
-  return {value: value as string[]}
-}
-
-/* ------------------------------------------------------------------ *
- * The recogniser
- * ------------------------------------------------------------------ */
-
-/**
- * Split `*[ FILTER ] TAIL` into its filter and whatever follows it.
- *
- * Scanned rather than matched with a regex: `*[_id in ["a"]][0]` contains nested
- * brackets, and a greedy `\[(.+)\]` swallows the slice into the filter while a
- * lazy one stops inside the array. Depth-and-quote-aware scanning is the only
- * correct reading, and getting it wrong is silent — the mis-parse still produces
- * *a* plan.
- */
-function splitRoot(normalized: string): {filter: string; tail: string} | null {
-  if (!normalized.startsWith('*[')) return null
-
-  let depth = 0
-  let quote: string | null = null
-  for (let index = 1; index < normalized.length; index += 1) {
-    const char = normalized[index] as string
-    if (quote !== null) {
-      if (char === quote && normalized[index - 1] !== '\\') quote = null
-      continue
-    }
-    if (char === '"' || char === "'") {
-      quote = char
-      continue
-    }
-    if (char === '[' || char === '(') depth += 1
-    else if (char === ']' || char === ')') {
-      depth -= 1
-      if (depth === 0) {
-        return {
-          filter: normalized.slice(2, index),
-          tail: normalized.slice(index + 1).trim(),
-        }
-      }
-    }
-  }
-  return null
-}
-
-interface Tail {
-  single: boolean
-  limit?: number
-}
-
-function parseTail(tail: string): Tail | {refusal: string} {
-  if (tail.length === 0) return {single: false}
-  if (!tail.startsWith('[') || !tail.endsWith(']')) {
-    return {refusal: `unsupported query shape: trailing ${JSON.stringify(tail)}`}
-  }
-  const inner = tail.slice(1, -1).trim()
-  if (inner === '0') return {single: true}
-  const exclusive = /^0\s*\.\.\.\s*(\d+)$/.exec(inner)
-  if (exclusive !== null) return {single: false, limit: Number(exclusive[1])}
-  return {
-    refusal:
-      `unsupported slice ${tail}: only [0] and [0...n] can be answered without ` +
-      'ordering the whole dataset first',
-  }
-}
-
-/**
- * Split a filter on top-level `&&`.
- *
- * Depth-aware so `_type in ["a", "b"] && …` is not cut inside its array, and
- * quote-aware so a `&&` inside a string literal is not a separator.
- */
-function splitConjuncts(filter: string): string[] {
-  const parts: string[] = []
-  let depth = 0
-  let quote: string | null = null
-  let current = ''
-
-  for (let index = 0; index < filter.length; index += 1) {
-    const char = filter[index] as string
-    if (quote !== null) {
-      current += char
-      if (char === quote && filter[index - 1] !== '\\') quote = null
-      continue
-    }
-    if (char === '"' || char === "'") {
-      quote = char
-      current += char
-      continue
-    }
-    if (char === '[' || char === '(') depth += 1
-    if (char === ']' || char === ')') depth -= 1
-    if (depth === 0 && char === '&' && filter[index + 1] === '&') {
-      parts.push(current)
-      current = ''
-      index += 1
-      continue
-    }
-    current += char
-  }
-  parts.push(current)
-  return parts.map((part) => part.trim()).filter((part) => part.length > 0)
-}
-
-interface Comparison {
-  field: string
-  operator: '==' | 'in'
-  operand: string
-}
-
-/** `field == operand` / `field in operand`, or `null` when it is something else. */
-function parseComparison(conjunct: string): Comparison | null {
-  const equality = /^([A-Za-z_][A-Za-z0-9_.]*)\s*==\s*(.+)$/.exec(conjunct)
-  if (equality !== null) {
-    return {field: equality[1] as string, operator: '==', operand: (equality[2] as string).trim()}
-  }
-  const membership = /^([A-Za-z_][A-Za-z0-9_.]*)\s+in\s+(.+)$/.exec(conjunct)
-  if (membership !== null) {
-    return {field: membership[1] as string, operator: 'in', operand: (membership[2] as string).trim()}
-  }
-  return null
-}
-
-/**
- * Classify a GROQ query against the `[M-LOCAL]` exact slice.
- *
- * Returns a plan the caller can resolve against the overlay, or a refusal with a
- * human-readable reason. It never returns a partial or best-effort plan: the
- * point of the whole module is that "supported" is a claim about exactness.
- */
-export function classifyReadQuery(query: unknown, params?: unknown): ReadQueryClassification {
-  if (typeof query !== 'string' || query.trim().length === 0) {
-    return refuse('unsupported query shape: not a GROQ string')
-  }
-
-  const normalized = normalizeQuery(query)
-
-  /* A projection turns the answer into something only a GROQ evaluator can
-   * produce (§22.2). Checked first, so the reason names the real obstacle rather
-   * than a generic "shape" — the difference between a user who knows to register
-   * the query with the query layer and one who does not. */
-  if (normalized.includes('{')) {
-    return refuse(
-      'unsupported projection: evaluating a projection needs the GROQ evaluator, and ' +
-        'approximating one would be a silently patched result (PRD §22.2)',
+  if (name === 'path') {
+    return (
+      'path() selects documents by ID pattern across the whole dataset, including the ' +
+      'system namespaces (`_.releases.*`) that no `*[_type == …]` or `*[_id in …]` base ' +
+      'fetch returns, so the candidate set cannot be proven complete'
     )
   }
-
-  const root = splitRoot(normalized)
-  if (root === null) {
-    return refuse(`unsupported query shape: only ${SUPPORTED_READ_SHAPES} are answered exactly`)
+  if (namespace === 'text') {
+    return (
+      `text::${name} is answered by the hosted search index, which has no local ` +
+      'equivalent — evaluating it over a candidate set would silently drop every match ' +
+      'the index would have found'
+    )
   }
-
-  const tail = parseTail(root.tail)
-  if ('refusal' in tail) return refuse(tail.refusal)
-
-  const conjuncts = splitConjuncts(root.filter)
-  if (conjuncts.length === 0 || conjuncts.length > 2) {
-    return refuse(`unsupported query shape: only ${SUPPORTED_READ_SHAPES} are answered exactly`)
-  }
-
-  const comparisons: Comparison[] = []
-  for (const conjunct of conjuncts) {
-    const comparison = parseComparison(conjunct)
-    if (comparison === null) {
-      return refuse(
-        `unsupported query shape: ${JSON.stringify(conjunct)} is not an == or in comparison`,
+  if (namespace === 'sanity') {
+    if (name === 'versionOf') {
+      return (
+        'sanity::versionOf selects the release-version namespace (`versions.<release>.<id>`), ' +
+        'whose members cannot be enumerated by an ID or type request, so no base fetch can ' +
+        'prove the candidate set complete'
       )
     }
-    comparisons.push(comparison)
+    return `sanity::${name} is a hosted dataset function with no local candidate plan`
   }
-
-  const byField = new Map(comparisons.map((comparison) => [comparison.field, comparison]))
-  if (byField.size !== comparisons.length) {
-    return refuse('unsupported query shape: the same field is constrained twice')
-  }
-
-  const idComparison = byField.get('_id')
-  const slugComparison = byField.get('slug.current')
-  const typeComparison = byField.get('_type')
-
-  /* ---- document(s) by _id ---- */
-  if (idComparison !== undefined) {
-    if (comparisons.length !== 1) {
-      return refuse(
-        'unsupported query shape: an _id filter combined with another constraint is not in the exact slice',
-      )
-    }
-    if (idComparison.operator === '==') {
-      const resolved = resolveStringOperand(idComparison.operand, params)
-      if ('refusal' in resolved) return refuse(resolved.refusal)
-      return {
-        supported: true,
-        plan: {
-          kind: 'by-id',
-          ids: [resolved.value],
-          types: [],
-          single: tail.single,
-          ...(tail.limit === undefined ? {} : {limit: tail.limit}),
-        },
-      }
-    }
-    const resolved = resolveStringArrayOperand(idComparison.operand, params)
-    if ('refusal' in resolved) return refuse(resolved.refusal)
-    return {
-      supported: true,
-      plan: {
-        kind: 'by-ids',
-        ids: resolved.value,
-        types: [],
-        single: tail.single,
-        ...(tail.limit === undefined ? {} : {limit: tail.limit}),
-      },
-    }
-  }
-
-  /* ---- document by slug ---- */
-  if (slugComparison !== undefined) {
-    if (slugComparison.operator !== '==') {
-      return refuse('unsupported query shape: slug.current must be compared with ==')
-    }
-    if (comparisons.length === 2 && typeComparison === undefined) {
-      return refuse(
-        'unsupported query shape: a slug filter may only be combined with a _type constraint',
-      )
-    }
-
-    const slug = resolveStringOperand(slugComparison.operand, params)
-    if ('refusal' in slug) return refuse(slug.refusal)
-
-    let types: string[] = []
-    if (typeComparison !== undefined) {
-      if (typeComparison.operator === '==') {
-        const resolved = resolveStringOperand(typeComparison.operand, params)
-        if ('refusal' in resolved) return refuse(resolved.refusal)
-        types = [resolved.value]
-      } else {
-        const resolved = resolveStringArrayOperand(typeComparison.operand, params)
-        if ('refusal' in resolved) return refuse(resolved.refusal)
-        types = resolved.value
-      }
-    }
-
-    return {
-      supported: true,
-      plan: {
-        kind: 'by-slug',
-        ids: [],
-        types,
-        slug: slug.value,
-        single: tail.single,
-        ...(tail.limit === undefined ? {} : {limit: tail.limit}),
-      },
-    }
-  }
-
-  return refuse(`unsupported query shape: only ${SUPPORTED_READ_SHAPES} are answered exactly`)
+  return null
 }
 
 /* ------------------------------------------------------------------ *
- * Evaluating the plan over a resolved candidate set
+ * Constraint derivation
  * ------------------------------------------------------------------ */
 
-/** `slug.current`, only in the object form Sanity's `slug` type actually stores. */
-function slugCurrentOf(document: Rec): unknown {
-  const slug = document.slug
-  return isRec(slug) ? slug.current : undefined
+type Constraint =
+  | {kind: 'ids'; ids: string[]}
+  | {kind: 'types'; types: string[]}
+  | {kind: 'field'; types: string[]; path: string[]; value: unknown}
+
+const SYSTEM_TYPE = /^(system|sanity)\./
+const SYSTEM_ID = /^_\./
+
+function stringsOf(value: unknown): string[] | null {
+  if (typeof value === 'string') return value.length === 0 ? null : [value]
+  if (!Array.isArray(value)) return null
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || item.length === 0) return null
+    out.push(item)
+  }
+  return out
 }
 
-function matchesPlan(plan: ReadPlan, document: Rec): boolean {
-  if (plan.kind === 'by-slug') {
-    if (plan.types.length > 0 && !plan.types.includes(String(document._type))) return false
-    return slugCurrentOf(document) === plan.slug
-  }
-  return typeof document._id === 'string' && plan.ids.includes(document._id)
+/** A refusal produced while reading a filter — carried out of the recursion. */
+class DeriveRefusal extends Error {}
+
+function fail(reason: string): never {
+  throw new DeriveRefusal(reason)
+}
+
+/** Describe an operand for a refusal message: `$name` when it came from one. */
+function operandLabel(node: unknown): string {
+  return isNode(node) && node.type === 'Parameter' && typeof node.name === 'string'
+    ? `$${node.name}`
+    : 'the value'
 }
 
 /**
- * Apply the plan's own predicate and slice to an already **virtually resolved**
- * candidate set.
+ * Read one `*[…]` filter as a candidate constraint.
  *
- * The candidates must already be the overlay's answer — tombstoned documents
- * absent, branch-created documents present, edits applied. This function only
- * filters and slices, which is exactly the part that is safe to do outside a GROQ
- * evaluator once the candidate set is proven complete.
- *
- * ID order comes from the plan, not from the candidate list: `*[_id in $ids]`
- * has no defined order in hosted Sanity either, and answering in the order the
- * caller asked is the one choice that is stable across a base fetch and an
- * overlay resolution.
+ * Only top-level conjuncts are read, and only to *narrow*: an unread conjunct
+ * can shrink the answer but never widen it, so ignoring it keeps the candidate
+ * set a superset of the result — which is what completeness means here. A filter
+ * that is a disjunction, or whose conjuncts name nothing bounded, yields `null`
+ * and is refused.
  */
-export function applyReadPlan(plan: ReadPlan, documents: readonly Rec[]): unknown {
-  const matched = documents.filter((document) => isRec(document) && matchesPlan(plan, document))
+function constraintOf(expr: unknown, params: Rec): Constraint | null {
+  const conjuncts = conjunctsOf(expr)
 
-  let ordered = matched
-  if (plan.kind !== 'by-slug') {
-    const byId = new Map<string, Rec>()
-    for (const document of matched) {
-      const id = document._id
-      if (typeof id === 'string' && !byId.has(id)) byId.set(id, document)
+  let ids: string[] | null = null
+  let types: string[] | null = null
+  let field: {path: string[]; value: unknown} | null = null
+
+  for (const conjunct of conjuncts) {
+    if (conjunct.type !== 'OpCall') continue
+    const op = conjunct.op
+    if (op !== '==' && op !== 'in') continue
+
+    const path = attributePath(conjunct.left)
+    if (path === null) continue
+    const resolved = operandValue(conjunct.right, params)
+    if (resolved === null) continue
+    if ('missing' in resolved) {
+      fail(
+        `parameter $${resolved.missing} was not supplied, so the candidate set for ` +
+          `${path.join('.')} cannot be resolved — guessing one would be a silent approximation`,
+      )
     }
-    ordered = plan.ids
-      .map((id) => byId.get(id))
-      .filter((document): document is Rec => document !== undefined)
+
+    if (path.length === 1 && path[0] === '_id') {
+      const values = stringsOf(resolved.value)
+      if (values === null) {
+        fail(
+          `${operandLabel(conjunct.right)} is not a document ID (or list of them), so the ` +
+            '`_id` candidate set cannot be resolved exactly',
+        )
+      }
+      const system = values.find((id) => SYSTEM_ID.test(id))
+      if (system !== undefined) {
+        fail(`document ID ${JSON.stringify(system)} is in a system namespace no base fetch returns`)
+      }
+      ids = ids === null ? values : [...ids, ...values]
+      continue
+    }
+
+    if (path.length === 1 && path[0] === '_type') {
+      const values = stringsOf(resolved.value)
+      if (values === null) {
+        fail(
+          `${operandLabel(conjunct.right)} is not a schema type (or list of them), so the ` +
+            '`_type` candidate set cannot be resolved exactly',
+        )
+      }
+      const system = values.find((type) => SYSTEM_TYPE.test(type))
+      if (system !== undefined) {
+        fail(
+          `type ${JSON.stringify(system)} is a hosted system type; a plain \`*[_type == …]\` ` +
+            'fetch does not return its documents, so the candidate set cannot be proven complete',
+        )
+      }
+      types = types === null ? values : [...types, ...values]
+      continue
+    }
+
+    /* A local field equality is only useful WITH a type constraint — it becomes
+     * the §22.7 "exact slug-filtered pages plus all overlaid pages" plan. Kept
+     * as the first one seen: a second one would need an intersection the base
+     * request shape cannot express. */
+    if (op === '==' && field === null && resolved.value !== null && typeof resolved.value !== 'object') {
+      field = {path, value: resolved.value}
+    }
   }
 
-  if (plan.single) return ordered[0] ?? null
-  return plan.limit === undefined ? [...ordered] : ordered.slice(0, plan.limit)
+  if (ids !== null) return {kind: 'ids', ids}
+  if (types !== null && field !== null) {
+    return {kind: 'field', types, path: field.path, value: field.value}
+  }
+  if (types !== null) return {kind: 'types', types}
+  if (field !== null) {
+    fail(
+      `a \`${field.path.join('.')} ==\` filter with no \`_type\` constraint has no bounded ` +
+        'candidate plan: no base request can select "every document with this field value"',
+    )
+  }
+  return null
+}
+
+/* ------------------------------------------------------------------ *
+ * Derivation
+ * ------------------------------------------------------------------ */
+
+function dedupe(values: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    if (seen.has(value)) continue
+    seen.add(value)
+    out.push(value)
+  }
+  return out
+}
+
+/** Fold every `*[…]` in one query into the single plan the registry model allows. */
+function combine(constraints: readonly Constraint[]): CandidatePlan {
+  if (constraints.length === 1 && constraints[0]?.kind === 'field') {
+    const only = constraints[0]
+    return {
+      type: 'slug',
+      types: dedupe(only.types),
+      path: only.path,
+      valueFromParam: SLUG_PLAN_PARAM,
+    }
+  }
+
+  if (constraints.every((constraint) => constraint.kind === 'ids')) {
+    return {
+      type: 'ids-literal',
+      ids: dedupe(constraints.flatMap((constraint) => (constraint as {ids: string[]}).ids)),
+    }
+  }
+
+  if (constraints.every((constraint) => constraint.kind === 'types')) {
+    return {
+      type: 'types',
+      types: dedupe(constraints.flatMap((constraint) => (constraint as {types: string[]}).types)),
+    }
+  }
+
+  fail(
+    'this query needs more than one candidate plan (an ID set and a type scan, or two ' +
+      'different field filters). PRD §22.4 registers exactly one candidate plan per query, ' +
+      'so the candidate set cannot be planned exactly',
+  )
+}
+
+function ceilingFor(plan: CandidatePlan): number {
+  if (plan.type === 'ids-literal') return plan.ids.length + ID_PLAN_HEADROOM
+  if (plan.type === 'ids') return plan.idsFromParams.length + ID_PLAN_HEADROOM
+  if (plan.type === 'slug') return SLUG_MAX_CANDIDATES
+  return TYPE_LIST_MAX_CANDIDATES
+}
+
+/**
+ * Derive the candidate plan for one `(query, params)` pair, or say why not.
+ *
+ * PER CALL, not per query text, and that is forced rather than chosen:
+ * `CandidatePlan.ids` names one PARAMETER per ID (`planner.ts` rejects anything
+ * that is not a non-empty string), so `*[_id in $ids]` — the single most common
+ * Studio shape — has no template form. Resolving the parameter here turns it
+ * into an exact `ids-literal`. See the reported gap in
+ * `spike-a-read-queries.test.ts` §6.
+ */
+export function deriveReadQuery(query: unknown, params?: unknown): ReadQueryDerivation {
+  if (typeof query !== 'string' || query.trim().length === 0) {
+    return refuse('not a GROQ string, so there is nothing to plan')
+  }
+  const callParams: Rec =
+    typeof params === 'object' && params !== null && !Array.isArray(params) ? (params as Rec) : {}
+
+  let tree: unknown
+  try {
+    tree = parseGroq(query)
+  } catch (cause) {
+    return refuse(`the query does not parse as GROQ: ${(cause as Error).message}`)
+  }
+
+  /* Pass 1: which `Everything` nodes are the subject of a filter, and does the
+   * query call anything whose selection cannot be enumerated locally. */
+  const filtered = new Set<unknown>()
+  const filters: unknown[] = []
+  let denied: string | null = null
+  walk(tree, (node) => {
+    if (node.type === 'Filter' && isNode(node.base) && node.base.type === 'Everything') {
+      filtered.add(node.base)
+      filters.push(node.expr)
+    }
+    if (node.type === 'FuncCall' && denied === null) denied = deniedFunction(node)
+  })
+  if (denied !== null) return refuse(denied)
+
+  /* Pass 2: an `Everything` that is not filtered is the whole dataset. */
+  let unconstrained = false
+  walk(tree, (node) => {
+    if (node.type === 'Everything' && !filtered.has(node)) unconstrained = true
+  })
+  if (unconstrained) {
+    return refuse(
+      'the query reaches an unconstrained `*`: the whole dataset is its candidate set, ' +
+        'which no base request can transfer and no local evaluation can prove complete ' +
+        `(PRD §22.3 Tier C). Answerable instead: ${SUPPORTED_READ_SHAPES}`,
+    )
+  }
+  if (filters.length === 0) {
+    return refuse('the query selects no documents, so there is nothing for the overlay to answer')
+  }
+
+  let plan: CandidatePlan
+  let constraints: Constraint[]
+  try {
+    constraints = filters.map((expr) => {
+      const constraint = constraintOf(expr, callParams)
+      if (constraint === null) {
+        fail(
+          'no bounded candidate plan can be derived from this filter: it names neither `_id` ' +
+            'nor `_type` in a form a base request can select. Answerable instead: ' +
+            SUPPORTED_READ_SHAPES,
+        )
+      }
+      return constraint
+    })
+    plan = combine(constraints)
+  } catch (error) {
+    if (error instanceof DeriveRefusal) return refuse(error.message)
+    throw error
+  }
+
+  const planParams: Rec = {...callParams}
+  if (plan.type === 'slug') {
+    const only = constraints[0] as {value: unknown}
+    planParams[SLUG_PLAN_PARAM] = only.value
+  }
+
+  const checksum = queryTextChecksum(query)
+  let definition: OverlayQueryDefinition
+  try {
+    definition = defineOverlayQuery({
+      id: `spike-a:${checksum.slice(0, 16)}`,
+      description: 'Studio-issued read, planned at call time by spikeA.',
+      query,
+      queryChecksum: checksum,
+      /* Studio is the only caller that reaches this path; `test` is here so the
+       * suite can exercise the same registration without a second definition. */
+      allowedCallers: ['studio', 'test'],
+      /* spikeA addresses documents by their raw `_id` (`drafts.x` vs `x`), which
+       * is §18.3's raw view; `published`/`drafts` are registered so a caller that
+       * asks for a perspective read is not rejected by the registry. */
+      perspectives: ['raw', 'published', 'drafts'],
+      candidatePlan: plan,
+      systemTimestampPolicy: 'preserve-base',
+      maxCandidates: ceilingFor(plan),
+      maxReferenceDepth: SPIKE_A_MAX_REFERENCE_DEPTH,
+      status: 'tier-a',
+    })
+  } catch (error) {
+    return refuse(`the query could not be registered: ${(error as Error).message}`)
+  }
+
+  let baseRequests: readonly BaseCandidateRequest[]
+  try {
+    baseRequests = planCandidateRequests(definition, planParams).baseRequests
+  } catch (error) {
+    return refuse(`the candidate plan could not be resolved: ${(error as Error).message}`)
+  }
+
+  return {supported: true, plan: {definition, planParams, baseRequests}}
+}
+
+/* ------------------------------------------------------------------ *
+ * The candidate source
+ * ------------------------------------------------------------------ */
+
+function readPath(document: QueryDocument, path: readonly string[]): unknown {
+  let cursor: unknown = document
+  for (const segment of path) {
+    if (cursor === null || typeof cursor !== 'object' || Array.isArray(cursor)) return undefined
+    cursor = (cursor as Rec)[segment]
+  }
+  return cursor
+}
+
+export interface CandidateSourceInput {
+  readonly baseDocuments: readonly QueryDocument[]
+  readonly overlay: OverlaySource
+}
+
+/**
+ * The `QueryBaseSource` spikeA hands the evaluator — and the answer to the
+ * candidate-order caveat `evaluate.ts` states in its own header.
+ *
+ * THE CAVEAT. The evaluator admits candidates base-fetch → branch-created →
+ * reference-expanded, and GROQ can observe that order: an unordered `*[…]`
+ * answers in dataset order. `evaluate.ts` calls it immaterial "while at most one
+ * candidate can match", which holds for an ID or slug lookup and does NOT hold
+ * for a list. Left alone, a list pane would answer with every branch-created
+ * document appended after every base one — an order that is a property of *where
+ * a document came from*, which is exactly what an overlay must not leak.
+ *
+ * THE ANSWER. Establish the order here, where the candidate set is assembled,
+ * instead of inheriting it: the source answers every request from the union of
+ * base and branch documents, **sorted by `_id`**. The evaluator then admits them
+ * in that order, so dataset order is a total order that is a pure function of
+ * the answer — identical whether a document came from staging or the branch.
+ * Nothing post-processes an evaluated result, which §22.2 forbids outright, and
+ * which would in any case be wrong for the real list-pane shape, whose documents
+ * sit inside a projection inside a slice inside an array wrapper.
+ *
+ * WHY THE UNION HAPPENS HERE AND NOT ONLY IN §22.6 STEP 6. Returning branch
+ * records from this port widens `ids`/`types` selections to documents base does
+ * not hold — the same documents step 6 would have unioned in a moment later, so
+ * the candidate SET is unchanged and only its order differs. `field-equality` is
+ * widened the same way and for the same reason step 6 does it: a branch edit can
+ * make a document newly match a predicate the base fetch evaluated against
+ * pre-branch content.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO: suppress tombstones. That is §22.6 step 7
+ * and it stays in `resolveVirtualDocument`, one implementation, so that removing
+ * it is falsifiable by a test.
+ */
+export function createCandidateSource(input: CandidateSourceInput): QueryBaseSource {
+  const byId = new Map<string, QueryDocument>()
+  for (const document of input.baseDocuments) {
+    if (typeof document?._id === 'string') byId.set(document._id, document)
+  }
+  /* §22.6 step 13: the branch record wins over the base row at the same ID. */
+  for (const [id, document] of input.overlay.documents) byId.set(id, {...document, _id: id})
+
+  const all = [...byId.values()].sort((left, right) =>
+    left._id < right._id ? -1 : left._id > right._id ? 1 : 0,
+  )
+
+  return {
+    async fetchCandidates(request) {
+      switch (request.kind) {
+        case 'ids': {
+          const wanted = new Set(request.ids)
+          return all.filter((document) => wanted.has(document._id))
+        }
+        case 'types': {
+          const types = new Set(request.types)
+          return all.filter((document) => types.has(document._type))
+        }
+        case 'field-equality': {
+          const types = new Set(request.types)
+          return all.filter(
+            (document) =>
+              types.has(document._type) &&
+              (readPath(document, request.path) === request.value ||
+                input.overlay.documents.has(document._id)),
+          )
+        }
+        default: {
+          const exhaustive: never = request
+          throw new Error(`unhandled base request ${JSON.stringify(exhaustive)}`)
+        }
+      }
+    },
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Evaluation
+ * ------------------------------------------------------------------ */
+
+export interface EvaluateReadQueryOptions {
+  readonly plan: ReadQueryPlan
+  readonly params: Record<string, unknown>
+  /** What the credential holder fetched for {@link ReadQueryPlan.baseRequests}. */
+  readonly baseDocuments: readonly QueryDocument[]
+  readonly overlay: OverlaySource
+  readonly perspective?: QueryPerspective
+}
+
+/**
+ * Evaluate one derived plan through the package.
+ *
+ * The registry is built per call from the ephemeral definition, which is what
+ * makes the package's own guarantees apply unchanged: the checksum is verified,
+ * the caller and perspective are checked, `maxCandidates` is enforced, and
+ * `groq-js` runs exactly once on the ORIGINAL query text over a candidate set
+ * that already contains the resolved branch state (§22.6 step 14).
+ */
+export async function evaluateReadQuery(
+  options: EvaluateReadQueryOptions,
+): Promise<ReadQueryEvaluation> {
+  const {definition} = options.plan
+  const registry = createQueryRegistry([definition])
+
+  const {result, diagnostics} = await evaluateOverlayQuery({
+    registry,
+    queryId: definition.id,
+    query: definition.query,
+    params: {...options.params, ...options.plan.planParams},
+    base: createCandidateSource({
+      baseDocuments: options.baseDocuments,
+      overlay: options.overlay,
+    }),
+    overlay: options.overlay,
+    caller: 'studio',
+    perspective: options.perspective ?? 'raw',
+  })
+
+  return {result, diagnostics}
 }

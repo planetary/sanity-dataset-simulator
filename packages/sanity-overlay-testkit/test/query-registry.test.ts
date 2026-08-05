@@ -144,6 +144,20 @@ describe('§22.5: the registered checksum is a pinned artifact', () => {
     )
   })
 
+  // Redundancy at the second entry point, added because a mutation audit found
+  // checksum enforcement was killed by exactly one test. `defineOverlayQuery`
+  // and `createQueryRegistry` are both public, and a registry assembled from
+  // raw objects must not bypass the check.
+  it('a tampered entry is rejected when the registry is constructed, not only when defined', () => {
+    const tampered = {
+      ...registry.get('article-by-slug'),
+      query: '*[_type == "article"]{_id}',
+    }
+    expect(() => createQueryRegistry([tampered])).toThrowError(
+      expect.objectContaining({code: 'QUERY_CHANGED'}),
+    )
+  })
+
   it('resolving with query text that differs from the registration is QUERY_CHANGED', () => {
     expect(() => registry.resolve('article-by-id', '*[_id == $id][0]{title}')).toThrowError(
       expect.objectContaining({code: 'QUERY_CHANGED'}),

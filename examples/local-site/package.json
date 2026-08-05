@@ -1,0 +1,13 @@
+{
+  "name": "local-site",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --experimental-strip-types run.mjs",
+    "demo": "node --experimental-strip-types run.mjs --demo",
+    "staging": "node --experimental-strip-types run.mjs --mode=off",
+    "seed": "node --experimental-strip-types seed.mjs",
+    "test": "echo 'tested via sanity-overlay-testkit'"
+  }
+}
