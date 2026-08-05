@@ -403,3 +403,95 @@ describe('ASCII behaviour is unchanged', () => {
     ).toBe('That quick brown fox jumped over a lazy dog.')
   })
 })
+
+/* ------------------------------------------------------------------ *
+ * 9. GUARD — 7 bytes per surrogate pair is correct. Do not "simplify" it.
+ * ------------------------------------------------------------------ *
+ *
+ * The likeliest future regression in this module is a well-meant cleanup of its
+ * byte counter to `new TextEncoder().encode(s).length`, or to a `for…of` loop
+ * over code points. Both are the *true* UTF-8 length, and both are wrong here.
+ *
+ * diff-match-patch's own `countUtf8Bytes` iterates UTF-16 **code units** and
+ * calls `codePointAt` at each one. For a surrogate pair that yields the astral
+ * code point at the lead surrogate (charged 4) and the bare trailing surrogate
+ * at the next index (charged 3): **7**. `patch_make` writes header numbers with
+ * that counter and `patch_fromText` reads them back with it, so 7 is not an
+ * approximation of the truth — it is what the numbers on the wire *mean*.
+ * Counting 4 makes this engine disagree with every patch Studio emits, and each
+ * disagreement rejects a real edit.
+ *
+ * The tests below therefore assert the quirk directly and fail with an
+ * explanation rather than an arithmetic diff, because the number alone looks
+ * like a bug to anyone who has not read the upstream source.
+ */
+
+describe('GUARD: a surrogate pair counts 7 bytes — read this before "fixing" the byte counter', () => {
+  /**
+   * `makePatches('Release party is tonight ok', 'Release party 🎉 is tonight ok')`
+   * → `stringifyPatches`, from `@sanity/diff-match-patch@3.2.0`, verbatim.
+   *
+   * `+6,24` decomposes as `se party` (8 ASCII bytes) + ` 🎉` + ` is toni`
+   * (8 ASCII bytes), so the library charged the insertion 8 — one space plus
+   * **7** for the pair. A TextEncoder would have charged 5 and written `+6,21`.
+   */
+  const EMOJI_PATCH = '@@ -6,16 +6,24 @@\n se party\n+ %F0%9F%8E%89\n  is toni\n'
+  const EMOJI_BASE = 'Release party is tonight ok'
+  const EMOJI_RESULT = 'Release party \u{1F389} is tonight ok'
+  const ASCII_CONTEXT_BYTES = 'se party'.length + ' is toni'.length
+
+  const WHY = [
+    'diff-match-patch charges a surrogate pair 7 bytes: 4 for the code point at the',
+    'lead surrogate and 3 more for the bare trailing surrogate. That is what',
+    '`patch_make` writes into the header and what `patch_fromText` reads back, so it',
+    'is the meaning of the number on the wire — not our arithmetic, and not something',
+    'to reconcile with TextEncoder. If this test is failing because the byte counter',
+    'in core/src/mutations/diff-match-patch.ts was changed to TextEncoder, to',
+    'Buffer.byteLength, or to a for…of loop over code points, revert it: every Studio',
+    'edit containing an emoji will otherwise be rejected as an invalid patch.',
+  ].join(' ')
+
+  it('accepts the emoji header the reference library emits (24), which only a 7-byte pair explains', () => {
+    /* Acceptance *is* the claim: `parseDiffMatchPatch` recomputes the byte length
+     * of the hunk payload and refuses any header that disagrees with it. So a
+     * counter that charged the pair 4 bytes would throw right here. */
+    let hunks
+    try {
+      hunks = parseDiffMatchPatch(EMOJI_PATCH)
+    } catch (error) {
+      throw new Error(
+        `A patch that @sanity/diff-match-patch emitted was rejected by our parser.\n\n${WHY}\n\n` +
+          `underlying error: ${(error as Error).message}`,
+      )
+    }
+
+    expect(hunks[0]!.length2).toBe(24)
+
+    /* An independent oracle for the gap: the same insertion measured the way the
+     * "obvious" cleanup would measure it, 3 bytes short. */
+    const charged = hunks[0]!.length2 - ASCII_CONTEXT_BYTES
+    const textEncoderWouldCharge = new TextEncoder().encode(' \u{1F389}').length
+    expect(textEncoderWouldCharge).toBe(5)
+    expect(charged - textEncoderWouldCharge, WHY).toBe(3)
+  })
+
+  it('rejects the header a TextEncoder-based counter would have produced (21)', () => {
+    /* The mirror. A counter charging 4 bytes per pair would *accept* this
+     * corrupted header — and then disagree with Studio on every later offset. */
+    const textEncoderHeader = '@@ -6,16 +6,21 @@\n se party\n+ %F0%9F%8E%89\n  is toni\n'
+    let rejected = false
+    try {
+      parseDiffMatchPatch(textEncoderHeader)
+    } catch (error) {
+      rejected = true
+      expect((error as OverlayDiffMatchPatchError).code).toBe('OVERLAY_DMP_PATCH_INVALID')
+    }
+    expect(rejected, `A 21-byte astral header was accepted. ${WHY}`).toBe(true)
+  })
+
+  it('applies the emoji patch to the exact string the reference library was given', () => {
+    /* The behavioural end of the same fact: the counter is only correct if the
+     * patch actually lands, character for character. */
+    expect(applyDiffMatchPatch(EMOJI_BASE, EMOJI_PATCH), WHY).toBe(EMOJI_RESULT)
+  })
+})

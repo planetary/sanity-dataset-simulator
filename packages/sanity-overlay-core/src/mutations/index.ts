@@ -54,6 +54,7 @@ export {
   localWinsMerge,
   noopStrongReferenceCheck,
   noopValidator,
+  threeWayMerge,
 } from './ports'
 export type {
   BaseDocumentSource,
@@ -70,6 +71,8 @@ export type {
 
 export {documentExists, resolveDraft, resolvePublished, resolveVersion} from './resolve'
 export type {ResolveContext} from './resolve'
+
+export {detectDocumentConflicts, persistTransactionConflicts} from './conflicts'
 
 export {
   applyMutation,

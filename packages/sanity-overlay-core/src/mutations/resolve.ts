@@ -9,15 +9,20 @@
  * - `setIfMissing` missingness is evaluated against the *resolved virtual
  *   document* (§17.2 precedence), not the local record alone (plan §5).
  *
- * The merge step itself is the injected {@link MergeResolver} port, defaulting to
- * the documented W2 stub.
+ * The merge step itself is the injected {@link MergeResolver} port, whose default
+ * is the real W3 three-way merge ({@link threeWayMerge}). Everything §17.3 needs
+ * beyond §17.1's five inputs — the explicit unset set (§17.5), the document
+ * origin (§17.2 rule 2) and the base status (§16.4) — is read off the §13.3
+ * record here and handed to the port, so the resolver stays pure.
  */
 import {toPublishedId} from '../encoding'
+import type {OverlayConflict} from '../types/conflict'
 import type {SanityDocument} from '../types/document'
 import type {OverlayDocumentRecord} from '../types/record'
+import {explicitUnsetPaths} from './operations'
 import {
   EMPTY_BASE_SOURCE,
-  localWinsMerge,
+  threeWayMerge,
   type BaseDocumentSource,
   type MergeResolver,
 } from './ports'
@@ -25,7 +30,10 @@ import {getRecord, versionKindFor, type OverlayState, type VersionKind} from './
 
 export interface ResolveContext {
   base?: BaseDocumentSource
+  /** Defaults to {@link threeWayMerge}, the real PRD §17.3 algorithm. */
   merge?: MergeResolver
+  /** Observer for merge conflicts (§17.4, §34.13). Purely informational. */
+  onConflict?: (conflict: OverlayConflict) => void
 }
 
 function baseOf(context: ResolveContext): BaseDocumentSource {
@@ -33,7 +41,7 @@ function baseOf(context: ResolveContext): BaseDocumentSource {
 }
 
 function mergeOf(context: ResolveContext): MergeResolver {
-  return context.merge ?? localWinsMerge
+  return context.merge ?? threeWayMerge
 }
 
 function mergeLocal(
@@ -58,6 +66,19 @@ function mergeLocal(
     localMaterialized: local.materialized,
     localTouchedPaths: local.touchedPaths,
     localTombstone: version === 'draft' ? record.local.draftTombstone : record.local.publishedTombstone,
+    documentId: record.logicalId,
+    // `detectedAt` for any conflict raised. Read off the record rather than from
+    // an injected clock on purpose: resolution is a *read*, and calling a caller's
+    // clock here would let a read consume a tick and move the timestamps of the
+    // write that follows it. Callers that need true detection time use the W3
+    // perspective resolver, which takes `now` as a value.
+    now: record.updatedAt,
+    // §17.5: absence alone is not a representation, so the tracked unsets are
+    // replayed out of the recorded operations and handed to the merge.
+    unsetPaths: explicitUnsetPaths(local.operations),
+    origin: record.origin,
+    ...(ancestorBlock === null ? {} : {baseStatus: ancestorBlock.baseStatus}),
+    ...(context.onConflict === undefined ? {} : {onConflict: context.onConflict}),
   })
 }
 

@@ -381,6 +381,115 @@ describe('writeGuard · RFC 6455 client frame reader', () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * 2b. the latch, for the whole class of ways it is set and probed
+ * ------------------------------------------------------------------ *
+ * A mutation check on 2026-08-04 removed the `if (latched) return …` line at
+ * the top of `inspect()` and only ONE assertion in this file went red — the
+ * latch was a single-test claim. Worse, the end-to-end leg cannot cover it: on
+ * a refusal `proxy.mjs` writes a 1008 close and destroys the client socket, so
+ * no second chunk ever reaches the guard through a real connection. The latch
+ * is therefore in-process defence-in-depth, and the unit tests are the only
+ * place it can be enforced at all.
+ *
+ * So the property is stated over the whole class rather than at one point:
+ * `latched` is set from three different places, and every kind of later chunk —
+ * including a control frame, which is otherwise unconditionally allowed — must
+ * be refused once it is.
+ */
+
+/** The header of a frame declaring 4 GiB of payload: unparseable, never buffered. */
+function oversizeHeader(): Buffer {
+  const header = Buffer.alloc(10)
+  header[0] = 0x81
+  header[1] = 0x80 | 127
+  header.writeBigUInt64BE(BigInt(4 * 1024 * 1024 * 1024), 2)
+  return header
+}
+
+const UNMASKED_FRAME = encodeClientFrame(
+  Buffer.from(JSON.stringify({jsonrpc: '2.0', method: 'presence_announce', id: 'u-1'})),
+  {masked: false},
+)
+
+const CLOSE_FRAME = encodeClientFrame(Buffer.alloc(0), {opcode: 0x8})
+
+describe('writeGuard · the latch holds for every way it can be set', () => {
+  const latchedBy: ReadonlyArray<readonly [string, Buffer]> = [
+    ['a refused RPC method', MUTATE_FRAME],
+    ['an unmasked frame (RFC 6455 §5.1)', UNMASKED_FRAME],
+    ['an over-large frame declaration', oversizeHeader()],
+  ]
+
+  it.each(latchedBy)('%s latches, and a later allowlisted frame is not forwarded', (_why, chunk) => {
+    const guard = createRealtimeFrameGuard() as FrameGuard
+    const first = guard.inspect(chunk)
+    expect(first.blocked).not.toBeNull()
+
+    const after = guard.inspect(PRESENCE_FRAME)
+    expect(after.forward).toHaveLength(0)
+    expect(after.frames).toEqual([])
+    expect(after.blocked).not.toBeNull()
+  })
+
+  it.each(latchedBy)('%s latches, and a later CONTROL frame is not forwarded', (_why, chunk) => {
+    // Control frames are the sharpest probe: `classifyFrame` returns
+    // `write: false` for them unconditionally, so they are the one input that
+    // sails straight through a latch that has stopped working.
+    const guard = createRealtimeFrameGuard() as FrameGuard
+    guard.inspect(chunk)
+    const after = guard.inspect(CLOSE_FRAME)
+    expect(after.forward).toHaveLength(0)
+    expect(after.blocked).not.toBeNull()
+  })
+
+  it('returns the same latched verdict on every later chunk, not a fresh one', () => {
+    const guard = createRealtimeFrameGuard() as FrameGuard
+    const blocked = guard.inspect(MUTATE_FRAME).blocked
+    expect(blocked!.rpcMethod).toBe('mutate')
+    for (const chunk of [PRESENCE_FRAME, CLOSE_FRAME, AUTH_FRAME, Buffer.alloc(0)]) {
+      const after = guard.inspect(chunk)
+      // Identity, not just truthiness: a guard that re-derived a verdict from
+      // the LATEST chunk would report `presence_announce` as the reason the
+      // connection died, and the audit trail would name the wrong frame.
+      expect(after.blocked).toBe(blocked)
+      expect(after.forward).toHaveLength(0)
+    }
+  })
+
+  it('observation mode does not latch on a refused RPC frame', () => {
+    // Non-vacuity for the whole block: the latch is what ENFORCEMENT adds. With
+    // `enforce: false` the tunnel stays byte-transparent — every frame is still
+    // classified and reported, and nothing is held back. Without this, "nothing
+    // is forwarded after a block" would also be satisfied by a guard that
+    // forwards nothing at all.
+    const guard = createRealtimeFrameGuard({enforce: false}) as FrameGuard
+    const first = guard.inspect(MUTATE_FRAME)
+    expect(first.blocked).toBeNull()
+    expect(first.frames[0].write).toBe(true) // still classified, still reported
+    expect(first.forward.equals(MUTATE_FRAME)).toBe(true)
+
+    const after = guard.inspect(PRESENCE_FRAME)
+    expect(after.forward.equals(PRESENCE_FRAME)).toBe(true)
+    expect(after.blocked).toBeNull()
+  })
+
+  it.each([
+    ['an unmasked frame', UNMASKED_FRAME],
+    ['an over-large frame declaration', oversizeHeader()],
+  ])('observation mode still latches on %s — framing it cannot parse', (_why, chunk) => {
+    // The one thing observation mode does NOT relax. There is no safe offset at
+    // which to resume reading a stream whose frame boundaries are unknown, so
+    // the reader stops in both modes: it can report what it saw, but it must not
+    // go on claiming to have seen the rest.
+    const guard = createRealtimeFrameGuard({enforce: false}) as FrameGuard
+    expect(guard.inspect(chunk).blocked).not.toBeNull()
+    const after = guard.inspect(PRESENCE_FRAME)
+    expect(after.forward).toHaveLength(0)
+    expect(after.blocked).not.toBeNull()
+  })
+})
+
+/* ------------------------------------------------------------------ *
  * 3. end to end through the proxy
  * ------------------------------------------------------------------ */
 

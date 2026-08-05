@@ -48,3 +48,11 @@ export {buildTouchTree, childKind, segmentKey} from './touch-tree'
 export type {TouchChildKind, TouchTreeChild, TouchTreeNode} from './touch-tree'
 
 export {isKeyedArray, itemKey, keyMap, valueEquals} from './context'
+
+/* PRD §17.11 — overlay-vs-overlay race handling (plan §6 scope boundary). */
+export {compareOverlayHeads} from './overlay-heads'
+export type {
+  OverlayHead,
+  OverlayHeadComparison,
+  OverlayHeadComparisonRequest,
+} from './overlay-heads'

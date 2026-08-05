@@ -36,6 +36,30 @@ export interface SpikeDiagnostics {
   fullDatasetCount: number
   referenceExpansions: number
   durationMs: number
+  // --- latency instrumentation (§36.3 pass criterion 5, §5.4) --------------
+  // Additive only: nothing above changes, and nothing below is consulted by
+  // the planning logic. These make the §22.6 pipeline measurable phase by
+  // phase — plan (steps 1-13) -> base fetch shape (step 5) -> evaluate (14).
+  /** groq-js evaluations performed. §22.6 permits step 5 and step 14 only. */
+  evaluatorInvocations: number
+  /** Documents the simulated server-side filtered base fetch returned (step 5). */
+  baseFetchDocuments: number
+  /** Wall clock inside that simulated base fetch — a network call in production. */
+  baseFetchMs: number
+  /** Candidate selection + reference expansion + ordering, excluding the base fetch. */
+  planMs: number
+  /** Step 14: the original query through groq-js over the candidate set. */
+  evaluateMs: number
+  /** Serialised size of the candidate set. 0 unless `options.measureBytes`. */
+  candidateBytes: number
+}
+
+export interface EvaluateOptions {
+  /**
+   * Serialise the candidate set to measure its size. Off by default because it
+   * costs a full JSON round trip; the latency harness turns it on.
+   */
+  measureBytes?: boolean
 }
 
 export class UnsupportedGroqError extends Error {
@@ -71,8 +95,12 @@ export async function evaluateRegistered<T = unknown>(
   overlay: SpikeOverlay,
   params: Record<string, unknown> = {},
   maxReferenceDepth = 3,
+  options: EvaluateOptions = {},
 ): Promise<{result: T; diagnostics: SpikeDiagnostics}> {
   const started = performance.now()
+  let evaluatorInvocations = 0
+  let baseFetchDocuments = 0
+  let baseFetchMs = 0
   if (def.status === 'unsupported' || def.candidatePlan.type === 'none') {
     throw new UnsupportedGroqError(def.id, 'no finite exact candidate plan is registered')
   }
@@ -91,7 +119,11 @@ export async function evaluateRegistered<T = unknown>(
   } else if (plan.type === 'base-filter') {
     // Server-side filtered fetch (§22.6 step 5). Only the returned documents
     // are candidates: this is what makes the plan bounded rather than a scan.
+    const fetchStarted = performance.now()
     const matched = await runGroq<Array<{_id: string}>>(plan.filter, base, params)
+    baseFetchMs = performance.now() - fetchStarted
+    evaluatorInvocations++
+    baseFetchDocuments = matched.length
     for (const d of matched) add(d._id)
     // Step 6: any branch record of the candidate types can newly match.
     for (const [id, d] of overlay.documents) {
@@ -162,7 +194,14 @@ export async function evaluateRegistered<T = unknown>(
     if (bi !== undefined) return 1
     return (overlayIndex.get(a._id) ?? 0) - (overlayIndex.get(b._id) ?? 0)
   })
+  const planMs = performance.now() - started - baseFetchMs
+  const candidateBytes = options.measureBytes
+    ? dataset.reduce((n, d) => n + JSON.stringify(d).length, 0)
+    : 0
+  const evaluateStarted = performance.now()
   const result = await runGroq<T>(def.query, dataset, params)
+  const evaluateMs = performance.now() - evaluateStarted
+  evaluatorInvocations++
   return {
     result,
     diagnostics: {
@@ -171,6 +210,12 @@ export async function evaluateRegistered<T = unknown>(
       fullDatasetCount: applyOverlay(base, overlay).length,
       referenceExpansions: expansions,
       durationMs: performance.now() - started,
+      evaluatorInvocations,
+      baseFetchDocuments,
+      baseFetchMs,
+      planMs,
+      evaluateMs,
+      candidateBytes,
     },
   }
 }

@@ -79,6 +79,30 @@ export interface EchoDocState {
   synthetic?: boolean
 }
 
+/**
+ * Where the session stands.
+ *
+ * `active` — the normal state; blocked writes may be acknowledged.
+ * `unauthenticated` — a 401/403 was observed. Recoverable: Studio refreshes the
+ *   token and calls {@link EchoProtocol.restoreSession}.
+ * `logged-out` — terminal for this protocol instance. Studio tore the session
+ *   down; a new one arrives with a new page load and a new protocol.
+ */
+export type EchoSessionState = 'active' | 'unauthenticated' | 'logged-out'
+
+export interface EchoAuthFailure {
+  status: number
+  /** Which part of the session's own plumbing reported it. */
+  source: 'listener' | 'read' | 'write'
+  message: string
+}
+
+/** Whether a blocked write may be answered with a synthetic success. */
+export interface EchoWriteAck {
+  ok: boolean
+  error?: {status?: number; message: string}
+}
+
 /** One `/commit` POST the echo layer owes the overlay server. */
 export interface EchoCommit {
   kind: 'actions' | 'mutations' | 'documentActions'
@@ -121,6 +145,28 @@ export interface EchoProtocol {
   planWrite(method: string, arg: unknown, options?: unknown): EchoPlan
   emit(plans: readonly PlannedEvent[], transactionId: string): EchoMutationEvent[]
   contractVersions(): {sanity: string; client: string}
+
+  /* ------------------------------------------------------------ session */
+
+  sessionState(): EchoSessionState
+  /** Record a 401/403 seen anywhere in the session's own plumbing. */
+  noteAuthFailure(failure: {
+    status: number
+    source: EchoAuthFailure['source']
+    message?: string
+  }): void
+  authFailures(): readonly EchoAuthFailure[]
+  /** Studio refreshed the token. No-op once the session is logged out. */
+  restoreSession(): void
+  /** Studio tore the session down: release every pane, deliver nothing more. */
+  logout(): void
+  /**
+   * May a blocked write be answered with the synthetic `{transactionId}` success?
+   *
+   * `false` is the one answer this layer used to be incapable of giving, and it
+   * is the only honest one once the write provably cannot land.
+   */
+  acknowledgeWrite(): EchoWriteAck
 }
 
 /* ------------------------------------------------------------------ *
@@ -161,6 +207,111 @@ function toDraftId(id: string): string {
 }
 
 /* ------------------------------------------------------------------ *
+ * Auth: recognising a 401/403, and the request paths the facade guards
+ * ------------------------------------------------------------------ */
+
+/** The two statuses that end a session. Everything else is transient. */
+const AUTH_STATUSES = new Set([401, 403])
+
+function authStatusIn(candidate: unknown): number | undefined {
+  if (!isRec(candidate)) return undefined
+  for (const key of ['statusCode', 'status'] as const) {
+    const value = candidate[key]
+    if (typeof value === 'number' && AUTH_STATUSES.has(value)) return value
+    if (typeof value === 'string' && /^\d+$/.test(value) && AUTH_STATUSES.has(Number(value))) {
+      return Number(value)
+    }
+  }
+  return undefined
+}
+
+/**
+ * The 401/403 inside whatever the transport threw, or `undefined`.
+ *
+ * @sanity/client 7.26.0 surfaces the status in four places depending on where the
+ * failure happened: `ClientError.statusCode`, the shared `HttpError.response
+ * .statusCode`, the API error body (`details` / `response.body`, shaped
+ * `{error, message, statusCode}`), and a bare `fetch` Response's `status` when
+ * the overlay server is being called directly. All four are checked.
+ *
+ * Deliberately narrow: a false positive stops every subsequent write in the
+ * session, so a 500, a `TypeError: fetch failed`, or the digits "401" inside a
+ * message must all read as *not* an auth failure.
+ */
+export function authStatusOf(error: unknown): number | undefined {
+  if (!isRec(error)) return undefined
+  const candidates: unknown[] = [error, error.response, error.details]
+  if (isRec(error.response)) candidates.push(error.response.body)
+  for (const candidate of candidates) {
+    const status = authStatusIn(candidate)
+    if (status !== undefined) return status
+  }
+  return undefined
+}
+
+/**
+ * Normalise a `client.request({url | uri})` target down to a comparable path.
+ *
+ * Gate E's hardened Spike F found the facade's write guard escapable by a
+ * *leading-slash-less* `request` to `/data/mutate` — a raw substring/regex test
+ * against the caller's spelling. Any guard built on this function inherits one
+ * normalisation instead of re-deriving it, so the whole variant family (absolute
+ * URL, missing or doubled slash, trailing slash, query, fragment, case,
+ * `.`/`..` segments, percent-encoding) collapses to the same string.
+ *
+ * Over-normalising is the safe direction here: a shortened path still matches
+ * the guarded prefixes, so it fails closed.
+ */
+export function requestPath(target: unknown): string {
+  if (typeof target !== 'string') return '/'
+  let value = target.trim()
+
+  /* Absolute URL: drop scheme and authority, keep the path. */
+  const scheme = /^[a-z][a-z0-9+.-]*:\/\//i.exec(value)
+  if (scheme) {
+    const rest = value.slice(scheme[0].length)
+    const slash = rest.indexOf('/')
+    value = slash === -1 ? '' : rest.slice(slash)
+  }
+
+  try {
+    value = decodeURIComponent(value)
+  } catch {
+    /* malformed escape — compare the raw spelling rather than give up */
+  }
+
+  const cut = Math.min(
+    ...[value.indexOf('?'), value.indexOf('#')].map((at) => (at === -1 ? value.length : at)),
+  )
+  value = value.slice(0, cut)
+
+  const segments: string[] = []
+  for (const segment of value.split('/')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..') {
+      segments.pop()
+      continue
+    }
+    segments.push(segment)
+  }
+  return `/${segments.join('/')}`.toLowerCase()
+}
+
+/** `/data/mutate` and `/data/actions` — the write endpoints, at any API version. */
+const MUTATION_PATH_RE = /(^|\/)data\/(mutate|actions)(\/|$)/
+
+/** `/auth/logout` — sanity 6.8.0's own logout call (`WorkspaceLoader`, `logout()`). */
+const LOGOUT_PATH_RE = /(^|\/)auth\/logout(\/|$)/
+
+export function isMutationEndpoint(target: unknown): boolean {
+  return MUTATION_PATH_RE.test(requestPath(target))
+}
+
+export function isLogoutEndpoint(target: unknown): boolean {
+  return LOGOUT_PATH_RE.test(requestPath(target))
+}
+
+/* ------------------------------------------------------------------ *
  * The protocol
  * ------------------------------------------------------------------ */
 
@@ -177,6 +328,78 @@ export function createEchoProtocol(options: EchoProtocolOptions = {}): EchoProto
   const emitted = new Set<string>()
 
   let txCounter = 0
+
+  /* ----------------------------------------------------------- session */
+
+  let session: EchoSessionState = 'active'
+  const authFailureLog: EchoAuthFailure[] = []
+
+  function noteAuthFailure(failure: {
+    status: number
+    source: EchoAuthFailure['source']
+    message?: string
+  }): void {
+    const message = failure.message ?? `HTTP ${failure.status}`
+    authFailureLog.push({status: failure.status, source: failure.source, message})
+    noteError(
+      `auth failure ${failure.status} on the ${failure.source}: ${message} — the session is no ` +
+        `longer authorized, so writes will not be acknowledged until the token is refreshed`,
+    )
+    /* Logout is terminal: a stale in-flight 401 must not downgrade it to a
+     * merely-recoverable state and let a later `restoreSession` resurrect it. */
+    if (session !== 'logged-out') session = 'unauthenticated'
+  }
+
+  function restoreSession(): void {
+    if (session === 'unauthenticated') session = 'active'
+  }
+
+  function logout(): void {
+    if (session === 'logged-out') return
+    session = 'logged-out'
+    /* Criterion 4's rule applied to the whole session: releasing here is what
+     * makes "no further events are delivered" true even for a pane that never
+     * got the chance to unsubscribe itself. */
+    listeners.clear()
+    noteError(
+      'session logged out: every pair-listener subscription is released and no further ' +
+        'write will be acknowledged',
+    )
+  }
+
+  /**
+   * The revision store is deliberately left alone by both transitions.
+   *
+   * An expired token says nothing about what the Content Lake holds, and a
+   * dropped or invented revision would only show up 30 s later as a
+   * `sequentializeListenerEvents` deadline, far from its cause.
+   */
+  function acknowledgeWrite(): EchoWriteAck {
+    if (session === 'logged-out') {
+      return {
+        ok: false,
+        error: {
+          message:
+            'the session is logged out: this write cannot be persisted and must not be ' +
+            'reported to the editor as saved',
+        },
+      }
+    }
+    if (session === 'unauthenticated') {
+      const last = authFailureLog[authFailureLog.length - 1]
+      const status = last?.status
+      return {
+        ok: false,
+        error: {
+          status,
+          message:
+            `the session is not authenticated (HTTP ${status ?? '401/403'}): this write cannot ` +
+            'be persisted and must not be reported to the editor as saved',
+        },
+      }
+    }
+    return {ok: true}
+  }
 
   /* --------------------------------------------------------- revisions */
 
@@ -231,6 +454,9 @@ export function createEchoProtocol(options: EchoProtocolOptions = {}): EchoProto
     ids: readonly string[],
     handler: (event: EchoMutationEvent) => void,
   ): EchoSubscription {
+    /* After logout the session is over: a late subscription (a pane torn down
+     * asynchronously, a retrying listener) must not re-open a delivery channel. */
+    if (session === 'logged-out') return {unsubscribe: () => {}}
     const entry = {ids: new Set(ids), handler}
     listeners.add(entry)
     let released = false
@@ -367,6 +593,10 @@ export function createEchoProtocol(options: EchoProtocolOptions = {}): EchoProto
 
   function emit(plans: readonly PlannedEvent[], transactionId: string): EchoMutationEvent[] {
     if (plans.length === 0) return []
+    /* Checked before `emitted` is touched, so a logged-out emit leaves no trace
+     * at all: neither a delivered frame nor a revision the next session would
+     * have to chain off but no pane ever saw. */
+    if (session === 'logged-out') return []
     /* Rule: one transaction, one delivery. Studio may subscribe to a blocked
      * write's result observable more than once, and a retried commit reuses the
      * id; a second frame would apply the same mutation to HEAD twice and break
@@ -743,6 +973,12 @@ export function createEchoProtocol(options: EchoProtocolOptions = {}): EchoProto
     planWrite,
     emit,
     contractVersions: () => ({...CONTRACT_VERSIONS}),
+    sessionState: () => session,
+    noteAuthFailure,
+    authFailures: () => authFailureLog.map((failure) => ({...failure})),
+    restoreSession,
+    logout,
+    acknowledgeWrite,
   }
 }
 

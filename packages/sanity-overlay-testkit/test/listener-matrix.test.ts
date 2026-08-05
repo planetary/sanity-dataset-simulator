@@ -493,6 +493,63 @@ describe('§21.4.1 criterion 3 — reconnect converges on the current head', () 
     expect(resumed.seen[0]?.previousRev).toBe('tx-committed')
   })
 
+  it('converges on the current head after an auth drop and a token refresh', () => {
+    /* The reconnect Gate A actually cares about: the stream did not just drop,
+     * it 401'd. `spike-a-auth-flows.test.ts` owns what that does to the write
+     * path; what belongs to criterion 3 is that the *listener* still converges
+     * afterwards, and converges on the head — not on a replay. */
+    const protocol = protocolWith()
+    const before = new Pane([PUBLISHED, DRAFT])
+    const connection = connect(protocol, before)
+
+    const committed = protocol.planActions(editAction('Committed before the 401'))
+    protocol.emit(committed.plans, 'tx-before-401')
+
+    protocol.noteAuthFailure({status: 401, source: 'listener'})
+    connection.unsubscribe()
+    expect(protocol.sessionState()).toBe('unauthenticated')
+
+    /* Studio refreshes the token, reopens the pair listener and re-runs the
+     * snapshot fetch. Somebody else published in the meantime. */
+    protocol.restoreSession()
+    const head = {...DRAFT, _rev: 'lake-draft-rev-42', title: 'Moved on while we were away'}
+    protocol.seedFromResult([PUBLISHED, head], true)
+
+    const after = new Pane([PUBLISHED, head])
+    connect(protocol, after)
+    /* The already-committed transaction is re-offered, exactly as a replaying
+     * transport would. It must not become a second frame. */
+    protocol.emit(committed.plans, 'tx-before-401')
+    expect(after.seen).toEqual([])
+
+    protocol.emit(protocol.planActions(editAction('After the refresh')).plans, 'tx-after-401')
+    expect(after.seen).toHaveLength(1)
+    expect(after.seen[0]?.previousRev).toBe('lake-draft-rev-42')
+    expect(after.head('drafts.article-1')).toMatchObject({
+      title: 'After the refresh',
+      _rev: 'tx-after-401',
+    })
+  })
+
+  it('does not reconnect a pane at all once the session is logged out', () => {
+    /* The failure this rules out: Studio tears the session down, some pane's
+     * retry loop reopens a subscription, and the echo layer keeps feeding
+     * synthetic frames into a logged-out editor. */
+    const protocol = protocolWith()
+    connect(protocol, new Pane([PUBLISHED, DRAFT]))
+
+    protocol.logout()
+
+    const reconnected = new Pane([PUBLISHED, DRAFT])
+    connect(protocol, reconnected)
+    protocol.emit(protocol.planActions(editAction('After logout')).plans, 'tx-after-logout')
+
+    expect(protocol.subscriberCount()).toBe(0)
+    expect(reconnected.seen).toEqual([])
+    /* And the head the next session would reconnect to is still the real one. */
+    expect(protocol.revisionOf('drafts.article-1')).toBe(DRAFT._rev)
+  })
+
   it('lets an upstream mutation event reseed the chain without a snapshot fetch', () => {
     const protocol = protocolWith()
     const pane = new Pane([PUBLISHED, DRAFT])

@@ -68,7 +68,10 @@
 // identity-stable proxies, and the HTTP round-trip to the overlay server.
 import type {SanityClient} from '@sanity/client'
 import {
+  authStatusOf,
   createEchoProtocol,
+  isLogoutEndpoint,
+  isMutationEndpoint,
   type EchoMutationEvent,
   type EchoPlan,
   type PlannedEvent,
@@ -303,22 +306,29 @@ function rawJson(arg: unknown): string | undefined {
   }
 }
 
+/**
+ * Returns the entry so a caller that later *refuses* the write can flip
+ * `handled` back to false — a blocked-but-not-acknowledged write is exactly the
+ * `handled: false` case `write-block-validation.md` uses to spot a dead button.
+ */
 function recordBlocked(
   method: string,
   arg0: unknown,
   transactionId: string | undefined,
   handled: boolean,
-): void {
+): EchoBlockedEntry | null {
   const log = echoLog()
-  if (!log) return
-  pushCapped(log.blocked, {
+  if (!log) return null
+  const entry: EchoBlockedEntry = {
     method,
     at: now(),
     summary: summarize(arg0),
     raw: rawJson(arg0),
     transactionId,
     handled,
-  })
+  }
+  pushCapped(log.blocked, entry)
+  return entry
 }
 
 /* --------------------------------------------------------- the protocol */
@@ -722,6 +732,7 @@ async function postCommit(
   idempotencyKey: string,
   baseDocuments: Rec[],
 ): Promise<void> {
+  let authStatus: number | undefined
   try {
     const response = await fetch(`${overlayUrl()}/commit`, {
       method: 'POST',
@@ -744,6 +755,11 @@ async function postCommit(
     } | null
 
     if (!response.ok || result?.ok !== true) {
+      /* A 401/403 is not an outage: this write will never land, and every write
+       * after it in this session is in the same position. It is recorded on the
+       * protocol so `acknowledgeWrite` can stop the synthetic success — see the
+       * `blockedResult` note. */
+      authStatus = authStatusOf({status: response.status})
       throw new Error(result?.error?.message ?? `POST /commit responded ${response.status}`)
     }
 
@@ -761,6 +777,14 @@ async function postCommit(
       console.warn(`[spike-a] overlay did not persist part of this write: ${reasons.join('; ')}`)
     }
   } catch (error) {
+    const status = authStatus ?? authStatusOf(error)
+    if (status !== undefined) {
+      protocol.noteAuthFailure({
+        status,
+        source: 'write',
+        message: `POST /commit ${idempotencyKey} (${kind}) responded ${status}`,
+      })
+    }
     persistFailure(`POST /commit ${idempotencyKey} (${kind}) did not land`, error)
   }
 }
@@ -784,6 +808,10 @@ async function persistPlan(plan: EchoPlan, transactionId: string): Promise<void>
       `${sessionId()}:${transactionId}:${index}`,
       baseDocuments,
     )
+    /* Once the session is unauthenticated the remaining batches of this write
+     * would only collect the same 401. Stopping here also keeps §34.6 replay
+     * honest: the keys that were never posted stay unused. */
+    if (protocol.sessionState() !== 'active') return
   }
 }
 
@@ -802,7 +830,10 @@ const WRITE_METHODS = new Set([
 ])
 const READ_TAP_METHODS = new Set(['getDocument', 'getDocuments'])
 const MUTATING_DATA_ENDPOINTS = new Set(['mutate', 'actions'])
-const WRITE_URL_RE = /\/data\/(mutate|actions)\b/
+/* The raw `/\/data\/(mutate|actions)\b/` this used to test the caller's spelling
+ * with is gone: Gate E's hardened Spike F escaped it with a leading-slash-less
+ * `request({uri: 'data/mutate'})`. `isMutationEndpoint` normalises the path
+ * first, so the whole variant family collapses to one comparison. */
 
 function transactionIdFromOptions(options: unknown): string | undefined {
   if (isRec(options) && typeof options.transactionId === 'string') return options.transactionId
@@ -813,6 +844,27 @@ function syntheticResult(transactionId: string, withDocuments: boolean): Rec {
   return withDocuments
     ? {transactionId, results: [], documentIds: []}
     : {transactionId}
+}
+
+/** An observable that fails immediately — the refusal, in observable form. */
+function observableThrowing<T>(error: unknown): MinimalObservable<T> {
+  return makeObservable<T>((subscriber) => {
+    subscriber.error(error)
+  })
+}
+
+/**
+ * The error a refused write is answered with.
+ *
+ * Shaped like a `@sanity/client` `ClientError` (`statusCode` on the error
+ * object) so Studio's own error handling reads it the way it reads a real one.
+ */
+function writeRefusal(refusal: {status?: number; message: string}): Error {
+  const error = new Error(`[spike-a] write not acknowledged — ${refusal.message}`)
+  if (refusal.status !== undefined) {
+    ;(error as unknown as Rec).statusCode = refusal.status
+  }
+  return error
 }
 
 /**
@@ -826,18 +878,44 @@ function syntheticResult(transactionId: string, withDocuments: boolean): Rec {
  * back, so the order Studio observes is: on disk, then "saved", then the
  * listener frame. Its promise is memoized for the same reason `once` exists —
  * a second subscribe must not become a second POST.
+ *
+ * AND THEN THE PROTOCOL GETS A VETO. `acknowledgeWrite()` is consulted after the
+ * persistence attempt, and when it says no — a 401/403 seen anywhere in this
+ * session, or a logout — the caller gets an *error* instead of a synthetic
+ * success, and `onDelivered` never runs, so no listener frame is emitted and the
+ * revision chain does not advance. A write that cannot be persisted must not
+ * look saved; a pane showing content that exists nowhere is worse than a visible
+ * failure. Note the asymmetry with a 5xx/offline overlay, which still gets the
+ * synthetic success: that degradation is what `SPIKE_OVERLAY_PERSIST` was
+ * designed to survive, and it is transient. An expired token is not.
+ *
+ * The veto is consulted BEFORE the persistence attempt as well as after. An
+ * already-dead session must not POST a write it has decided to disown, or the
+ * edit lands on disk and is reported failed — the mirror image of the bug.
  */
 function blockedResult(
   kind: Kind,
   value: Rec,
   onDelivered: () => void,
   persist?: () => Promise<void>,
+  blockedEntry?: EchoBlockedEntry | null,
 ): unknown {
   let fired = false
   const once = (): void => {
     if (fired) return
     fired = true
     onDelivered()
+  }
+
+  /** null when the write may be acknowledged, otherwise the error to raise. */
+  const refusal = (): Error | null => {
+    const ack = protocol.acknowledgeWrite()
+    if (ack.ok) return null
+    if (blockedEntry) blockedEntry.handled = false
+    const error = writeRefusal(ack.error ?? {message: 'the session cannot accept writes'})
+    noteError(error.message)
+    console.error(error.message)
+    return error
   }
 
   let pending: Promise<void> | null = null
@@ -854,11 +932,25 @@ function blockedResult(
       : (): Promise<void> => (pending ??= persist())
 
   if (kind === 'observable') {
-    if (ready === null) return observableOf(value, once)
+    if (ready === null) {
+      const refused = refusal()
+      if (refused) return observableThrowing<Rec>(refused)
+      return observableOf(value, once)
+    }
     return makeObservable<Rec>((subscriber) => {
+      const refusedUpFront = refusal()
+      if (refusedUpFront) {
+        subscriber.error(refusedUpFront)
+        return
+      }
       let cancelled = false
       void ready().then(() => {
         if (cancelled) return
+        const refused = refusal()
+        if (refused) {
+          subscriber.error(refused)
+          return
+        }
         subscriber.next(value)
         subscriber.complete()
         once()
@@ -870,10 +962,16 @@ function blockedResult(
   }
 
   if (ready === null) {
+    const refused = refusal()
+    if (refused) return Promise.reject(refused)
     once()
     return Promise.resolve(value)
   }
+  const refusedUpFront = refusal()
+  if (refusedUpFront) return Promise.reject(refusedUpFront)
   return ready().then(() => {
+    const refused = refusal()
+    if (refused) throw refused
     once()
     return value
   })
@@ -887,6 +985,24 @@ function blockedResult(
  * Those are precisely the documents the overlay has to replay, so the replay is
  * driven from the request, not from the response.
  */
+/**
+ * Record a 401/403 hiding in whatever the transport threw.
+ *
+ * Only called from the session's own plumbing — the pair listener, its snapshot
+ * fetch, and the `/commit` POST. A 403 from an arbitrary query could be a
+ * dataset ACL rather than a dead token, and over-reporting stops every
+ * subsequent write.
+ */
+function noteAuthFailureFrom(error: unknown, source: 'listener' | 'read' | 'write'): void {
+  const status = authStatusOf(error)
+  if (status === undefined) return
+  protocol.noteAuthFailure({
+    status,
+    source,
+    message: error instanceof Error ? error.message : String(error),
+  })
+}
+
 function tapRead(result: unknown, keepDocuments: boolean, requestedIds: string[] = []): unknown {
   if (!result) return result
   const observed = (value: unknown): void => {
@@ -906,16 +1022,25 @@ function tapRead(result: unknown, keepDocuments: boolean, requestedIds: string[]
           observed(value)
           subscriber.next(value)
         },
-        error: (err) => subscriber.error(err),
+        error: (err) => {
+          if (keepDocuments) noteAuthFailureFrom(err, 'read')
+          subscriber.error(err)
+        },
         complete: () => subscriber.complete(),
       }),
     )
   }
   if (isRec(result) && typeof (result as Rec).then === 'function') {
-    return (result as unknown as Promise<unknown>).then((value) => {
-      observed(value)
-      return value
-    })
+    return (result as unknown as Promise<unknown>).then(
+      (value) => {
+        observed(value)
+        return value
+      },
+      (err: unknown) => {
+        if (keepDocuments) noteAuthFailureFrom(err, 'read')
+        throw err
+      },
+    )
   }
   return result
 }
@@ -976,7 +1101,14 @@ function wrapListen(realListen: (...args: unknown[]) => unknown, self: object) {
           protocol.observeUpstreamEvent(event)
           subscriber.next(event)
         },
-        error: (err) => subscriber.error(err),
+        error: (err) => {
+          /* A 401/403 on the pair stream is the session expiring mid-edit. Note
+           * it — the same token is what a write would use — and then forward it
+           * unchanged: this is a tap, not a filter, and Studio's own listener
+           * error handling must still run. */
+          noteAuthFailureFrom(err, 'listener')
+          subscriber.error(err)
+        },
         complete: () => subscriber.complete(),
       }),
     )
@@ -1011,9 +1143,9 @@ function blockFluentCommit<T extends object>(target: T, label: string, kind: Kin
       const wrapped = (...args: unknown[]): unknown => {
         if (name === 'commit') {
           const transactionId = transactionIdFromOptions(args[0]) ?? nextTransactionId()
-          recordBlocked(`${label}.commit`, args[0], transactionId, false)
+          const entry = recordBlocked(`${label}.commit`, args[0], transactionId, false)
           noteError(`${label}.commit blocked without echo (unsupported write path)`)
-          return blockedResult(kind, syntheticResult(transactionId, true), () => {})
+          return blockedResult(kind, syntheticResult(transactionId, true), () => {}, undefined, entry)
         }
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const result = (value as any).apply(t, args)
@@ -1067,7 +1199,7 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
         wrapped = (...args: unknown[]): unknown => {
           const transactionId = transactionIdFromOptions(args[1]) ?? nextTransactionId()
           const plan = protocol.planActions(args[0])
-          recordBlocked('action', args[0], transactionId, plan.plans.length > 0)
+          const entry = recordBlocked('action', args[0], transactionId, plan.plans.length > 0)
           if (plan.unsupported.length > 0) {
             noteError(`action blocked without echo for: ${plan.unsupported.join(', ')}`)
           }
@@ -1076,6 +1208,7 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
             syntheticResult(transactionId, false),
             () => scheduleEcho(plan.plans, transactionId),
             () => persistPlan(plan, transactionId),
+            entry,
           )
         }
       } else if (name === 'dataRequest') {
@@ -1091,34 +1224,53 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
           const plan = isMutate
             ? protocol.planMutations(body)
             : protocol.planActions(isRec(body) ? body.actions : undefined)
-          recordBlocked(`dataRequest:${endpoint}`, body, transactionId, plan.plans.length > 0)
+          const entry = recordBlocked(
+            `dataRequest:${endpoint}`,
+            body,
+            transactionId,
+            plan.plans.length > 0,
+          )
           return blockedResult(
             kind,
             syntheticResult(transactionId, isMutate),
             () => scheduleEcho(plan.plans, transactionId),
             () => persistPlan(plan, transactionId),
+            entry,
           )
         }
       } else if (name === 'request') {
         wrapped = (...args: unknown[]): unknown => {
           const options = args[0]
-          const url = isRec(options)
-            ? String(options.url ?? options.uri ?? '')
-            : ''
+          const url = isRec(options) ? (options.url ?? options.uri) : undefined
           const method = isRec(options) ? String(options.method ?? 'GET').toUpperCase() : 'GET'
-          const isWrite = WRITE_URL_RE.test(url) && method !== 'GET' && method !== 'HEAD'
+
+          /* Studio's logout is `client.request({uri: '/auth/logout', method:
+           * 'POST'})` on a middleware-stripped clone — sanity 6.8.0,
+           * `WorkspaceLoader-BRx2afZV.js` `logout()`. It is passed straight
+           * through (swallowing it would leave a live token behind) but the
+           * session ends here, synchronously: `Promise.allSettled` means Studio
+           * does not wait for the response, and neither may the pane release. */
+          if (isLogoutEndpoint(url)) {
+            protocol.logout()
+            const log = echoLog()
+            if (log) Object.assign(log.revs, protocol.revisions())
+            return fn.apply(t, args)
+          }
+
+          const isWrite = isMutationEndpoint(url) && method !== 'GET' && method !== 'HEAD'
           if (!isWrite) return fn.apply(t, args)
           const body = isRec(options) ? options.body : undefined
           const transactionId =
             (isRec(body) && typeof body.transactionId === 'string' ? body.transactionId : undefined) ??
             nextTransactionId()
           const plan = protocol.planMutations(body)
-          recordBlocked('request', options, transactionId, plan.plans.length > 0)
+          const entry = recordBlocked('request', options, transactionId, plan.plans.length > 0)
           return blockedResult(
             kind,
             syntheticResult(transactionId, true),
             () => scheduleEcho(plan.plans, transactionId),
             () => persistPlan(plan, transactionId),
+            entry,
           )
         }
       } else if (WRITE_METHODS.has(name)) {
@@ -1129,12 +1281,13 @@ function echoProxy<T extends object>(target: T, kind: Kind): T {
            * duplicate on the wire: Studio's duplicate is
            * `client.create(copy, {tag: 'document.duplicate'})`, not an action. */
           const plan = protocol.planWrite(name, args[0], args[1])
-          recordBlocked(name, args[0], transactionId, plan.plans.length > 0)
+          const entry = recordBlocked(name, args[0], transactionId, plan.plans.length > 0)
           return blockedResult(
             kind,
             syntheticResult(transactionId, true),
             () => scheduleEcho(plan.plans, transactionId),
             () => persistPlan(plan, transactionId),
+            entry,
           )
         }
       } else if (name === 'patch' || name === 'transaction') {

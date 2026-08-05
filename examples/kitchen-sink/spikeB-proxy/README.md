@@ -345,11 +345,13 @@ Concretely, the three observations that decide Track B:
 
 `docs/plans/evidence/phase-1/spike-f-safety-boundary/report.md:64` claims a live smoke run in
 which **seven** request shapes all returned 403. The repository's only server-side proxy
-evidence, `proxy-log.jsonl`, holds **six** blocked rows in total — four `/data/actions/parity`,
-one `/data/mutate/parity`, one `/assets/images/parity` — and **zero** DELETE, PUT or PATCH
-requests of any kind. Three of the seven claimed shapes are non-POST verbs, so that log cannot be
-the log of the run that exercised them. By this project's standing rule (*server-side logs are the
-only trustworthy escape evidence*) the claim is currently **unevidenced**.
+evidence, `proxy-log.jsonl`, holds **14** blocked rows in total — four `/data/actions/parity`,
+four `/descriptors/claim`, four `/intake/batch`, one `/data/mutate/parity`, one
+`/assets/images/parity` — and **zero** DELETE, PUT or PATCH requests of any kind. Three of the
+seven claimed shapes are non-POST verbs, so that log cannot be the log of the run that exercised
+them. Only one of the seven (`/assets/images/parity`) has a blocked row at all. By this project's
+standing rule (*server-side logs are the only trustworthy escape evidence*) the claim is currently
+**unevidenced**.
 
 The classifier half is already pinned: `test/proxy-log-replay.test.ts` asserts all seven shapes
 classify as writes, with a non-vacuity oracle showing five of the seven escape the pre-Spike-F
@@ -410,39 +412,82 @@ The browser-side statuses are **not** the evidence — they are a convenience. T
 log file. (If any `path` in the log differs from the string above, the browser normalised the URL;
 record that as a finding rather than editing the expectation.)
 
-### Step 3 — the exact log lines the run must produce
+### Step 3 — the log-record model the predicates are written against
 
-`proxy-log-reverify.jsonl` must contain **one row per shape**, each with `"blocked": true` and
-`"status": 403`, on these exact `method` + `path` pairs:
+`proxy-log.jsonl` and `proxy-log-reverify.jsonl` are **not** logs of request lines. Since the frame
+guard landed the proxy writes **two record kinds into one stream**, and every predicate below is
+defined over one kind or the other. Read this first or the counts will not mean what they say.
 
-| # | `method` | `path` | `blocked` | `status` |
-|---|---|---|---|---|
-| 1 | `POST` | `/v2025-02-19/assets/images/parity` | `true` | `403` |
-| 2 | `POST` | `/v2025-02-19/agent/action/patch/parity` | `true` | `403` |
-| 3 | `DELETE` | `/v2025-02-19/datasets/parity` | `true` | `403` |
-| 4 | `POST` | `/v2025-02-19/projects/b1n03q3z/datasets/parity/mutate` | `true` | `403` |
-| 5 | `POST` | `/v2025-02-19//data//mutate//parity` | `true` | `403` |
-| 6 | `POST` | `/v2025-02-19/DATA/MUTATE/parity` | `true` | `403` |
-| 7 | `POST` | `/v2025-02-19/data/..%2Fmutate/parity` | `true` | `403` |
+| kind | discriminator | `method` | fields written (exhaustive) |
+|---|---|---|---|
+| **request** | `"frame"` absent | a real HTTP method | `at`, `method`, `path`, `status`, `ms`, `blocked`, and `upgrade` only on an upgrade |
+| **frame** | `"frame":true` | always `"WS"` | the above plus `opcode`, `rpc`, `rpcId`, `wouldBlock`, `reason` |
 
-and **two liveness rows**, which must be `"blocked": false` and `2xx`:
+Three consequences that will bite a naive grep:
 
-| # | `method` | `path` | `blocked` | `status` |
-|---|---|---|---|---|
-| 8 | `GET` | `/v2025-02-19/ping` | `false` | `200` |
-| 9 | `GET` | `/v2025-02-19/data/query/parity` | `false` | `200` |
+- `"status":101` matches **both** an accepted upgrade and every non-refused frame on it. In
+  `proxy-log.jsonl` that is 4 upgrades and 61 frames = 65 hits, so `grep -c '"status":101'` does
+  **not** count sockets.
+- `"blocked":true` matches a refused frame (`"status":1008`) as well as a refused request
+  (`"status":403`). Always pair `blocked` with `status`.
+- `"method":"WS"` is a pseudo-method. Never feed a frame record to anything that classifies request
+  lines — `WS` is on no read allowlist, so a default-deny guard calls it a write and the Studio's
+  own listener socket is reported as newly blocked. `test/proxy-log-replay.test.ts`
+  (`frames and request lines are different kinds of record`) pins this.
+- `path` is the **pathname only** — the query string is stripped before logging. Match
+  `/v2025-02-19/data/query/parity`, never `…/parity?query=…`.
 
-Additional `OPTIONS` preflight rows (`status: 204`, `blocked: false`) are expected for the
-cross-origin probes and are not part of the checklist. Any other row with `blocked: false` on one
-of the seven paths is a **failure of the claim**, whatever the browser reported.
+`path` is logged **raw**: no dot-segment resolution, no case folding, no slash collapsing. Shapes
+5–7 below must appear byte-for-byte as sent.
 
-### Step 4 — mechanical check, then commit the log
+### Step 4 — the predicates the run must satisfy
+
+Every predicate is a mechanical test over `proxy-log-reverify.jsonl`. `R` = the records with
+`"frame"` absent; `F` = the records with `"frame":true`. `SHAPES` is the seven
+`method`+`path` pairs in the table. A predicate that cannot be evaluated counts as **FAIL**.
+
+| id | predicate | exact values to match |
+|---|---|---|
+| **P0** | `proxy-log-reverify.jsonl` exists and is non-empty; every line parses as JSON | — |
+| **P1** | `git status --porcelain examples/kitchen-sink/spikeB-proxy/proxy-log.jsonl` prints **nothing**, and that file still has exactly **730** lines — the committed session was not appended to or overwritten | line count `730` |
+| **P2** | every record in `R` has `method` ∈ the HTTP set; every record in `F` has `"method":"WS"` and `"upgrade":true` | `GET HEAD POST PUT PATCH DELETE OPTIONS TRACE CONNECT` |
+| **P3** | for each of the 7 `SHAPES`: **at least one** record in `R` with that exact `method` **and** that exact `path` **and** `"blocked":true` **and** `"status":403` | `"blocked":true,"status":403` |
+| **P4** | for each of the 7 `SHAPES`: **zero** records in `R` with that exact `method`+`path` and `"blocked"` anything other than `true` | any `"blocked":false` on a shape = **FAIL** |
+| **P5** | at least one record in `R` with `"method":"DELETE"` — the verb the committed log has never contained, and the single strongest signal that this is a new run | `"method":"DELETE"` |
+| **P6** | at least one record in `R` with `"method":"OPTIONS"`, `"path":"/v2025-02-19/datasets/parity"`, `"status":204`, `"blocked":false` — a cross-origin `DELETE` is never a simple request, so its preflight proves the probe came from the browser and not from a shell | `"method":"OPTIONS"` + `"status":204` |
+| **P7** | at least one record in `R` with `"method":"GET"`, `"path":"/v2025-02-19/ping"`, `"status":200`, `"blocked":false` | `"path":"/v2025-02-19/ping"` |
+| **P8** | at least one record in `R` with `"method":"GET"`, `"path":"/v2025-02-19/data/query/parity"`, `"status":200`, `"blocked":false` | `"path":"/v2025-02-19/data/query/parity"` |
+| **P9** | `grep -c 'Bearer' proxy-log-reverify.jsonl` is `0` **and** `grep -c '"params"' proxy-log-reverify.jsonl` is `0` — no frame payload or credential was ever written | `Bearer`, `"params"` |
+| **P10** | every record in `F` has a non-empty `"reason"` string — a frame the guard forwarded without classifying would have none | `"reason":"…"` |
+
+P7 and P8 together are the **liveness control**: seven 403s from a proxy that 403s everything prove
+nothing. P4 is the **leak control**. P5 and P6 are the **freshness controls** — they are what
+`proxy-log.jsonl` cannot satisfy, and therefore what stops an old log being offered in place of the
+run.
+
+The seven shapes, verbatim:
+
+| # | `method` | `path` |
+|---|---|---|
+| 1 | `POST` | `/v2025-02-19/assets/images/parity` |
+| 2 | `POST` | `/v2025-02-19/agent/action/patch/parity` |
+| 3 | `DELETE` | `/v2025-02-19/datasets/parity` |
+| 4 | `POST` | `/v2025-02-19/projects/b1n03q3z/datasets/parity/mutate` |
+| 5 | `POST` | `/v2025-02-19//data//mutate//parity` |
+| 6 | `POST` | `/v2025-02-19/DATA/MUTATE/parity` |
+| 7 | `POST` | `/v2025-02-19/data/..%2Fmutate/parity` |
+
+`OPTIONS` preflight rows on shape paths other than #3 are expected and are ignored by P3/P4, which
+match on `method`+`path` together. If any `path` in the log differs from the string above, the
+browser normalised the URL: record that as a finding, do **not** edit the expectation.
+
+### Step 5 — run the predicates
 
 ```bash
 node -e '
-const fs=require("node:fs");
-const rows=fs.readFileSync("examples/kitchen-sink/spikeB-proxy/proxy-log-reverify.jsonl","utf8")
-  .split("\n").filter(Boolean).map(JSON.parse);
+const fs=require("node:fs"), cp=require("node:child_process");
+const LOG="examples/kitchen-sink/spikeB-proxy/proxy-log-reverify.jsonl";
+const HTTP=new Set(["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS","TRACE","CONNECT"]);
 const SHAPES=[
   ["POST","/v2025-02-19/assets/images/parity"],
   ["POST","/v2025-02-19/agent/action/patch/parity"],
@@ -453,26 +498,61 @@ const SHAPES=[
   ["POST","/v2025-02-19/data/..%2Fmutate/parity"],
 ];
 let ok=true;
+const P=(id,pass,note="")=>{ if(!pass) ok=false; console.log((pass?"PASS":"FAIL"),id,note); };
+
+const raw=fs.existsSync(LOG)?fs.readFileSync(LOG,"utf8"):"";
+const lines=raw.split("\n").filter(l=>l.trim());
+let recs=null; try{ recs=lines.map(l=>JSON.parse(l)); }catch(e){}
+P("P0", recs!==null && recs.length>0, `${lines.length} lines`);
+// Stop here on an empty or unparseable log: P2/P4/P9/P10 are all satisfied
+// vacuously by zero records, and a vacuous PASS is the failure mode this whole
+// checklist exists to prevent.
+if(recs===null || recs.length===0){ console.log("\nCLAIM NOT SUBSTANTIATED"); process.exit(1); }
+
+const COMMITTED="examples/kitchen-sink/spikeB-proxy/proxy-log.jsonl";
+const dirty=cp.execSync("git status --porcelain "+COMMITTED).toString().trim();
+const kept=fs.readFileSync(COMMITTED,"utf8").split("\n").filter(l=>l.trim()).length;
+P("P1", dirty==="" && kept===730, dirty||`proxy-log.jsonl unmodified, ${kept} lines`);
+
+const R=recs.filter(r=>r.frame!==true), F=recs.filter(r=>r.frame===true);
+P("P2", R.every(r=>HTTP.has(r.method)) && F.every(r=>r.method==="WS"&&r.upgrade===true),
+  `${R.length} request records, ${F.length} frame records`);
+
 for(const [m,p] of SHAPES){
-  const hit=rows.find(r=>r.method===m&&r.path===p&&r.blocked===true&&r.status===403);
-  const leak=rows.find(r=>r.method===m&&r.path===p&&r.blocked!==true);
-  console.log((hit&&!leak?"PASS":"FAIL"),m,p);
-  if(!hit||leak) ok=false;
+  const hit=R.some(r=>r.method===m&&r.path===p&&r.blocked===true&&r.status===403);
+  P("P3", hit, `${m} ${p}`);
 }
-const live=rows.filter(r=>r.blocked===false&&r.status>=200&&r.status<300&&r.method==="GET");
-console.log(live.length?"PASS liveness":"FAIL liveness — no allowlisted read succeeded");
-if(!live.length) ok=false;
+for(const [m,p] of SHAPES){
+  const leak=R.filter(r=>r.method===m&&r.path===p&&r.blocked!==true);
+  P("P4", leak.length===0, `${m} ${p}` + (leak.length?` LEAKED status=${leak.map(r=>r.status).join(",")}`:""));
+}
+P("P5", R.some(r=>r.method==="DELETE"));
+P("P6", R.some(r=>r.method==="OPTIONS"&&r.path==="/v2025-02-19/datasets/parity"&&r.status===204&&r.blocked===false));
+P("P7", R.some(r=>r.method==="GET"&&r.path==="/v2025-02-19/ping"&&r.status===200&&r.blocked===false));
+P("P8", R.some(r=>r.method==="GET"&&r.path==="/v2025-02-19/data/query/parity"&&r.status===200&&r.blocked===false));
+P("P9", !/Bearer/.test(raw) && !/"params"/.test(raw));
+P("P10", F.every(r=>typeof r.reason==="string"&&r.reason.length>0), `${F.length} frame records`);
+
+console.log(ok?"\nALL PREDICATES PASS":"\nCLAIM NOT SUBSTANTIATED");
 process.exit(ok?0:1);
 '
 ```
 
-Then `git add examples/kitchen-sink/spikeB-proxy/proxy-log-reverify.jsonl` and commit it. Adding
-that file makes `test/proxy-log-replay.test.ts` go **red** on its pinned
+Run it from the repository root. Exit code 0 is the whole gate; every `FAIL` line names the
+predicate and the offending shape.
+
+### Step 6 — commit the log, then let the suite grade it
+
+`git add examples/kitchen-sink/spikeB-proxy/proxy-log-reverify.jsonl` and commit it. Adding that
+file makes `test/proxy-log-replay.test.ts` go **red** on its pinned
 `the live re-verification has not happened yet` assertion — that is deliberate. Flipping that
-literal to `true` is what switches the same suite from recording the claim as unevidenced to
-asserting all seven rows, so the claim cannot become "verified" without the evidence landing in
-the same commit. Finally, update `spike-f-safety-boundary/report.md:64` to cite the new file and
-its line numbers instead of asserting the run from memory.
+literal to `true` switches the same suite from recording the claim as unevidenced to grading the
+new log through `gradeReverifyLog`, which applies the same rule as P3/P4/P7/P8 above. The two
+cannot drift: the grader is tested against synthetic logs *and* against `proxy-log.jsonl`, which
+must fail on six of seven shapes.
+
+Finally, update `spike-f-safety-boundary/report.md:64` to cite the new file and its line numbers
+instead of asserting the run from memory.
 
 ## Verification already performed (no browser, curl + Node `fetch`)
 

@@ -166,10 +166,16 @@ describe('§35.2 core merge unit tests', () => {
     expect(conflict?.documentId).toBe('article-1')
   })
 
-  it('Local value equal to current base removes redundant override (§17.3 step 5 collapse)', () => {
+  it('Local value equal to current base does NOT collapse at merge time; the §35.2 case is on rebase — see core-w3-rebase.test.ts "step 3 — removes obsolete touched paths whose local value now equals base"', () => {
     // Local moved the value to X; base has since moved to X too, and the ancestor
     // still holds the old value. §17.3 step 5 fires only for local == ancestor,
     // so this case must *not* collapse but must also record no conflict.
+    //
+    // The §35.2 line "Local value equal to current base removes redundant
+    // override **on rebase**" is proved in `core-w3-rebase.test.ts` (§28.5 step 3)
+    // plus the generative property beside it. This test is the *negative* half —
+    // it exists to stop the collapse leaking into merge — so its name says so,
+    // rather than reading like the §35.2 case it is not (acceptance audit F-04).
     const currentBase = variant(ANCESTOR_ARTICLE, (document) => {
       document.title = 'Converged title'
     })

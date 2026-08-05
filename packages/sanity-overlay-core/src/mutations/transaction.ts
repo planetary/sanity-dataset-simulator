@@ -18,14 +18,17 @@
  *   participates in deduplication (§13.10).
  */
 import {checksum} from '../checksum'
+import {overlayConflictSummary} from '../conflicts/persist'
 import {OverlayMutationError} from '../errors'
 import type {OverlayActor} from '../types/actor'
+import type {OverlayConflict} from '../types/conflict'
 import {OVERLAY_FORMAT_VERSION} from '../types/format-version'
 import type {OverlayMutation} from '../types/operations'
 import type {OverlayTransactionRecord} from '../types/transaction'
+import {persistTransactionConflicts} from './conflicts'
 import {applyMutation, mutationTargetId, validateMutation, type MutationContext} from './mutation'
 import type {BaseDocumentSource, MergeResolver, StrongReferenceCheck} from './ports'
-import type {OverlayState} from './state'
+import {getRecord, type OverlayState} from './state'
 
 export interface TransactionOptions {
   /** Server-assigned, lexicographically ordered by commit time (PRD §13.10). */
@@ -47,6 +50,46 @@ export interface TransactionCommit {
   transaction: OverlayTransactionRecord
   /** True when the result was replayed from the idempotency ledger (PRD §34.6). */
   replayed: boolean
+  /**
+   * The conflicts this commit surfaced on the documents it touched — PRD §17.11
+   * "the conflict is first surfaced to the writing client at commit time". They
+   * are also persisted on the §13.3 records in {@link TransactionCommit.state},
+   * for as long as they remain unresolved.
+   *
+   * Empty when the transaction carried no base view: core never fetches base
+   * (§16.1), and an absent base source is not evidence of a deleted base.
+   */
+  conflicts: OverlayConflict[]
+  /**
+   * The overlay-wide §13.1 `conflictSummary` after this commit, counting
+   * unresolved conflicts across every document — the same value a store adapter
+   * writes into the manifest.
+   */
+  conflictSummary: {total: number; hard: number; soft: number}
+}
+
+/** The §13.3 conflicts a replayed transaction's documents are currently carrying. */
+function persistedConflicts(
+  state: OverlayState,
+  affectedDocumentIds: readonly string[],
+): OverlayConflict[] {
+  const conflicts: OverlayConflict[] = []
+  for (const logicalId of affectedDocumentIds) {
+    const record = getRecord(state, logicalId)
+    if (record !== null) conflicts.push(...record.conflicts)
+  }
+  return conflicts
+}
+
+/** The `ResolveContext` the post-commit §17.4 detection sweep runs under. */
+function detectionContext(options: TransactionOptions): {
+  base?: BaseDocumentSource
+  merge?: MergeResolver
+} {
+  return {
+    ...(options.base === undefined ? {} : {base: options.base}),
+    ...(options.merge === undefined ? {} : {merge: options.merge}),
+  }
 }
 
 /** Look up a previously committed transaction by idempotency key (PRD §34.6). */
@@ -84,7 +127,15 @@ export function applyTransaction(
   /* §34.6 — one idempotency key maps to one immutable transaction result. The
      stored record is returned unchanged and nothing is reapplied. */
   const replayed = findByIdempotencyKey(state, options.idempotencyKey)
-  if (replayed !== null) return {state, transaction: replayed, replayed: true}
+  if (replayed !== null) {
+    return {
+      state,
+      transaction: replayed,
+      replayed: true,
+      conflicts: persistedConflicts(state, replayed.affectedDocumentIds),
+      conflictSummary: overlayConflictSummary(state),
+    }
+  }
 
   if (!Array.isArray(mutations) || mutations.length === 0) {
     throw new OverlayMutationError(
@@ -130,7 +181,12 @@ export function applyTransaction(
     }
   }
 
-  /* Phase 3 — commit: exactly one revision increment (§34.5). */
+  /* Phase 3 — §17.11 detection at commit time, before the checksums are taken,
+     so a record's stored digest covers the conflicts it now carries (§34.4). */
+  const detected = persistTransactionConflicts(working, affected, detectionContext(options))
+  working = detected.state
+
+  /* Phase 4 — commit: exactly one revision increment (§34.5). */
   const committedAt = options.now()
   const resultChecksums: Record<string, string> = {}
   for (const id of affected) {
@@ -154,15 +210,19 @@ export function applyTransaction(
     ...(options.requestId === undefined ? {} : {requestId: options.requestId}),
   }
 
+  const committed: OverlayState = {
+    ...working,
+    revision: overlayRevisionAfter,
+    transactions: [...state.transactions, transaction],
+    idempotencyLedger: {...state.idempotencyLedger, [options.idempotencyKey]: transaction},
+  }
+
   return {
-    state: {
-      ...working,
-      revision: overlayRevisionAfter,
-      transactions: [...state.transactions, transaction],
-      idempotencyLedger: {...state.idempotencyLedger, [options.idempotencyKey]: transaction},
-    },
+    state: committed,
     transaction,
     replayed: false,
+    conflicts: detected.conflicts,
+    conflictSummary: overlayConflictSummary(committed),
   }
 }
 
@@ -184,7 +244,15 @@ export function commitTransform(
   },
 ): TransactionCommit {
   const replayed = findByIdempotencyKey(state, options.idempotencyKey)
-  if (replayed !== null) return {state, transaction: replayed, replayed: true}
+  if (replayed !== null) {
+    return {
+      state,
+      transaction: replayed,
+      replayed: true,
+      conflicts: persistedConflicts(state, replayed.affectedDocumentIds),
+      conflictSummary: overlayConflictSummary(state),
+    }
+  }
 
   const requestedAt = options.now()
   const overlayRevisionBefore = state.revision
@@ -207,7 +275,15 @@ export function commitTransform(
       : {checkStrongReferences: options.checkStrongReferences}),
   }
 
-  const {state: working, affectedDocumentIds} = transform(state, context)
+  const {state: transformed, affectedDocumentIds} = transform(state, context)
+
+  /* §17.11 detection at commit time, before the checksums are taken (§34.4). */
+  const detected = persistTransactionConflicts(
+    transformed,
+    affectedDocumentIds,
+    detectionContext(options),
+  )
+  const working = detected.state
 
   const committedAt = options.now()
   const resultChecksums: Record<string, string> = {}
@@ -232,14 +308,18 @@ export function commitTransform(
     ...(options.requestId === undefined ? {} : {requestId: options.requestId}),
   }
 
+  const committed: OverlayState = {
+    ...working,
+    revision: overlayRevisionAfter,
+    transactions: [...state.transactions, transaction],
+    idempotencyLedger: {...state.idempotencyLedger, [options.idempotencyKey]: transaction},
+  }
+
   return {
-    state: {
-      ...working,
-      revision: overlayRevisionAfter,
-      transactions: [...state.transactions, transaction],
-      idempotencyLedger: {...state.idempotencyLedger, [options.idempotencyKey]: transaction},
-    },
+    state: committed,
     transaction,
     replayed: false,
+    conflicts: detected.conflicts,
+    conflictSummary: overlayConflictSummary(committed),
   }
 }

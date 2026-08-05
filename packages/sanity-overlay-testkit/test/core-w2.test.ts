@@ -12,6 +12,7 @@ import {
   applyTransaction,
   createBaseSource,
   createOverlayState,
+  createStrongReferenceCheck,
   deleteDocument,
   discardDraft,
   documentExists,
@@ -948,6 +949,124 @@ describe('PRD §35.5 draft and action tests', () => {
     ]
     const ok = publish(edited.state, {id: 'article-1'}, actionOptions({checkStrongReferences: weak}))
     expect(ok.state.documents['article-1']!.local.published).not.toBeNull()
+  })
+
+  it('§35.5 "Publish blocks on strong reference to draft-only target." composed with the real W4 engine', () => {
+    // Acceptance-audit F-02: the case above proves `publish` reacts to the *port*.
+    // This one proves the reference engine actually produces that verdict, with no
+    // hand-written issue list anywhere in the path.
+    const withDraftOnlyTarget = applyTransaction(
+      emptyState(),
+      [
+        {
+          type: 'create',
+          document: {_id: 'drafts.author-draft-only', _type: 'author', name: 'Draft only'},
+        },
+      ],
+      tx({base}),
+    ).state
+
+    const edited = edit(
+      withDraftOnlyTarget,
+      {
+        id: 'article-1',
+        operations: [
+          {type: 'set', path: ['author'], value: {_type: 'reference', _ref: 'author-draft-only'}},
+        ],
+      },
+      actionOptions(),
+    ).state
+
+    let thrown: unknown
+    try {
+      publish(
+        edited,
+        {id: 'article-1'},
+        actionOptions({checkStrongReferences: createStrongReferenceCheck(edited, {base})}),
+      )
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(OverlayActionBlockedError)
+    expect((thrown as OverlayActionBlockedError).reason).toBe('strong-reference-invalid')
+    expect((thrown as OverlayActionBlockedError).details).toMatchObject({
+      documentId: 'article-1',
+      references: [
+        {
+          referringDocumentId: 'article-1',
+          path: ['author'],
+          targetId: 'author-draft-only',
+          strength: 'strong',
+          reason: 'target-draft-only',
+        },
+      ],
+    })
+
+    // §19.5 — the same target behind a weak reference does not block.
+    const weakened = edit(
+      withDraftOnlyTarget,
+      {
+        id: 'article-1',
+        operations: [
+          {
+            type: 'set',
+            path: ['author'],
+            value: {_type: 'reference', _ref: 'author-draft-only', _weak: true},
+          },
+        ],
+      },
+      actionOptions(),
+    ).state
+    const ok = publish(
+      weakened,
+      {id: 'article-1'},
+      actionOptions({checkStrongReferences: createStrongReferenceCheck(weakened, {base})}),
+    )
+    expect(ok.state.documents['article-1']!.local.published).not.toBeNull()
+  })
+
+  it('§35.5 "Unpublish reports affected strong references." composed with the real W4 engine', () => {
+    // Acceptance-audit F-02, the reporting half: a real referrer, found by the real
+    // reverse scan, reported through `unpublish` without blocking it.
+    const edited = edit(
+      emptyState(),
+      {id: 'article-1', operations: [{type: 'set', path: ['title'], value: 'Live'}]},
+      actionOptions(),
+    ).state
+    const published = publish(edited, {id: 'article-1'}, actionOptions()).state
+    const referring = applyTransaction(
+      published,
+      [
+        {
+          type: 'create',
+          document: {
+            _id: 'drafts.page-9',
+            _type: 'page',
+            featured: {_type: 'reference', _ref: 'article-1'},
+          },
+        },
+      ],
+      tx({base}),
+    ).state
+
+    const result = unpublish(
+      referring,
+      {id: 'article-1'},
+      actionOptions({checkStrongReferences: createStrongReferenceCheck(referring, {base})}),
+    )
+
+    expect(result.affectedStrongReferences).toEqual([
+      {
+        referringDocumentId: 'page-9',
+        path: ['featured'],
+        targetId: 'article-1',
+        strength: 'strong',
+        reason: 'target-unpublished',
+      },
+    ])
+    // §18.6 reports; only publish and delete block.
+    expect(result.state.documents['article-1']!.local.publishedTombstone).toBe(true)
   })
 
   it('§35.5 "Unpublish reports affected strong references." without blocking (PRD §18.6)', () => {

@@ -18,14 +18,16 @@ import {toPublishedId} from '../encoding'
 import {OverlayActionBlockedError, OverlayMutationError} from '../errors'
 import type {SanityDocument} from '../types/document'
 import type {OverlayMutation, OverlayOperation} from '../types/operations'
+import type {OverlayPath} from '../types/path'
 import type {OverlayDocumentRecord} from '../types/record'
+import {changedPaths} from '../merge/invariants'
 import {
   applyMutation,
   blockingStrongReferences,
   ensureRecord,
   type MutationContext,
 } from '../mutations/mutation'
-import {deepClone} from '../mutations/paths'
+import {deepClone, mergeTouchedPaths} from '../mutations/paths'
 import {
   noopValidator,
   type DocumentValidator,
@@ -90,6 +92,36 @@ function requireRecord(
   context: MutationContext,
 ): OverlayDocumentRecord {
   return ensureRecord(state, logicalId, context)
+}
+
+/**
+ * The touched paths that carry a promotion's intent (PRD §13.5, §17.2 rule 4).
+ *
+ * `publish` and `unpublish` do not apply operations — they move an already
+ * *resolved* document into the other local version — so nothing records what the
+ * branch decided. Without a record, §17.2 rule 4 is right to conclude the branch
+ * owns nothing here, and the next read resolves straight back to current base:
+ * the action becomes invisible.
+ *
+ * The intent is exactly where the promoted document disagrees with the base
+ * version it now stands in front of. Paths where the two already agree stay
+ * untouched, so genuine upstream changes keep flowing in (invariant §34.12) and
+ * only the promoted values are pinned (invariant §34.13). Synthetic system fields
+ * (§13.9) are never intent — they are recomputed on every write.
+ */
+function promotionTouchedPaths(
+  promoted: SanityDocument,
+  currentBase: SanityDocument | null,
+): OverlayPath[] {
+  if (currentBase === null) {
+    // Nothing upstream to inherit from: the whole promoted body is branch intent.
+    return Object.keys(promoted)
+      .filter((key) => !key.startsWith('_'))
+      .map((key) => [key])
+  }
+  return changedPaths(currentBase, promoted).filter(
+    (path) => path.length > 0 && !(typeof path[0] === 'string' && path[0].startsWith('_')),
+  )
 }
 
 function assertLiveEditDisabled(options: ActionOptions, action: string): void {
@@ -222,7 +254,15 @@ export function publish(
 
     const published = createLocalVersion({
       materialized,
-      touchedPaths: deepClone(draft?.touchedPaths ?? record.local.published?.touchedPaths ?? []),
+      // §18.5 promotes a resolved document, so the promotion itself is recorded
+      // as touched intent alongside whatever the draft already carried.
+      touchedPaths: mergeTouchedPaths(
+        deepClone(draft?.touchedPaths ?? record.local.published?.touchedPaths ?? []),
+        promotionTouchedPaths(
+          materialized,
+          context.base?.getPublished(logicalId)?.document ?? null,
+        ),
+      ),
       operations: deepClone(draft?.operations ?? record.local.published?.operations ?? []),
       ancestorKind: draft?.ancestorKind ?? record.local.published?.ancestorKind ?? 'base-published',
       ...(draft?.ancestorRevision === undefined
@@ -304,8 +344,16 @@ export function unpublish(
 
     const draft = createLocalVersion({
       materialized,
-      touchedPaths: deepClone(
-        existingDraft?.touchedPaths ?? record.local.published?.touchedPaths ?? [],
+      // §18.6 moves the resolved published document into the draft; the draft's
+      // current base is the §18.2 chain's draft-then-published fallback.
+      touchedPaths: mergeTouchedPaths(
+        deepClone(existingDraft?.touchedPaths ?? record.local.published?.touchedPaths ?? []),
+        promotionTouchedPaths(
+          materialized,
+          context.base?.getDraft(logicalId)?.document ??
+            context.base?.getPublished(logicalId)?.document ??
+            null,
+        ),
       ),
       operations: deepClone(existingDraft?.operations ?? record.local.published?.operations ?? []),
       ancestorKind:

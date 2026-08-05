@@ -10,6 +10,14 @@
 export {conflictId, createConflict, hasHardConflict, summarizeConflicts} from './create'
 export type {CreateConflictInput} from './create'
 
+/* Persistence onto the §13.3 record and the §13.1 summary (§17.11, §28.6). */
+export {
+  describesSameDisagreement,
+  overlayConflictSummary,
+  persistConflicts,
+  unresolvedConflicts,
+} from './persist'
+
 export {
   CONFLICT_RESOLUTION_ACTIONS,
   CONFLICT_RESOLUTION_ACTION_TYPES,

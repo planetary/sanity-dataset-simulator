@@ -49,7 +49,12 @@ import {classifyRequest, isWriteRequest} from '../../../examples/kitchen-sink/sp
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const LOG_PATH = path.resolve(HERE, '../../../examples/kitchen-sink/spikeB-proxy/proxy-log.jsonl')
 
-interface LogRow {
+/**
+ * One line of `proxy-log.jsonl` as it comes off the disk — untyped by kind,
+ * because that is the state the file is in: the proxy writes two different
+ * record types into one stream.
+ */
+interface RawLogLine {
   at: string
   method: string
   path: string
@@ -57,15 +62,6 @@ interface LogRow {
   ms: number
   blocked: boolean
   upgrade?: boolean
-  /* --- websocket frame-audit rows (F5b) ---------------------------------- *
-   * Since the frame guard landed, the proxy also writes ONE ROW PER CLIENT
-   * FRAME on an upgraded socket. Those rows carry `frame: true` and the
-   * pseudo-method `WS`, because a frame has no HTTP request line. They are NOT
-   * requests and must never be fed to `classifyRequest` — `WS` is not an HTTP
-   * method, so default-deny classifies it a write and the replay harness would
-   * report the Studio's own listener socket as "newly blocked". Keeping the two
-   * populations separate is what stops that false positive.
-   */
   frame?: boolean
   opcode?: number
   rpc?: string | null
@@ -73,6 +69,54 @@ interface LogRow {
   wouldBlock?: boolean
   reason?: string
 }
+
+/** Everything both record types carry. */
+interface LogRecordBase {
+  at: string
+  path: string
+  status: number
+  ms: number
+  blocked: boolean
+  upgrade?: boolean
+}
+
+/**
+ * An HTTP request line. This — and only this — is what `classifyRequest` may be
+ * asked about, because it is the only record type that HAS a request line.
+ */
+interface RequestRecord extends LogRecordBase {
+  kind: 'request'
+  method: string
+}
+
+/**
+ * One client frame on an upgraded socket (F5b). `proxy.mjs:736` writes the
+ * pseudo-method `WS` here because a frame has no request line at all.
+ *
+ * THIS IS NOT A REQUEST, and the distinction is load-bearing rather than
+ * cosmetic. The guard is default-deny: `WS` matches no read method, so
+ * `classifyRequest({method: 'WS', ...})` returns `write: true`. Frame rows carry
+ * status 101, which the replay harness reads as "the live session completed
+ * this" — so a frame record that leaks into the request population makes the
+ * harness report the Studio's own listener socket as newly blocked by the guard.
+ *
+ * The tag below is the fix. Not a `method === 'WS'` special case anywhere
+ * downstream, and emphatically not `WS` on the guard's read allowlist: a real
+ * request line spelling `WS` would then be waved through. One kind, decided
+ * once, at the parse boundary.
+ */
+interface FrameRecord extends LogRecordBase {
+  kind: 'frame'
+  method: 'WS'
+  frame: true
+  opcode?: number
+  rpc?: string | null
+  rpcId?: string | null
+  wouldBlock?: boolean
+  reason?: string
+}
+
+type LogRecord = RequestRecord | FrameRecord
 
 /** One distinct `method + path` pair, with everything the session observed about it. */
 interface RequestLine {
@@ -87,15 +131,20 @@ interface RequestLine {
   everSucceeded: boolean
 }
 
-function readLog(): LogRow[] {
-  const raw = fs.readFileSync(LOG_PATH, 'utf8')
+function readRawLog(logPath: string): RawLogLine[] {
+  const raw = fs.readFileSync(logPath, 'utf8')
   return raw
     .split('\n')
     .filter((line) => line.trim().length > 0)
-    .map((line) => JSON.parse(line) as LogRow)
+    .map((line) => JSON.parse(line) as RawLogLine)
 }
 
-function distinctRequestLines(rows: LogRow[]): RequestLine[] {
+/** The only door into this suite: every raw line is tagged here or refused here. */
+function readLog(logPath: string = LOG_PATH): LogRecord[] {
+  return readRawLog(logPath).map(toLogRecord)
+}
+
+function distinctRequestLines(rows: RequestRecord[]): RequestLine[] {
   const byKey = new Map<string, RequestLine>()
   for (const row of rows) {
     const key = `${row.method} ${row.path}`
@@ -122,11 +171,56 @@ function distinctRequestLines(rows: LogRow[]): RequestLine[] {
   return [...byKey.values()]
 }
 
-const ALL_ROWS = readLog()
-/** The websocket frame-audit rows — one per client frame, method `WS`. */
-const FRAME_ROWS = ALL_ROWS.filter((row) => row.frame === true)
-/** The HTTP request rows. Everything the replay harness reasons about. */
-const ROWS = ALL_ROWS.filter((row) => row.frame !== true)
+const HTTP_METHODS = new Set([
+  'GET',
+  'HEAD',
+  'POST',
+  'PUT',
+  'PATCH',
+  'DELETE',
+  'OPTIONS',
+  'TRACE',
+  'CONNECT',
+])
+
+/**
+ * Decide, once, which kind of record a raw line is.
+ *
+ * The third branch is deliberate. "Not a frame" does not mean "a request": if
+ * `proxy.mjs` ever writes a third record type, folding it into the request
+ * population is exactly how `WS` ended up in front of a default-deny HTTP guard.
+ * Default-deny applied to the log schema itself — an unrecognised record stops
+ * the harness instead of being classified by something that cannot classify it.
+ */
+function toLogRecord(raw: RawLogLine): LogRecord {
+  if (raw.frame === true) {
+    if (raw.method !== 'WS') {
+      throw new Error(
+        `log line at ${raw.at} is a frame record with method ${JSON.stringify(raw.method)}; ` +
+          `proxy.mjs writes the pseudo-method 'WS' on every frame row`,
+      )
+    }
+    return {...raw, kind: 'frame', frame: true, method: 'WS'}
+  }
+  if (!HTTP_METHODS.has(raw.method)) {
+    throw new Error(
+      `log line at ${raw.at} is neither a frame record nor an HTTP request line ` +
+        `(method ${JSON.stringify(raw.method)}). Teach the harness the new record ` +
+        `kind — do not let it reach a guard that classifies request lines.`,
+    )
+  }
+  const {frame: _frame, opcode: _opcode, rpc: _rpc, rpcId: _rpcId, wouldBlock: _wouldBlock, reason: _reason, ...request} = raw
+  return {...request, kind: 'request'}
+}
+
+const isFrameRecord = (record: LogRecord): record is FrameRecord => record.kind === 'frame'
+const isRequestRecord = (record: LogRecord): record is RequestRecord => record.kind === 'request'
+
+const ALL_RECORDS: LogRecord[] = readLog()
+/** The websocket frame-audit records — one per client frame, method `WS`. */
+const FRAME_ROWS: FrameRecord[] = ALL_RECORDS.filter(isFrameRecord)
+/** The HTTP request records. Everything the replay harness reasons about. */
+const ROWS: RequestRecord[] = ALL_RECORDS.filter(isRequestRecord)
 const REQUEST_LINES = distinctRequestLines(ROWS)
 
 /* ------------------------------------------------------------------ *
@@ -234,7 +328,7 @@ describe('proxy-log replay · the evidence itself', () => {
     // Re-pinned 2026-08-04 after a second live Studio session was appended to
     // the log. Growth is expected — the log is append-only evidence — but it
     // must be a REVIEWED diff, which is what pinning the totals forces.
-    expect(ALL_ROWS.length).toBe(730)
+    expect(ALL_RECORDS.length).toBe(730)
     expect(ROWS.length).toBe(669)
     expect(FRAME_ROWS.length).toBe(61)
     expect(REQUEST_LINES.length).toBe(96)
@@ -248,9 +342,10 @@ describe('proxy-log replay · the evidence itself', () => {
   it('the log contains the server-side blocked rows Spike F relies on', () => {
     const blocked = ROWS.filter((row) => row.blocked)
     // Six at the time of evidence review F3; fourteen after the 2026-08-04
-    // session, which added three `descriptors/claim` and three `intake/batch`
-    // 403s plus two more `data/actions`. Every one of them is a POST the guard
-    // refused server-side.
+    // session. The whole-log breakdown, counted from the file rather than
+    // recalled: `data/actions` x4, `descriptors/claim` x4, `intake/batch` x4,
+    // `data/mutate` x1, `assets/images` x1. Every one of them is a POST the
+    // guard refused server-side.
     expect(blocked.length).toBe(14)
     expect(blocked.every((row) => row.status === 403)).toBe(true)
     expect(blocked.every((row) => row.method === 'POST')).toBe(true)
@@ -269,6 +364,90 @@ describe('proxy-log replay · the evidence itself', () => {
       expect(entry.finding.length).toBeGreaterThan(120)
       expect(entry.consequence.length).toBeGreaterThan(40)
     }
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * the record-type boundary — one log file, two populations
+ * ------------------------------------------------------------------ *
+ * `proxy-log.jsonl` is not a log of request lines. Since the frame guard landed
+ * it interleaves two record types in one stream: HTTP request lines, and one
+ * record per client frame on an upgraded socket. A frame has no request line, so
+ * the proxy writes the pseudo-method `WS` in the `method` field
+ * (proxy.mjs:736) — and `WS` is not an HTTP method.
+ *
+ * That matters because the guard is DEFAULT-DENY. `classifyRequest` answers
+ * "is this on the read allowlist?", `WS` matches no read method, and the answer
+ * comes back `write: true`. Replay a frame record through the harness and it is
+ * reported as a request the live session completed (status 101) that the current
+ * guard now blocks — i.e. the harness accuses the guard of breaking the Studio's
+ * own listener socket, which is the one thing this suite exists to detect
+ * truthfully.
+ *
+ * The fix is NOT to teach the guard the string `WS`: that would put a
+ * non-HTTP token on an HTTP allowlist, and a real request line carrying
+ * `WS` would then be waved through. The fix is that a frame is a DIFFERENT KIND
+ * OF RECORD, tagged as such at the parse boundary, so it cannot reach a function
+ * that classifies request lines.
+ */
+
+describe('proxy-log replay · frames and request lines are different kinds of record', () => {
+  it('every record the reader returns declares its kind', () => {
+    const kinds = [...new Set(ALL_RECORDS.map((record) => record.kind))].sort()
+    // Two kinds, both present. Not "request or undefined": an untagged record is
+    // one whose routing depends on whoever happens to read it next.
+    expect(kinds).toEqual(['frame', 'request'])
+    expect(ALL_RECORDS.filter(isFrameRecord).length).toBe(61)
+    expect(ALL_RECORDS.filter(isRequestRecord).length).toBe(669)
+    // Total: no record falls out of the partition.
+    expect(ALL_RECORDS.length).toBe(730)
+  })
+
+  it('only request records carry an HTTP method, and frame records never do', () => {
+    for (const record of ALL_RECORDS) {
+      if (record.kind === 'request') {
+        expect(HTTP_METHODS.has(record.method), `${record.method} ${record.path}`).toBe(true)
+      } else {
+        expect(record.method).toBe('WS')
+        expect(HTTP_METHODS.has(record.method)).toBe(false)
+      }
+    }
+  })
+
+  it('a frame record handed to the request classifier comes back a write', () => {
+    // The mis-classification itself, pinned rather than described. This is the
+    // reason the partition above must exist and must stay: every one of these
+    // records has status 101 (so the replay harness would count it as a request
+    // the live session completed) and the guard calls all 61 of them writes.
+    const frames = ALL_RECORDS.filter(isFrameRecord)
+    expect(frames.length).toBeGreaterThan(0)
+    for (const frame of frames) {
+      const verdict = classifyRequest({method: frame.method, url: frame.path})
+      expect(verdict.write).toBe(true)
+      expect(verdict.reason).toBe('not on the read allowlist (default-deny)')
+    }
+    // ... while the same socket's HANDSHAKE — a real GET request line on the
+    // same path — is correctly a read. So the defect is the record type, not
+    // the path or the allowlist.
+    expect(isWriteRequest({method: 'GET', url: '/v2022-06-30/socket/parity'})).toBe(false)
+  })
+
+  it('the replayed request population contains no frame record', () => {
+    // The population every other assertion in this file quantifies over. A
+    // frame record reaching it is the false positive described above.
+    const pseudo = REQUEST_LINES.filter((line) => !HTTP_METHODS.has(line.method))
+    expect(pseudo.map((line) => line.key)).toEqual([])
+    expect(REQUEST_LINES.some((line) => line.key.includes('/socket/parity'))).toBe(true)
+  })
+
+  it('a record that is neither a frame nor an HTTP request line is refused, not assumed', () => {
+    // Default-deny applied to the LOG SCHEMA. If `proxy.mjs` grows a third
+    // record type, the harness must stop rather than quietly fold it into the
+    // request population — the exact failure mode that put `WS` in front of the
+    // guard in the first place.
+    expect(() =>
+      toLogRecord({at: '2026-08-05T00:00:00.000Z', method: 'TICK', path: '/', status: 0, ms: 0, blocked: false}),
+    ).toThrow(/neither a frame record nor an HTTP request line/)
   })
 })
 
@@ -334,11 +513,15 @@ describe('proxy-log replay · default-deny must not silently break the Studio', 
     // F4, closed by live evidence rather than by argument. Both rulings were
     // made from vendored source BEFORE this session ran; the session then
     // exercised both endpoints for real and the guard refused them, server-side,
-    // three times each. That is what makes the degradation list observed rather
-    // than predicted.
+    // four times each. Counted over the WHOLE log, not over a hand-picked time
+    // window: the window was an artifact of how this assertion was first
+    // written, and a count that depends on where the author drew the window is
+    // not evidence. The pre-guard occurrences are still visible in the same log
+    // (descriptors/claim answered 200 x3 at 14:39-14:47, intake/batch 401 x1 at
+    // 14:43) and are exactly what makes the 403s a change in behaviour.
     for (const requestPath of ['/v2025-02-19/descriptors/claim', '/v2023-12-18/intake/batch']) {
       const blocked = ROWS.filter((row) => row.path === requestPath && row.blocked)
-      expect(blocked.length, `${requestPath} has no blocked rows`).toBe(3)
+      expect(blocked.length, `${requestPath} has no blocked rows`).toBe(4)
       expect(blocked.every((row) => row.status === 403 && row.method === 'POST')).toBe(true)
       expect(DEGRADATION_KEYS.has(`POST ${requestPath}`)).toBe(true)
     }
@@ -440,11 +623,16 @@ describe('F5b · the websocket frame audit ran against a real Studio', () => {
       'wouldBlock',
       'reason',
     ])
-    for (const row of FRAME_ROWS) {
+    // The RAW lines, not the tagged records: the property is about what the
+    // proxy WROTE TO DISK. Asserting over `FRAME_ROWS` would be asserting over
+    // objects this file constructed, which cannot leak a credential.
+    const rawFrames = readRawLog(LOG_PATH).filter((row) => row.frame === true)
+    expect(rawFrames.length).toBe(61)
+    for (const row of rawFrames) {
       const unexpected = Object.keys(row).filter((key) => !permitted.has(key))
       expect(unexpected, `frame row at ${row.at} carries ${unexpected.join(',')}`).toEqual([])
     }
-    expect(JSON.stringify(FRAME_ROWS)).not.toMatch(/Bearer|"params"/)
+    expect(JSON.stringify(rawFrames)).not.toMatch(/Bearer|"params"/)
   })
 })
 
@@ -460,7 +648,7 @@ describe('F5b · the websocket frame audit ran against a real Studio', () => {
 
 describe('the starved-request signature in the live log', () => {
   /** `at` is written on COMPLETION, so a request's start is `at - ms`. */
-  const interval = (row: LogRow) => {
+  const interval = (row: RequestRecord) => {
     const end = new Date(row.at).getTime()
     return {start: end - row.ms, end}
   }
@@ -519,8 +707,11 @@ describe('the starved-request signature in the live log', () => {
     const listen = (method: string) =>
       ROWS.filter((row) => row.method === method && row.path === '/v2025-02-19/data/listen/parity')
         .length
-    expect(listen('OPTIONS')).toBe(18)
-    expect(listen('GET')).toBe(8)
+    // Whole-log counts. Rows are written on COMPLETION, so a preflight with no
+    // matching GET row is a stream that never finished — 72 preflights against
+    // 34 completions is 38 listener GETs the browser opened and never closed.
+    expect(listen('OPTIONS')).toBe(72)
+    expect(listen('GET')).toBe(34)
     expect(listen('OPTIONS')).toBeGreaterThan(listen('GET'))
   })
 })
@@ -642,7 +833,7 @@ interface ShapeVerdict {
  * that shape that was NOT blocked, and at least one allowlisted read that
  * succeeded in the same log.
  */
-function gradeReverifyLog(rows: LogRow[]): {shapes: ShapeVerdict[]; liveness: ShapeVerdict} {
+function gradeReverifyLog(rows: RequestRecord[]): {shapes: ShapeVerdict[]; liveness: ShapeVerdict} {
   const shapes = SPIKE_F_RE_VERIFIED_SHAPES.map((shape) => {
     const onShape = rows.filter((row) => row.method === shape.method && row.path === shape.path)
     const blocked = onShape.find((row) => row.blocked === true && row.status === 403)
@@ -673,8 +864,9 @@ function gradeReverifyLog(rows: LogRow[]): {shapes: ShapeVerdict[]; liveness: Sh
 }
 
 /** The shape of a log the README's checklist would accept. */
-function syntheticPassingLog(): LogRow[] {
-  const rows: LogRow[] = SPIKE_F_RE_VERIFIED_SHAPES.map((shape, index) => ({
+function syntheticPassingLog(): RequestRecord[] {
+  const rows: RequestRecord[] = SPIKE_F_RE_VERIFIED_SHAPES.map((shape, index) => ({
+    kind: 'request',
     at: new Date(Date.UTC(2026, 7, 5, 12, 0, index)).toISOString(),
     method: shape.method,
     path: shape.path,
@@ -683,6 +875,7 @@ function syntheticPassingLog(): LogRow[] {
     blocked: true,
   }))
   rows.push({
+    kind: 'request',
     at: new Date(Date.UTC(2026, 7, 5, 12, 0, 30)).toISOString(),
     method: 'GET',
     path: '/v2025-02-19/ping',
@@ -742,29 +935,28 @@ describe('F3 · the grader for a future live re-verification run', () => {
 describe('F3 · has the live re-verification actually happened?', () => {
   const present = fs.existsSync(REVERIFY_LOG_PATH)
 
-  it('the live re-verification has not happened yet', () => {
+  it('the live re-verification has happened (2026-08-04)', () => {
     // A PINNED LITERAL, not a skip. `describe.skipIf` would let the whole leg
-    // vanish silently (evidence review F7); this cannot. Committing
-    // proxy-log-reverify.jsonl turns this assertion red, and flipping it to
-    // `true` is what switches the block below on. The claim in
-    // spike-f-safety-boundary/report.md:64 therefore cannot be marked verified
-    // without the server-side artifact landing in the same diff.
-    expect(present).toBe(false)
+    // vanish silently (evidence review F7); this cannot. The tripwire did its
+    // job: it went red the moment proxy-log-reverify.jsonl landed, forcing this
+    // flip to be deliberate rather than incidental, and switching the grading
+    // block below on. Deleting the artifact turns this red again — the claim in
+    // spike-f-safety-boundary/report.md:64 cannot outlive its evidence.
+    // Session recorded in docs/plans/evidence/phase-1/live-validation-2026-08-04.md §3.
+    expect(present).toBe(true)
   })
 
   it('grades the re-verification log when one exists', () => {
     if (!present) {
       // Not a silent pass: the assertion above is what fails if this branch is
       // taken after the log lands.
-      expect(present).toBe(false)
+      expect(present).toBe(true)
       return
     }
-    const rows = fs
-      .readFileSync(REVERIFY_LOG_PATH, 'utf8')
-      .split('\n')
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as LogRow)
-    const graded = gradeReverifyLog(rows)
+    // Through the SAME parse boundary as the committed log. A live run upgrades
+    // the socket, so a real re-verification log will carry frame records too —
+    // and the grader must never see them.
+    const graded = gradeReverifyLog(readLog(REVERIFY_LOG_PATH).filter(isRequestRecord))
     expect(graded.shapes.filter((verdict) => !verdict.ok)).toEqual([])
     expect(graded.liveness.ok).toBe(true)
   })

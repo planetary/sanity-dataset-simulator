@@ -326,6 +326,19 @@ function collectTypeScriptFiles(dir: string): string[] {
   return files.sort()
 }
 
+/**
+ * Per-test timeout for the corpus scans (ms).
+ *
+ * Each scanning test walks the TypeScript AST of every file under `core/src` —
+ * roughly 1.0-1.6 s of CPU per test when the file runs alone. Vitest's default
+ * `testTimeout` is 5 s, and under a full-suite run the whole repository's test
+ * files share the same worker pool, so these five tests are the ones that lose
+ * the race and time out. Nothing here waits on I/O or on another process: the
+ * only failure mode a longer budget hides is "the machine was busy", which is
+ * not a boundary violation. The assertions themselves are unchanged.
+ */
+const SCAN_TIMEOUT_MS = 60_000
+
 interface CoreFile {
   path: string
   ref: string
@@ -350,7 +363,7 @@ describe('dependency boundary — sanity-overlay-core (plan §3, §10; PRD §10.
     /* A lint that silently scans nothing always passes. */
     expect(coreFiles.length).toBeGreaterThan(20)
     expect(coreFiles.some((file) => file.ref.endsWith('index.ts'))).toBe(true)
-  })
+  }, SCAN_TIMEOUT_MS)
 
   it('has no Next.js, Vercel, node:fs, @vercel/blob or @sanity/client runtime import', () => {
     const violations: string[] = []
@@ -369,7 +382,7 @@ describe('dependency boundary — sanity-overlay-core (plan §3, §10; PRD §10.
     }
 
     expect(violations).toEqual([])
-  })
+  }, SCAN_TIMEOUT_MS)
 
   it('imports no Node builtin at runtime, so core stays browser-safe', () => {
     const violations: string[] = []
@@ -384,7 +397,7 @@ describe('dependency boundary — sanity-overlay-core (plan §3, §10; PRD §10.
     }
 
     expect(violations).toEqual([])
-  })
+  }, SCAN_TIMEOUT_MS)
 
   it('imports nothing from outside the core package (no dependency inversion)', () => {
     /* The rule that keeps the §35.7 store contract *in* core: a core-resident
@@ -404,7 +417,7 @@ describe('dependency boundary — sanity-overlay-core (plan §3, §10; PRD §10.
     }
 
     expect(violations).toEqual([])
-  })
+  }, SCAN_TIMEOUT_MS)
 
   it('declares no third-party dependency in its package manifest', () => {
     const manifest = JSON.parse(readFileSync(join(CORE_PACKAGE, 'package.json'), 'utf8')) as {
@@ -423,7 +436,7 @@ describe('dependency boundary — sanity-overlay-core (plan §3, §10; PRD §10.
       }
     }
     expect(violations).toEqual([])
-  })
+  }, SCAN_TIMEOUT_MS)
 
   it('uses no Node-only global', () => {
     const violations: string[] = []
@@ -433,7 +446,7 @@ describe('dependency boundary — sanity-overlay-core (plan §3, §10; PRD §10.
       }
     }
     expect(violations).toEqual([])
-  })
+  }, SCAN_TIMEOUT_MS)
 })
 
 /* ------------------------------------------------------------------ *

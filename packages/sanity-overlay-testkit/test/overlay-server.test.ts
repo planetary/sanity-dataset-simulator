@@ -602,6 +602,177 @@ describe('spikeA overlay server', () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * Regression class — a non-ASCII diffMatchPatch must reach disk intact
+ * ------------------------------------------------------------------ *
+ *
+ * The live failure this pins: typing ` — OVERLAY EDIT` after `Article 1` in a
+ * real Studio produced a `diffMatchPatch` whose hunk header counts UTF-8 bytes.
+ * Core counted UTF-16 code units, so `length2 25` was measured as 23, the patch
+ * was rejected, and the edit never reached disk. Studio's autosave has nowhere
+ * to show a commit error, so the user simply lost the character they typed.
+ *
+ * `test/core-dmp-unicode.test.ts` pins the unit. This pins the whole *path*:
+ * Studio-shaped action → HTTP → `translateInterceptedWrite` → `applyTransaction`
+ * → `FsOverlayStore` → `documents/<id>/intent.json`. Every assertion reads that
+ * file back with `node:fs`; a server that answered `committed: true` while
+ * writing nothing — or writing mojibake — passes an assertion on its own
+ * response body and fails these.
+ */
+
+/** Exactly the payload `client.observable.action(...)` carries for a dmp edit. */
+function diffMatchPatchAction(patch: string): unknown[] {
+  return [
+    {
+      actionType: 'sanity.action.document.edit',
+      draftId: 'drafts.article-1',
+      publishedId: 'article-1',
+      patch: {diffMatchPatch: {title: patch}},
+    },
+  ]
+}
+
+function articleTitled(title: string): Record<string, unknown> {
+  return {...BASE_ARTICLE, title}
+}
+
+/**
+ * Patches emitted by `@sanity/diff-match-patch@3.2.0` — the library Studio
+ * itself ships — and pasted in verbatim. No value here was computed by the code
+ * under test.
+ */
+const DMP_OVER_HTTP: ReadonlyArray<{
+  readonly name: string
+  readonly base: string
+  readonly patch: string
+  readonly expected: string
+}> = [
+  {
+    /* THE live-session patch, byte for byte. This exact string is what failed in
+     * the browser; `length2` is 25 bytes for 23 code units. */
+    name: 'the em dash Studio actually sent',
+    base: 'Article 1',
+    patch: '@@ -2,8 +2,25 @@\n rticle 1\n+ %E2%80%94 OVERLAY EDIT\n',
+    expected: 'Article 1 — OVERLAY EDIT',
+  },
+  {
+    name: 'an emoji, which dmp charges 7 bytes for the surrogate pair',
+    base: 'Release party is tonight ok',
+    patch: '@@ -6,16 +6,24 @@\n se party\n+ %F0%9F%8E%89\n  is toni\n',
+    expected: 'Release party \u{1F389} is tonight ok',
+  },
+  {
+    name: 'CJK, at 3 bytes per character',
+    base: 'Chapter one starts here now',
+    patch: '@@ -4,16 +4,23 @@\n pter one\n+ %E4%B8%96%E7%95%8C\n  starts \n',
+    expected: 'Chapter one 世界 starts here now',
+  },
+  {
+    /* Two hunks, the first inserting an astral character: hunk 2's start is
+     * measured in the text hunk 1 already produced, so a byte/character mix-up
+     * *or* an absolute-start reading lands the `Y` in the wrong place — and
+     * silently, because the context still matches there. */
+    name: 'a multi-hunk patch whose second start rolls over an astral insertion',
+    base: `alpha e beta${'PAD'.repeat(19)} omega x delta`,
+    patch:
+      '@@ -1,15 +1,21 @@\n alpha \n-e\n+%F0%9F%8E%89\n  betaPAD\n@@ -79,9 +79,9 @@\n ega \n-x\n+Y\n  del\n',
+    expected: `alpha \u{1F389} beta${'PAD'.repeat(19)} omega Y delta`,
+  },
+]
+
+describe('spikeA overlay server — a non-ASCII diffMatchPatch lands on disk', () => {
+  for (const fixture of DMP_OVER_HTTP) {
+    it(`commits ${fixture.name}`, async () => {
+      const root = await makeRoot()
+      const server = await boot(root)
+
+      const {status, json} = await postCommit(server, {
+        idempotencyKey: 'session-a:local-echo-dmp',
+        kind: 'actions',
+        payload: diffMatchPatchAction(fixture.patch),
+        baseDocuments: [articleTitled(fixture.base)],
+      })
+
+      /* Asserted together so a rejection reports the core error verbatim rather
+       * than a bare `expected 400 to be 200`. The live session failed exactly
+       * here, with `OVERLAY_DMP_PATCH_INVALID: Hunk declares length2 25 but its
+       * context and insertions total 23`. */
+      expect({status, error: json.error}).toEqual({status: 200, error: undefined})
+      expect(json).toMatchObject({ok: true, committed: true})
+
+      /* The claim under test, read back off the filesystem. */
+      const intent = await readIntent(root, 'article-1')
+      expect(intent.draft?.overrides).toEqual([{path: ['title'], value: fixture.expected}])
+    })
+  }
+
+  it('writes the em dash as UTF-8 bytes, not mojibake or an escape', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+
+    await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-dmp',
+      kind: 'actions',
+      payload: diffMatchPatchAction('@@ -2,8 +2,25 @@\n rticle 1\n+ %E2%80%94 OVERLAY EDIT\n'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    /* Compared as raw bytes, so the claim cannot be satisfied by a decode that
+     * happens to be symmetric with a broken encode. `TextEncoder` is the oracle
+     * rather than core's own `utf8Encode`, so the two sides are independent;
+     * U+2014 must appear as E2 80 94. */
+    const bytes = new Uint8Array(
+      await readFile(join(root, '.sanity-overlay', 'documents', 'article-1', 'intent.json')),
+    )
+    const expected = new TextEncoder().encode('Article 1 \u{2014} OVERLAY EDIT')
+
+    const found = bytes.some((_byte, at) =>
+      expected.every((byte, index) => bytes[at + index] === byte),
+    )
+    expect(found).toBe(true)
+  })
+
+  it('survives a restart — the patched value is rehydrated from disk, not memory', async () => {
+    const root = await makeRoot()
+
+    const first = await boot(root)
+    await postCommit(first, {
+      idempotencyKey: 'session-a:local-echo-dmp',
+      kind: 'actions',
+      payload: diffMatchPatchAction('@@ -2,8 +2,25 @@\n rticle 1\n+ %E2%80%94 OVERLAY EDIT\n'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    await first.close()
+    running.length = 0
+
+    const second = await boot(root)
+    const state = await getState(second)
+    expect(state.documents[0].draft.title).toBe('Article 1 — OVERLAY EDIT')
+  })
+
+  it('still refuses a patch whose context genuinely does not match', async () => {
+    const server = await boot(await makeRoot())
+
+    /* The live patch against a different base. The byte-aware engine must not
+     * have become "accept everything": a mismatch is a loud failure, because
+     * §17.9 makes the applied string the stored value. */
+    const {status, json} = await postCommit(server, {
+      idempotencyKey: 'session-a:local-echo-dmp',
+      kind: 'actions',
+      payload: diffMatchPatchAction('@@ -2,8 +2,25 @@\n rticle 1\n+ %E2%80%94 OVERLAY EDIT\n'),
+      baseDocuments: [articleTitled('Something else entirely — really')],
+    })
+
+    /* 400, not 500: the server maps a core error carrying a `code` onto a
+     * structured client error. What matters is *which* code — a byte-aware
+     * engine must reject this as a context mismatch, never as a bad patch and
+     * never at all. */
+    expect(status).toBe(400)
+    expect(json.ok).toBe(false)
+    expect((json.error as {code: string}).code).toBe('OVERLAY_DMP_CONTEXT_MISMATCH')
+  })
+})
+
+/* ------------------------------------------------------------------ *
  * Regression class — no store work may outlive the request that started it
  * ------------------------------------------------------------------ *
  *

@@ -1,0 +1,302 @@
+{"at":"2026-08-04T22:39:39.115Z","method":"OPTIONS","path":"/v2026-05-04/users/me","status":204,"ms":9,"blocked":false}
+{"at":"2026-08-04T22:39:39.127Z","method":"GET","path":"/v2026-05-04/users/me","status":200,"ms":432,"blocked":false}
+{"at":"2026-08-04T22:39:39.570Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/grants","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.572Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/user-applications","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.576Z","method":"OPTIONS","path":"/v2021-12-15/projects/b1n03q3z","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:39.580Z","method":"OPTIONS","path":"/v2024-09-19/journey/announcements","status":204,"ms":2,"blocked":false}
+{"at":"2026-08-04T22:39:39.585Z","method":"GET","path":"/v2024-09-19/journey/announcements","status":200,"ms":7,"blocked":false}
+{"at":"2026-08-04T22:39:39.593Z","method":"OPTIONS","path":"/v2025-02-19/users/me/keyvalue/studio.announcement.seen","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.600Z","method":"OPTIONS","path":"/v2025-02-19/journey/asset-limit","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:39.606Z","method":"OPTIONS","path":"/v2025-02-19/journey/document-limit","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.611Z","method":"OPTIONS","path":"/v2025-02-19/journey/asset-limit","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.614Z","method":"OPTIONS","path":"/v2025-02-19/journey/document-limit","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.617Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.619Z","method":"OPTIONS","path":"/v2025-02-19/features","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:39.573Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/user-applications","status":200,"ms":217,"blocked":false}
+{"at":"2026-08-04T22:39:39.804Z","method":"GET","path":"/v2025-02-19/journey/document-limit","status":200,"ms":314,"blocked":false}
+{"at":"2026-08-04T22:39:39.579Z","method":"GET","path":"/v2021-12-15/projects/b1n03q3z","status":304,"ms":567,"blocked":false}
+{"at":"2026-08-04T22:39:39.574Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/grants","status":304,"ms":578,"blocked":false}
+{"at":"2026-08-04T22:39:39.601Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.announcement.seen","status":200,"ms":551,"blocked":false}
+{"at":"2026-08-04T22:39:39.595Z","method":"GET","path":"/v2024-09-19/journey/announcements","status":200,"ms":587,"blocked":false}
+{"at":"2026-08-04T22:39:39.622Z","method":"GET","path":"/v2025-02-19/journey/asset-limit","status":200,"ms":564,"blocked":false}
+{"at":"2026-08-04T22:39:40.187Z","method":"OPTIONS","path":"/v2025-02-19/schedules/b1n03q3z/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.187Z","method":"OPTIONS","path":"/v1/help","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:40.188Z","method":"OPTIONS","path":"/v1/help","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.199Z","method":"OPTIONS","path":"/v1/help","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.200Z","method":"OPTIONS","path":"/v1/help","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.200Z","method":"OPTIONS","path":"/v2023-12-11/journey/trial","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.201Z","method":"OPTIONS","path":"/v2025-02-19/journey/scheduled-drafts","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.201Z","method":"OPTIONS","path":"/v2025-02-19/journey/content-releases","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:40.202Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.203Z","method":"OPTIONS","path":"/v2023-12-11/journey/trial","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.204Z","method":"OPTIONS","path":"/v2025-02-19/journey/scheduled-drafts","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.204Z","method":"OPTIONS","path":"/v2025-02-19/journey/content-releases","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.205Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":204,"ms":3,"blocked":false}
+{"at":"2026-08-04T22:39:40.209Z","method":"OPTIONS","path":"/v2021-06-07/projects/b1n03q3z/datasets/parity/acl","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.211Z","method":"OPTIONS","path":"/v2025-02-19/users/me/keyvalue/studio.structure-tool.layout.article,studio.structure-tool.sort-order.article","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:40.214Z","method":"OPTIONS","path":"/v2025-02-19/agent/oTu7RImef/bundles/mine/listen","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.214Z","method":"OPTIONS","path":"/v2025-02-19/descriptors/claim","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.188Z","method":"GET","path":"/v2022-06-30/socket/parity","status":502,"ms":80,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:39:40.201Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":85,"blocked":false}
+{"at":"2026-08-04T22:39:40.187Z","method":"GET","path":"/v2025-02-19/features","status":304,"ms":187,"blocked":false}
+{"at":"2026-08-04T22:39:40.218Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":183,"blocked":false}
+{"at":"2026-08-04T22:39:40.214Z","method":"GET","path":"/v2025-02-19/schedules/b1n03q3z/parity","status":200,"ms":196,"blocked":false}
+{"at":"2026-08-04T22:39:40.218Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":285,"blocked":false}
+{"at":"2026-08-04T22:39:40.289Z","method":"GET","path":"/v2025-02-19/journey/scheduled-drafts","status":200,"ms":226,"blocked":false}
+{"at":"2026-08-04T22:39:40.516Z","method":"POST","path":"/v2025-02-19/descriptors/claim","status":403,"ms":0,"blocked":true}
+{"at":"2026-08-04T22:39:40.519Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.520Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:40.522Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.524Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.525Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.527Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.412Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.structure-tool.layout.article,studio.structure-tool.sort-order.article","status":200,"ms":215,"blocked":false}
+{"at":"2026-08-04T22:39:40.375Z","method":"GET","path":"/v2025-02-19/journey/content-releases","status":200,"ms":260,"blocked":false}
+{"at":"2026-08-04T22:39:40.519Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":117,"blocked":false}
+{"at":"2026-08-04T22:39:40.402Z","method":"GET","path":"/v2021-06-07/projects/b1n03q3z/datasets/parity/acl","status":200,"ms":236,"blocked":false}
+{"at":"2026-08-04T22:39:40.638Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":82,"blocked":false}
+{"at":"2026-08-04T22:39:40.197Z","method":"GET","path":"/v2022-06-30/socket/parity","status":101,"ms":526,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:39:40.530Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":194,"blocked":false}
+{"at":"2026-08-04T22:39:40.725Z","method":"OPTIONS","path":"/v2021-12-15/projects/b1n03q3z","status":204,"ms":2,"blocked":false}
+{"at":"2026-08-04T22:39:40.728Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:40.731Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":534,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"authorization","rpcId":"Rvi2baijlpCo-lhNn3HT","wouldBlock":false,"reason":"allowlisted RPC method authorization"}
+{"at":"2026-08-04T22:39:40.732Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:40.639Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":260,"blocked":false}
+{"at":"2026-08-04T22:39:40.735Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":267,"blocked":false}
+{"at":"2026-08-04T22:39:41.008Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:41.115Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":918,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_rollcall","rpcId":"46ZAgAu6NiCoiIVpYWcS","wouldBlock":false,"reason":"allowlisted RPC method presence_rollcall"}
+{"at":"2026-08-04T22:39:41.115Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":918,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_subscribe","rpcId":"rSYgyDwFGTm-GIoIqk4q","wouldBlock":false,"reason":"allowlisted RPC method presence_subscribe"}
+{"at":"2026-08-04T22:39:41.115Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":918,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"hvSHvFWeWMPkqxCYEi42","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:39:41.012Z","method":"GET","path":"/v2021-12-15/projects/b1n03q3z","status":304,"ms":198,"blocked":false}
+{"at":"2026-08-04T22:39:40.917Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":466,"blocked":false}
+{"at":"2026-08-04T22:39:41.212Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":197,"blocked":false}
+{"at":"2026-08-04T22:39:41.413Z","method":"OPTIONS","path":"/v2025-02-19/data/doc/parity/article-01,drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:41.418Z","method":"OPTIONS","path":"/v2024-09-01/projects/b1n03q3z/user-applications","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:41.424Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":247,"blocked":false}
+{"at":"2026-08-04T22:39:41.672Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:41.674Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":90,"blocked":false}
+{"at":"2026-08-04T22:39:41.767Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":191,"blocked":false}
+{"at":"2026-08-04T22:39:41.961Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:41.963Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:41.964Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:41.965Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:41.966Z","method":"GET","path":"/v2025-02-19/data/doc/parity/article-01,drafts.article-01","status":200,"ms":183,"blocked":false}
+{"at":"2026-08-04T22:39:42.151Z","method":"GET","path":"/v2024-09-01/projects/b1n03q3z/user-applications","status":200,"ms":216,"blocked":false}
+{"at":"2026-08-04T22:39:42.431Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:42.439Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":204,"ms":23,"blocked":false}
+{"at":"2026-08-04T22:39:42.482Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":236,"blocked":false}
+{"at":"2026-08-04T22:39:42.720Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":200,"blocked":false}
+{"at":"2026-08-04T22:39:42.921Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":202,"blocked":false}
+{"at":"2026-08-04T22:39:43.127Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":200,"blocked":false}
+{"at":"2026-08-04T22:39:43.380Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":3183,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:39:43.331Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":212,"blocked":false}
+{"at":"2026-08-04T22:39:43.546Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:39:43.551Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":203,"blocked":false}
+{"at":"2026-08-04T22:39:43.759Z","method":"OPTIONS","path":"/v2025-02-19/users/me/keyvalue/studio.timezone.input.article-01.publishedAt","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:43.772Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":221,"blocked":false}
+{"at":"2026-08-04T22:39:44.007Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:39:44.012Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":191,"blocked":false}
+{"at":"2026-08-04T22:39:44.204Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.timezone.input.article-01.publishedAt","status":200,"ms":178,"blocked":false}
+{"at":"2026-08-04T22:39:44.387Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:40:10.946Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":30749,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"jYEUQWxldmofgEAWeqIW","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:40:13.378Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":33181,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:40:40.946Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":60749,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"G0oxUg6S1SYRGxiru7VV","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:40:43.381Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":63184,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:41:10.948Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":90751,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"f1mqGHfITUUbBojPjS8t","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:41:13.377Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":93180,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:41:40.949Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":120752,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"-KAoDTLnFY6JPkzw-q0F","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:41:43.375Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":123178,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:41:48.303Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":128106,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_disconnect","rpcId":"xny9JApGqrKTcxUjm16I","wouldBlock":false,"reason":"allowlisted RPC method presence_disconnect"}
+{"at":"2026-08-04T22:41:48.303Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":128106,"blocked":false,"upgrade":true,"frame":true,"opcode":8,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:39:40.724Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":127731,"blocked":false}
+{"at":"2026-08-04T22:39:40.639Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":127816,"blocked":false}
+{"at":"2026-08-04T22:39:44.390Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":124065,"blocked":false}
+{"at":"2026-08-04T22:39:40.219Z","method":"GET","path":"/v2025-02-19/agent/oTu7RImef/bundles/mine/listen","status":200,"ms":128238,"blocked":false}
+{"at":"2026-08-04T22:39:40.186Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":128272,"blocked":false}
+{"at":"2026-08-04T22:39:40.640Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":127818,"blocked":false}
+{"at":"2026-08-04T22:39:41.384Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":127076,"blocked":false}
+{"at":"2026-08-04T22:41:48.467Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.469Z","method":"OPTIONS","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.469Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.469Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.469Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.470Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.470Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.470Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.470Z","method":"OPTIONS","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.470Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.470Z","method":"OPTIONS","path":"/v2023-12-18/intake/telemetry-status","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:48.473Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:41:48.892Z","method":"GET","path":"/v2026-05-04/users/me","status":200,"ms":340,"blocked":false}
+{"at":"2026-08-04T22:41:49.283Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:41:49.252Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/user-applications","status":200,"ms":197,"blocked":false}
+{"at":"2026-08-04T22:41:49.267Z","method":"GET","path":"/v2021-12-15/projects/b1n03q3z","status":304,"ms":405,"blocked":false}
+{"at":"2026-08-04T22:41:49.271Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.announcement.seen","status":200,"ms":403,"blocked":false}
+{"at":"2026-08-04T22:41:49.253Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/grants","status":304,"ms":425,"blocked":false}
+{"at":"2026-08-04T22:41:49.337Z","method":"GET","path":"/v2025-02-19/features","status":304,"ms":342,"blocked":false}
+{"at":"2026-08-04T22:41:49.456Z","method":"GET","path":"/v2025-02-19/schedules/b1n03q3z/parity","status":200,"ms":224,"blocked":false}
+{"at":"2026-08-04T22:41:49.678Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":20,"blocked":false}
+{"at":"2026-08-04T22:41:49.680Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":92,"blocked":false}
+{"at":"2026-08-04T22:41:49.688Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":227,"blocked":false}
+{"at":"2026-08-04T22:41:49.697Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":234,"blocked":false}
+{"at":"2026-08-04T22:41:49.916Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":17,"blocked":false}
+{"at":"2026-08-04T22:41:49.933Z","method":"POST","path":"/v2025-02-19/descriptors/claim","status":403,"ms":1,"blocked":true}
+{"at":"2026-08-04T22:41:49.934Z","method":"OPTIONS","path":"/v2025-02-19/agent/oTu7RImef/bundles/mine/listen","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:49.790Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":147,"blocked":false}
+{"at":"2026-08-04T22:41:49.934Z","method":"GET","path":"/v2022-06-30/socket/parity","status":502,"ms":95,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:41:49.932Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":288,"blocked":false}
+{"at":"2026-08-04T22:41:49.944Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":462,"blocked":false}
+{"at":"2026-08-04T22:41:49.932Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":510,"blocked":false}
+{"at":"2026-08-04T22:41:50.444Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:50.226Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.structure-tool.layout.article,studio.structure-tool.sort-order.article","status":200,"ms":218,"blocked":false}
+{"at":"2026-08-04T22:41:49.935Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":509,"blocked":false}
+{"at":"2026-08-04T22:41:49.936Z","method":"GET","path":"/v2021-06-07/projects/b1n03q3z/datasets/parity/acl","status":200,"ms":510,"blocked":false}
+{"at":"2026-08-04T22:41:50.447Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:50.449Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:50.450Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:50.450Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:50.451Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:50.451Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:50.454Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":90,"blocked":false}
+{"at":"2026-08-04T22:41:49.959Z","method":"GET","path":"/v2022-06-30/socket/parity","status":101,"ms":604,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:41:50.627Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":668,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"authorization","rpcId":"EeW78yKtKa2XpSTdbIbI","wouldBlock":false,"reason":"allowlisted RPC method authorization"}
+{"at":"2026-08-04T22:41:50.453Z","method":"GET","path":"/v2021-12-15/projects/b1n03q3z","status":304,"ms":274,"blocked":false}
+{"at":"2026-08-04T22:41:50.454Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":288,"blocked":false}
+{"at":"2026-08-04T22:41:50.452Z","method":"GET","path":"/v2024-09-01/projects/b1n03q3z/user-applications","status":200,"ms":295,"blocked":false}
+{"at":"2026-08-04T22:41:50.448Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":299,"blocked":false}
+{"at":"2026-08-04T22:41:50.939Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":980,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_rollcall","rpcId":"rLaJyzpep8K3DoeUDnvD","wouldBlock":false,"reason":"allowlisted RPC method presence_rollcall"}
+{"at":"2026-08-04T22:41:50.939Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":980,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_subscribe","rpcId":"by-MUQPSILV9jA7r6-Fq","wouldBlock":false,"reason":"allowlisted RPC method presence_subscribe"}
+{"at":"2026-08-04T22:41:50.939Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":980,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"Nn7SPgoBv1VZDkVxKYFk","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:41:50.804Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":226,"blocked":false}
+{"at":"2026-08-04T22:41:51.033Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":212,"blocked":false}
+{"at":"2026-08-04T22:41:51.247Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":188,"blocked":false}
+{"at":"2026-08-04T22:41:51.438Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":198,"blocked":false}
+{"at":"2026-08-04T22:41:51.637Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":174,"blocked":false}
+{"at":"2026-08-04T22:41:51.814Z","method":"GET","path":"/v2025-02-19/data/doc/parity/article-01,drafts.article-01","status":200,"ms":185,"blocked":false}
+{"at":"2026-08-04T22:41:52.002Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":201,"blocked":false}
+{"at":"2026-08-04T22:41:52.211Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":459,"blocked":false}
+{"at":"2026-08-04T22:41:52.675Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":182,"blocked":false}
+{"at":"2026-08-04T22:41:52.858Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":220,"blocked":false}
+{"at":"2026-08-04T22:41:53.079Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":274,"blocked":false}
+{"at":"2026-08-04T22:41:53.356Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":205,"blocked":false}
+{"at":"2026-08-04T22:41:53.564Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:41:53.566Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":198,"blocked":false}
+{"at":"2026-08-04T22:41:53.770Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.timezone.input.article-01.publishedAt","status":200,"ms":184,"blocked":false}
+{"at":"2026-08-04T22:41:53.959Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":189,"blocked":false}
+{"at":"2026-08-04T22:41:54.150Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:41:54.151Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":242,"blocked":false}
+{"at":"2026-08-04T22:41:54.401Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":218,"blocked":false}
+{"at":"2026-08-04T22:42:08.662Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":18703,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:42:12.985Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":23026,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"Bta-1yH0cyiekga5UZJQ","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:42:38.668Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":48709,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:42:42.984Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":53025,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"fQEXfP5cXqqYh24byLoE","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:42:43.789Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":53830,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_disconnect","rpcId":"NIQTiEipyqeDPKR4k9v4","wouldBlock":false,"reason":"allowlisted RPC method presence_disconnect"}
+{"at":"2026-08-04T22:42:43.790Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":53831,"blocked":false,"upgrade":true,"frame":true,"opcode":8,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:41:50.545Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":53396,"blocked":false}
+{"at":"2026-08-04T22:41:50.756Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":53185,"blocked":false}
+{"at":"2026-08-04T22:41:54.629Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":49313,"blocked":false}
+{"at":"2026-08-04T22:41:50.804Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":53139,"blocked":false}
+{"at":"2026-08-04T22:41:49.285Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":54659,"blocked":false}
+{"at":"2026-08-04T22:41:49.944Z","method":"GET","path":"/v2025-02-19/agent/oTu7RImef/bundles/mine/listen","status":200,"ms":54000,"blocked":false}
+{"at":"2026-08-04T22:41:50.804Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":53140,"blocked":false}
+{"at":"2026-08-04T22:42:43.949Z","method":"GET","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":200,"ms":5,"blocked":false}
+{"at":"2026-08-04T22:42:43.953Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":2,"blocked":false}
+{"at":"2026-08-04T22:42:43.954Z","method":"GET","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":200,"ms":4,"blocked":false}
+{"at":"2026-08-04T22:42:43.958Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:43.957Z","method":"GET","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":200,"ms":2,"blocked":false}
+{"at":"2026-08-04T22:42:43.959Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:42:43.960Z","method":"GET","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":200,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:42:43.960Z","method":"GET","path":"/v2023-12-18/intake/telemetry-status","status":200,"ms":3,"blocked":false}
+{"at":"2026-08-04T22:42:43.962Z","method":"GET","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":200,"ms":2,"blocked":false}
+{"at":"2026-08-04T22:42:43.964Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:42:43.963Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":2,"blocked":false}
+{"at":"2026-08-04T22:42:44.370Z","method":"GET","path":"/v2026-05-04/users/me","status":200,"ms":332,"blocked":false}
+{"at":"2026-08-04T22:42:44.723Z","method":"GET","path":"/v2024-09-19/journey/announcements","status":200,"ms":10,"blocked":false}
+{"at":"2026-08-04T22:42:44.739Z","method":"GET","path":"/v2025-02-19/journey/asset-limit","status":200,"ms":12,"blocked":false}
+{"at":"2026-08-04T22:42:44.740Z","method":"GET","path":"/v2025-02-19/journey/document-limit","status":200,"ms":12,"blocked":false}
+{"at":"2026-08-04T22:42:44.755Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:42:44.713Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/grants","status":304,"ms":181,"blocked":false}
+{"at":"2026-08-04T22:42:44.722Z","method":"GET","path":"/v2021-12-15/projects/b1n03q3z","status":304,"ms":326,"blocked":false}
+{"at":"2026-08-04T22:42:44.734Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.announcement.seen","status":200,"ms":331,"blocked":false}
+{"at":"2026-08-04T22:42:44.714Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/user-applications","status":200,"ms":390,"blocked":false}
+{"at":"2026-08-04T22:42:44.753Z","method":"GET","path":"/v2024-09-19/journey/announcements","status":200,"ms":352,"blocked":false}
+{"at":"2026-08-04T22:42:45.151Z","method":"POST","path":"/v2025-02-19/descriptors/claim","status":403,"ms":0,"blocked":true}
+{"at":"2026-08-04T22:42:45.198Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:42:45.049Z","method":"GET","path":"/v2025-02-19/features","status":304,"ms":184,"blocked":false}
+{"at":"2026-08-04T22:42:44.899Z","method":"GET","path":"/v2025-02-19/journey/asset-limit","status":200,"ms":352,"blocked":false}
+{"at":"2026-08-04T22:42:44.756Z","method":"GET","path":"/v2025-02-19/journey/document-limit","status":200,"ms":540,"blocked":false}
+{"at":"2026-08-04T22:42:45.151Z","method":"GET","path":"/v2022-06-30/socket/parity","status":502,"ms":150,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:42:45.124Z","method":"GET","path":"/v2025-02-19/schedules/b1n03q3z/parity","status":200,"ms":211,"blocked":false}
+{"at":"2026-08-04T22:42:45.238Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":188,"blocked":false}
+{"at":"2026-08-04T22:42:45.344Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":93,"blocked":false}
+{"at":"2026-08-04T22:42:45.304Z","method":"GET","path":"/v2025-02-19/journey/scheduled-drafts","status":200,"ms":137,"blocked":false}
+{"at":"2026-08-04T22:42:45.253Z","method":"GET","path":"/v2025-02-19/journey/content-releases","status":200,"ms":195,"blocked":false}
+{"at":"2026-08-04T22:42:45.455Z","method":"OPTIONS","path":"/v2025-02-19/agent/oTu7RImef/bundles/mine/listen","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.239Z","method":"GET","path":"/v2022-06-30/socket/parity","status":502,"ms":220,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:42:45.474Z","method":"GET","path":"/v2025-02-19/journey/scheduled-drafts","status":200,"ms":1,"blocked":false}
+{"at":"2026-08-04T22:42:45.198Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":281,"blocked":false}
+{"at":"2026-08-04T22:42:45.475Z","method":"GET","path":"/v2022-06-30/socket/parity","status":502,"ms":104,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:42:45.453Z","method":"GET","path":"/v2025-02-19/journey/scheduled-drafts","status":200,"ms":206,"blocked":false}
+{"at":"2026-08-04T22:42:45.486Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":191,"blocked":false}
+{"at":"2026-08-04T22:42:45.694Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":94,"blocked":false}
+{"at":"2026-08-04T22:42:45.676Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":187,"blocked":false}
+{"at":"2026-08-04T22:42:45.868Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.871Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.474Z","method":"GET","path":"/v2021-06-07/projects/b1n03q3z/datasets/parity/acl","status":200,"ms":397,"blocked":false}
+{"at":"2026-08-04T22:42:45.871Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.875Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.877Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.879Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.880Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.881Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:45.473Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":441,"blocked":false}
+{"at":"2026-08-04T22:42:45.882Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":80,"blocked":false}
+{"at":"2026-08-04T22:42:45.793Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.structure-tool.layout.article,studio.structure-tool.sort-order.article","status":200,"ms":179,"blocked":false}
+{"at":"2026-08-04T22:42:45.485Z","method":"GET","path":"/v2022-06-30/socket/parity","status":101,"ms":525,"blocked":false,"upgrade":true}
+{"at":"2026-08-04T22:42:45.475Z","method":"GET","path":"/v2025-02-19/journey/content-releases","status":200,"ms":545,"blocked":false}
+{"at":"2026-08-04T22:42:46.060Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":575,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"authorization","rpcId":"wx7Hdbtzz-myzM-sYm-2","wouldBlock":false,"reason":"allowlisted RPC method authorization"}
+{"at":"2026-08-04T22:42:45.873Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":231,"blocked":false}
+{"at":"2026-08-04T22:42:45.915Z","method":"GET","path":"/v2024-09-01/projects/b1n03q3z/user-applications","status":200,"ms":197,"blocked":false}
+{"at":"2026-08-04T22:42:45.963Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":187,"blocked":false}
+{"at":"2026-08-04T22:42:45.976Z","method":"GET","path":"/v2021-12-15/projects/b1n03q3z","status":304,"ms":192,"blocked":false}
+{"at":"2026-08-04T22:42:46.267Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":782,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_rollcall","rpcId":"41vYViGyEAh2ga47PmGC","wouldBlock":false,"reason":"allowlisted RPC method presence_rollcall"}
+{"at":"2026-08-04T22:42:46.267Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":791,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_subscribe","rpcId":"ArenTQhUbWouPkt5f7Ma","wouldBlock":false,"reason":"allowlisted RPC method presence_subscribe"}
+{"at":"2026-08-04T22:42:46.169Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":109,"blocked":false}
+{"at":"2026-08-04T22:42:46.280Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":795,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"423YW0hC2WR-OMBlVXrn","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:42:46.282Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":225,"blocked":false}
+{"at":"2026-08-04T22:42:46.508Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":224,"blocked":false}
+{"at":"2026-08-04T22:42:46.734Z","method":"GET","path":"/v2025-02-19/data/doc/parity/article-01,drafts.article-01","status":200,"ms":185,"blocked":false}
+{"at":"2026-08-04T22:42:46.920Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":187,"blocked":false}
+{"at":"2026-08-04T22:42:47.109Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":195,"blocked":false}
+{"at":"2026-08-04T22:42:47.318Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":197,"blocked":false}
+{"at":"2026-08-04T22:42:47.566Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":2081,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"dPjq9gQFwGiTao99TMZx","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:42:47.524Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":202,"blocked":false}
+{"at":"2026-08-04T22:42:47.728Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":192,"blocked":false}
+{"at":"2026-08-04T22:42:47.924Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":239,"blocked":false}
+{"at":"2026-08-04T22:42:48.168Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":211,"blocked":false}
+{"at":"2026-08-04T22:42:48.380Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-04T22:42:48.383Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":195,"blocked":false}
+{"at":"2026-08-04T22:42:48.581Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":3,"blocked":false}
+{"at":"2026-08-04T22:42:48.585Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":190,"blocked":false}
+{"at":"2026-08-04T22:42:48.776Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":181,"blocked":false}
+{"at":"2026-08-04T22:42:48.961Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.timezone.input.article-01.publishedAt","status":200,"ms":177,"blocked":false}
+{"at":"2026-08-04T22:42:49.151Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":221,"blocked":false}
+{"at":"2026-08-04T22:43:04.631Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":19146,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:43:17.352Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":31867,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"JaycW5UZPTRAaKzvs-jq","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:43:34.624Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":49139,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:43:47.354Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":61869,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"Zaf7tRAOr2Rwl7-Gy-s3","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:44:04.626Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":79141,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:44:17.352Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":91867,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"Riar02FypUBvor9IV7dP","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:44:34.628Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":109143,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:44:47.350Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":121865,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"VmryUTbRrSmkfGd5ddcS","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:45:04.627Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":139142,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:45:17.354Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":151869,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"zNpMgq1JPOoYIad9oM7N","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:45:34.627Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":169142,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:45:47.351Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":181866,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"rt0vdH2nNDiHBY-zOeK5","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:46:04.623Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":199138,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-04T22:46:17.350Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":211866,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"vJhR7fCAHpAR2l4cLhJ6","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-04T22:42:46.151Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":223478,"blocked":false}
+{"at":"2026-08-04T22:46:29.636Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":396,"blocked":false}
+{"at":"2026-08-04T22:46:30.037Z","method":"GET","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":200,"ms":199,"blocked":false}
+{"at":"2026-08-04T22:46:30.240Z","method":"GET","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":200,"ms":223,"blocked":false}
+{"at":"2026-08-04T22:46:30.464Z","method":"GET","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":200,"ms":270,"blocked":false}

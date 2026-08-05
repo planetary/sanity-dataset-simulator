@@ -69,6 +69,23 @@ const DRAFT_ARTICLE = {
 
 const PAIR_IDS = ['article-1', 'drafts.article-1'] as const
 
+/**
+ * The revision an overlay document is expected to be at, by counter only.
+ *
+ * `_rev` is `overlay.<counter>.<content hash>`. The **counter** is the claim these
+ * tests make — it says how many revisions the action produced, so an action that
+ * silently applied twice, or that rewrote a perspective it should not have
+ * touched, fails here. The **hash** is a property of the canonical serializer in
+ * `sanity-overlay-core`, which these tests do not exercise and must not pin:
+ * doing so would turn every legitimate serializer change (key order, unicode
+ * normalisation) into six opaque failures in an integration suite that has no
+ * opinion about hashing. The hashes were verified to reproduce exactly at the
+ * time of writing; they are deliberately not asserted.
+ */
+function OVERLAY_REV(counter: number): unknown {
+  return expect.stringMatching(new RegExp(`^overlay\\.${counter}\\.[0-9a-f]{12}$`))
+}
+
 function publishAction(): unknown[] {
   return [
     {
@@ -586,7 +603,14 @@ describe('document actions persist through the overlay server', () => {
     /* Read back through a *restarted* server: the claim is about disk. */
     const stored = await reread(root, 'article-1')
     expect(stored?.draft).toBeNull()
-    expect(stored?.published).toMatchObject({_id: 'article-1', title: 'Published body'})
+    expect(stored?.published).toEqual({
+      _createdAt: '2025-12-01T00:00:00.000Z',
+      _id: 'article-1',
+      _rev: OVERLAY_REV(2),
+      _type: 'article',
+      _updatedAt: '2026-01-01T00:00:09.000Z',
+      title: 'Published body',
+    })
 
     const intent = await readIntentRaw(root, 'article-1')
     expect(intent.logicalId).toBe('article-1')
@@ -614,7 +638,14 @@ describe('document actions persist through the overlay server', () => {
     const stored = await reread(root, 'article-1')
     expect(stored?.publishedTombstone).toBe(true)
     expect(stored?.published).toBeNull()
-    expect(stored?.draft).toMatchObject({title: 'Will be unpublished'})
+    expect(stored?.draft).toEqual({
+      _createdAt: '2025-12-01T00:00:00.000Z',
+      _id: 'drafts.article-1',
+      _rev: OVERLAY_REV(3),
+      _type: 'article',
+      _updatedAt: '2026-01-01T00:00:14.000Z',
+      title: 'Will be unpublished',
+    })
   })
 
   it('discards the draft without touching local published', async () => {
@@ -639,7 +670,14 @@ describe('document actions persist through the overlay server', () => {
 
     const stored = await reread(root, 'article-1')
     expect(stored?.draft).toBeNull()
-    expect(stored?.published).toMatchObject({title: 'Promoted'})
+    expect(stored?.published).toEqual({
+      _createdAt: '2025-12-01T00:00:00.000Z',
+      _id: 'article-1',
+      _rev: OVERLAY_REV(2),
+      _type: 'article',
+      _updatedAt: '2026-01-01T00:00:09.000Z',
+      title: 'Promoted',
+    })
   })
 
   it('deletes: both perspectives are tombstoned and the record survives', async () => {
@@ -683,7 +721,14 @@ describe('document actions persist through the overlay server', () => {
 
     const stored = await reread(root, 'article-1')
     expect(stored?.draftTombstone).toBe(false)
-    expect(stored?.draft).toMatchObject({title: 'Recovered'})
+    expect(stored?.draft).toEqual({
+      _createdAt: '2025-12-01T00:00:00.000Z',
+      _id: 'drafts.article-1',
+      _rev: OVERLAY_REV(4),
+      _type: 'article',
+      _updatedAt: '2026-01-01T00:00:19.000Z',
+      title: 'Recovered',
+    })
   })
 
   it('duplicates a document into a new logical id', async () => {
@@ -707,13 +752,27 @@ describe('document actions persist through the overlay server', () => {
     expect(json).toMatchObject({ok: true, committed: true})
 
     const copy = await reread(root, 'article-copy')
-    expect(copy?.draft).toMatchObject({_id: 'drafts.article-copy', title: 'Original'})
+    expect(copy?.draft).toEqual({
+      _createdAt: '2026-01-01T00:00:09.000Z',
+      _id: 'drafts.article-copy',
+      _rev: OVERLAY_REV(2),
+      _type: 'article',
+      _updatedAt: '2026-01-01T00:00:10.000Z',
+      title: 'Original',
+    })
     /* §18.9 "[MUST] Remove base revision metadata" — the copy must not inherit
      * the source's Content Lake revision. */
     expect(copy?.draft?._rev).not.toBe(PUBLISHED_ARTICLE._rev)
 
     const original = await reread(root, 'article-1')
-    expect(original?.draft).toMatchObject({title: 'Original'})
+    expect(original?.draft).toEqual({
+      _createdAt: '2025-12-01T00:00:00.000Z',
+      _id: 'drafts.article-1',
+      _rev: OVERLAY_REV(1),
+      _type: 'article',
+      _updatedAt: '2026-01-01T00:00:04.000Z',
+      title: 'Original',
+    })
   })
 
   it('replays a repeated document-action key instead of applying it twice', async () => {
