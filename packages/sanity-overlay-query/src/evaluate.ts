@@ -102,19 +102,41 @@ export async function evaluateOverlayQuery<T = unknown>(
   const plan = planCandidateRequests(def, params, {affectedIds})
   const derefPaths = analyzeDerefPaths(tree)
 
-  /* 5. Fetch base candidates. */
+  /* 5. Fetch base candidates.
+   *
+   * Core requests every adapter serves; extended requests only an adapter that
+   * opted in does. When it has not, the query is REFUSED. The alternative — ask
+   * for the candidate types and apply the predicate locally — returns the right
+   * answer while transferring the whole type, so no parity test could ever see
+   * it, and §22.2 forbids that class of silent degradation outright. */
   const baseById = new Map<string, QueryDocument>()
   let baseRequestCount = 0
   let baseFetchDocuments = 0
   const fetched: QueryDocument[] = []
-  for (const request of plan.baseRequests) {
-    baseRequestCount++
-    const documents = await base.fetchCandidates(request)
+  const absorb = (documents: readonly QueryDocument[]): void => {
     baseFetchDocuments += documents.length
     for (const doc of documents) {
       baseById.set(doc._id, doc)
       fetched.push(doc)
     }
+  }
+  for (const request of plan.baseRequests) {
+    baseRequestCount++
+    absorb(await base.fetchCandidates(request))
+  }
+  for (const request of plan.extendedRequests) {
+    if (typeof base.fetchExtendedCandidates !== 'function') {
+      throw new OverlayQueryError(
+        'UNSUPPORTED_GROQ',
+        `Query ${def.id} plans a ${JSON.stringify(request.kind)} base fetch, which this base ` +
+          `source does not implement (QueryBaseSource.fetchExtendedCandidates is absent). ` +
+          `Falling back to a broader fetch filtered locally would return the right answer by ` +
+          `over-fetching, which PRD §22.2 forbids.`,
+        {queryId: def.id, requestKind: request.kind},
+      )
+    }
+    baseRequestCount++
+    absorb(await base.fetchExtendedCandidates(request))
   }
 
   const candidates = new Map<string, QueryDocument>()

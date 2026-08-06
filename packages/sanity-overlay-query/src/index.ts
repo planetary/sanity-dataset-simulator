@@ -38,7 +38,12 @@ export type {OverlayQueryRegistry} from './registry'
 export {M_LOCAL_QUERIES} from './mLocalRegistry'
 
 export {createMemoryBaseSource} from './baseSource'
-export type {BaseCandidateRequest, QueryBaseSource} from './baseSource'
+export type {
+  BaseCandidateRequest,
+  ExtendedCandidateRequest,
+  PlannedCandidateRequest,
+  QueryBaseSource,
+} from './baseSource'
 
 export {emptyOverlaySource, resolveVirtualDocument} from './overlaySource'
 export type {OverlaySource} from './overlaySource'

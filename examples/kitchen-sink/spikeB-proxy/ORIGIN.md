@@ -250,6 +250,80 @@ Persistence, the mutation engine, perspective resolution and the §18 reducers
 are all composed from the existing packages. `origin.mjs` owns no overlay
 semantics; it is HTTP plus translation.
 
+#### The structure list is a *findability* query, and it needed two fixes
+
+A Studio structure list pane does **not** send `*[_type == "article"]`. It sends
+the search service's findability query, built by `createSearchQuery` in
+`sanity@6.8.0`:
+
+```groq
+// findability-mvi:5
+// findability-source: list
+*[_type in $__types && ([@, _id] match text::query($__query) || references($__rawQuery)) && (_type == $type)] {
+  _type, _id, _originalId, "orderings": [_updatedAt]
+} | order(orderings[0] desc) [0...$__limit]
+```
+
+Two things in it defeat `groq-js@2.0.0`, and in Mode 2 — with no upstream to
+fall back to — either one means **an empty content list**, which is the worst
+possible failure for a branch overlay whose whole purpose is editing content:
+
+1. `[0...$__limit]` — groq-js answers *"slicing must use constant numbers"*. The
+   query never parses, so not one document comes back.
+2. `text::query(...)` — groq-js parses it, then throws *"not implemented"*
+   during evaluation. It is Content Lake's hosted full-text index.
+
+**What the parameters actually carry.** Not assumed — `origin-findability.test.ts`
+extracts Studio's own `prefixLast()` out of the installed dist and runs it:
+
+| case | `$__query` | `$__rawQuery` | `$__limit` |
+|---|---|---|---|
+| unfiltered pane (`searchQuery \|\| ""`) | `"*"` | `""` | `(limit ?? 1000) + 1` |
+| typed term `Born` | `"Born*"` | `"Born"` | ditto |
+
+That is the crux. For the case the structure list overwhelmingly uses — no
+search term — the predicate means **"match everything of these types"**. Over a
+Mode 2 dataset, which *is* the overlay in full, that answer is **exact**.
+Returning nothing was never an honest degradation; it was simply wrong.
+
+**How it is answered now.** Before evaluation, `origin.mjs`:
+
+- retries the parse with integer parameters substituted into slice endpoints —
+  and *only* after groq-js has already refused the source, so a query groq-js
+  accepts is never rewritten;
+- resolves every `<expr> match text::query($p)` by evaluating `<expr>` once per
+  document with that document as `@`, collecting its text leaves, and applying
+  groq-js's own `match` operator, then rewrites the predicate to
+  `_id in $<generated ids>`. Evaluating the left-hand side rather than
+  pattern-matching one captured query shape means `[@, _id]`, a plain field path
+  and a dereference all work.
+
+`references($__rawQuery)` needs no special handling: groq-js implements
+`references`, and with the empty raw term of an unfiltered pane it is false for
+every document, so the list result above cannot be explained by it. With a typed
+term that *is* a document id, it does what it says — referencing documents show
+up in the pane.
+
+**Where this is approximate, it says so.** With a typed term, hosted
+`text::query` does stemming, language analysis and relevance ranking against an
+index this process does not have. Mode 2 substitutes case-insensitive prefix
+token matching over the document's own text. Every such response carries
+
+```json
+"overlayApproximation": [
+  {"function": "text::query", "term": "Born*", "matched": 1, "reason": "…"}
+]
+```
+
+alongside `result`, and logs a warning. `"*"` is **not** reported as an
+approximation, because it is exact. System fields (`_rev`, `_createdAt`,
+`_key`, `_ref`, …) are excluded from the searchable text — a document should not
+surface because its revision hash contained your term; `_id` still participates,
+because Studio's predicate names it explicitly.
+
+Used as a **value** rather than as the right-hand side of `match`,
+`text::query()` has no honest local answer at all and raises 501.
+
 ---
 
 ## What Mode 2 does NOT do
@@ -339,9 +413,11 @@ is a claim only a browser can settle.
 | `test/origin-safety.test.ts` | loopback-only, explicit opt-in, the guard is not weakened, Mode 1 is unchanged |
 | `test/origin-boot.test.ts` | every recorded request line is served / blocked / declared; synthetic identity; the bifur handshake |
 | `test/origin-data.test.ts` | empty base; branch-create → read back; GROQ over overlay; patch/publish/delete; restart durability; the listen stream |
+| `test/origin-findability.test.ts` | the structure list: Studio's verbatim findability query returns the overlay; the parameter shapes, established by running Studio's own `prefixLast`; typed search narrows; approximation is declared; branch-created in, tombstoned out |
 | `test/write-guard.test.ts` | the write-guard contract itself, unchanged |
 
 Mutation-checked: removing the loopback restriction → 4 red; inferring Mode 2
 instead of requiring the opt-in → 6 red; canonicalising the origin write
-allowlist instead of requiring an already-canonical request line → 14 red. Each
-restored and re-verified green.
+allowlist instead of requiring an already-canonical request line → 14 red;
+making the findability text match find nothing → 7 red; dropping tombstone
+suppression from the list corpus → 7 red. Each restored and re-verified green.

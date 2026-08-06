@@ -90,7 +90,7 @@ Constraints that are testable in CI from day one:
 
 PRD §37 Phase 1 checkboxes, reproduced verbatim, with the concrete schema each refers to.
 
-- [ ] **Define manifest schema.** → `OverlayManifest` (PRD §13.1): `formatVersion`, `overlayId`, `status` (the six §12.3 lifecycle states), `base`, `source`, `revision`, timestamps, actors, `documentHeads: Record<string, OverlayDocumentHead>`, `transactionHead`, `conflictSummary {total, hard, soft}`, `checkpoint`, `promotion`, `expiresAt`. Also define `OverlayDocumentHead` (PRD §13.2) with `state`, `hasDraft`, `hasPublished`, `hasConflict`, `storageRef`, `checksum`, and `OverlayActor` (PRD §13.8).
+- [ ] **Define manifest schema.** → `OverlayManifest` (PRD §13.1): `formatVersion`, `overlayId`, `status` (the six §12.3 lifecycle states), `base`, `source`, `revision`, timestamps, actors, `documentHeads: Record<string, OverlayDocumentHead>`, `transactionHead`, `conflictSummary {total, hard, soft}`, `checkpoint`, `promotion` (**reserved and never written** — promotion is out of scope permanently since 2026-08-05; the field stays in the type rather than being migrated out), `expiresAt`. Also define `OverlayDocumentHead` (PRD §13.2) with `state`, `hasDraft`, `hasPublished`, `hasConflict`, `storageRef`, `checksum`, and `OverlayActor` (PRD §13.8).
 - [ ] **Define document record schema.** → `OverlayDocumentRecord` (PRD §13.3) with `origin: 'base' | 'branch'`, the nullable `base` block (`published`/`draft` as `BaseDocumentVersion`, `lastObserved*Revision`, `baseStatus`), the `local` block (`published`/`draft` as `LocalDocumentVersion`, `publishedTombstone`, `draftTombstone`), and `conflicts`. Include `BaseDocumentVersion` (§13.4) and `LocalDocumentVersion` (§13.5: `materialized`, `touchedPaths`, `operations`, `ancestorKind`, `ancestorRevision`, `overlayRevision`).
 - [ ] **Define operation schema.** → `OverlayOperation` union (PRD §13.7): `set`, `setIfMissing`, `unset`, `insert` (`before | after | replace`), `inc`, `dec`, `diffMatchPatch`, `replaceDocument`.
 - [ ] **Define transaction schema.** → `OverlayTransactionRecord` (PRD §13.10): `transactionId`, `overlayRevisionBefore/After`, `actor`, `requestedAt`/`committedAt`, `mutations`, `affectedDocumentIds`, `resultChecksums`, `requestId`, `idempotencyKey`. Implement the document-level `OverlayMutation` envelope now defined in PRD §13.7 (v1.1): `create`, `createIfNotExists`, `createOrReplace`, `delete`, and `patch` with `ifRevision` precondition and `operations: OverlayOperation[]`, matching the §25.6 primitives (resolution of former Open question O1 — see §12).
@@ -115,7 +115,7 @@ PRD §37 Phase 1 checkboxes, mapped to §13.7 operations, §25.6 primitives, and
 - [ ] **Implement create.** Branch-created document: `origin: 'branch'`, new logical ID, `_type` required at creation, `_createdAt` set once (PRD §13.9).
 - [ ] **Implement create-if-not-exists.** Existence is evaluated against the *virtual* dataset — base plus overlay plus tombstones — not the overlay alone (PRD §35.4 "Create-if-not-exists against base and overlay").
 - [ ] **Implement create-or-replace.** Follows §17.10 full-document replacement: store the complete replacement, mark all user fields touched, preserve protected system fields per policy, require explicit intent for `_type` changes, and treat `_id` changes as create-new plus reference migration (never in-place mutation).
-- [ ] **Implement delete and tombstones.** Check incoming strong references in the virtual dataset and block the delete when a strong reference would become invalid — **unless the same transaction updates or deletes all referring documents** (PRD §18.8), which keeps legitimate multi-document delete transactions legal (§37 Phase 1 "Implement multi-document transactions", §35.4 "Multi-document transaction"). Otherwise set `local.publishedTombstone` and `local.draftTombstone` (PRD §13.3, §18.8). A tombstone suppresses inheritance; deleting a record is not a content delete (PRD §34.2). Preserve record metadata for diff, recovery and promotion (§18.8).
+- [ ] **Implement delete and tombstones.** Check incoming strong references in the virtual dataset and block the delete when a strong reference would become invalid — **unless the same transaction updates or deletes all referring documents** (PRD §18.8), which keeps legitimate multi-document delete transactions legal (§37 Phase 1 "Implement multi-document transactions", §35.4 "Multi-document transaction"). Otherwise set `local.publishedTombstone` and `local.draftTombstone` (PRD §13.3, §18.8). A tombstone suppresses inheritance; deleting a record is not a content delete (PRD §34.2). Preserve record metadata for diff and recovery (§18.8). (§18.8's "and promotion" clause is inert since 2026-08-05.)
 - [ ] **Implement set.** → §13.7 `{type: 'set'; path; value}`. Records `path` in `LocalDocumentVersion.touchedPaths` (§13.5) under the §17.6 object rules: track the nested path where possible, treat a full object replacement as touching the whole subtree, and preserve new upstream sibling fields when only one child path is touched. Covered by §35.4 "Set".
 - [ ] **Implement set-if-missing.** → §13.7 `{type: 'setIfMissing'; path; value}`. Missingness is evaluated against the *resolved virtual document* — base merged with overlay per the §17.2 precedence — not the local record alone; this is the same base-vs-overlay existence question the PRD makes explicit for the parallel primitive in §35.4 "Create-if-not-exists against base and overlay". When the value is already present the operation is a no-op and records **no** touched path, so the path continues to inherit base. Covered by §35.4 "Set-if-missing".
 - [ ] **Implement unset.** Explicit unset must be recorded as a tracked field tombstone / unset operation on a touched path, continue suppressing base fields added or changed later, and be removable to resume inheritance (PRD §17.5, invariant §34.11).
@@ -192,7 +192,7 @@ PRD §37 Phase 1 checkboxes, mapped to §19.
 - [ ] Export canonical state.
 - [ ] Import canonical state.
 - [ ] Mark closed.
-- [ ] Mark promoted.
+- [ ] Mark promoted. *(Store-contract lifecycle only. Nothing calls it: promotion is out of scope permanently since 2026-08-05, so `markPromoted` is a reserved transition, not a feature.)*
 - [ ] Retention metadata.
 - [ ] Delete overlay.
 - [ ] Orphan revision cleanup.
@@ -217,7 +217,9 @@ Implement as assertions callable from both tests and runtime debug tooling. In s
 - [ ] §34.14 Base deletion never destroys a touched materialized document.
 - [ ] §34.17 Checkpoint output is deterministic for the same logical state (serializer-level assertion; checkpoint I/O is Phase 3/7).
 
-Deferred with an owning phase, not dropped: §34.7 and §34.19 (Phase 4), §34.9 and §34.18 and §34.20 (Phase 8), §34.10 (partially here via W4, fully at publish/promotion), §34.15 (Phases 1 and 4 safety tests), §34.16 (Phase 6).
+Deferred with an owning phase, not dropped: §34.7 and §34.19 (Phase 4), §34.10 (partially here via W4, fully at publish), §34.15 (Phases 1 and 4 safety tests), §34.16 (Phase 6).
+
+§34.9, §34.18 and §34.20 were owned by Phase 8's promotion half and are **retired**, not deferred — 2026-08-05 ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)): all three are invariants about applying overlay content to a real Sanity dataset, which this system never does.
 
 ### 8.4 Unit test corpus
 
@@ -290,7 +292,7 @@ Steps 3-6 are the critical path; W1 format-version migration framework and testk
 - [ ] Serializer output is byte-identical for the same logical state (PRD §34.17, §14.3, §35.9 "Deterministic serialization"). *Plan-level guidance:* additionally verify across platforms and Node versions in CI.
 - [ ] Contract-test runner is exported from the testkit and consumable by Phase 3.
 - [ ] Implementation matches the §12 resolution log (PRD v1.1); no unresolved open questions remain for this phase.
-- [ ] Phase report states which milestone claims are made: `[M-LOCAL]` foundations only; no `[M-LOCAL]`, `[M-PREVIEW]`, `[M-PROD]` or `[M-PROMO]` acceptance is claimed (PRD §1.4, §38).
+- [ ] Phase report states which milestone claims are made: `[M-LOCAL]` foundations only; no `[M-LOCAL]`, `[M-PREVIEW]` or `[M-PROD]` acceptance is claimed (PRD §1.4, §38). (`[M-PROMO]` was retired on 2026-08-05.)
 
 ---
 
@@ -303,7 +305,8 @@ Steps 3-6 are the critical path; W1 format-version migration framework and testk
 | Studio client facade, actions UI, listener emulation, conflict panel UI (PRD §21, §28.2-28.3) | Phase 5 |
 | GROQ planner, evaluator, query registry, parity harness (PRD §22, §35.10-35.11) | Phase 6 (minimal ID/slug planners and reduced registry pulled into Phase 3 by the v1.1 §37 Phase 2 minimal slice) |
 | Checkpoint export/import to `.sanity-overlay/` files, CI status checks, drift scan (PRD §29, §16.6) | Phase 7 (a minimal Blob-export CLI path lands in Phase 4 per the v1.1 §37 Phase 3 task) |
-| Assets and promotion (PRD §24, §30) | Phase 8 |
+| Branch assets, local and preview only (PRD §24 minus §24.9) | Phase 8 |
+| ~~Promotion (PRD §30)~~ | **OUT OF SCOPE PERMANENTLY — 2026-08-05.** The implementing module and its 108 tests were deleted |
 | API routes, auth, CSRF, SSE (PRD §25, §26) | Phases 3, 4 and 7 |
 | Live edit mode (PRD §18.10 `[LATER]`) | Out of milestone scope; flag only |
 
@@ -321,7 +324,7 @@ Eight questions were recorded here when this plan was first written. The PRD v1.
 
 - **O1 — `OverlayMutation` was referenced but never defined. Resolved.** §13.7 now defines the document-level union: `create`, `createIfNotExists`, `createOrReplace`, `delete`, and `patch` with `ifRevision` and `operations: OverlayOperation[]`, matching the §25.6 primitives. `replaceDocument` remains a patch-level operation inside `OverlayOperation`.
 - **O2 — Conflict type union omitted `OVERLAY_SAME_PATH_CHANGED`. Resolved.** The §13.11 union now includes it (thirteen members). Per §17.4 it is first surfaced to the writing client at commit time (§17.11), persisted only when it remains unresolved, and a persisted instance is soft and counted in `conflictSummary.soft`.
-- **O3 — Default severity was unspecified for four conflict types. Resolved.** §17.4 now carries rows for `BASE_DRAFT_DELETED` (soft; local draft wins, §18.2 fallback), `BASE_TYPE_CHANGED` (hard), `ARRAY_KEY_COLLISION` (hard), `UNSUPPORTED_SCHEMA_MIGRATION` (hard; blocks branch publish and promotion), and `OVERLAY_SAME_PATH_CHANGED` (soft), and states that every §13.11 union member maps to a table row.
+- **O3 — Default severity was unspecified for four conflict types. Resolved.** §17.4 now carries rows for `BASE_DRAFT_DELETED` (soft; local draft wins, §18.2 fallback), `BASE_TYPE_CHANGED` (hard), `ARRAY_KEY_COLLISION` (hard), `UNSUPPORTED_SCHEMA_MIGRATION` (hard; blocks branch publish; its "and promotion" clause is inert since 2026-08-05), and `OVERLAY_SAME_PATH_CHANGED` (soft), and states that every §13.11 union member maps to a table row.
 - **O4 — Checksum algorithm and synthetic revision precision. Resolved.** §13.2 now specifies SHA-256 over the canonical JSON serialization (§14.3 rules), hex encoded, for all data-model checksum fields, with `documentChecksumPrefix` as the first 12 hex characters.
 - **O5 — Idempotency key vs transaction ID. Resolved.** §5.3 and §13.10 now make `idempotencyKey` the deduplication authority; a retried request with the same key returns the original result including its `transactionId`, which names and orders the record without participating in deduplication. §13.10 further makes `transactionId` server-assigned (unique, commit-time ordered, e.g. a ULID) so the §15.1 immutable transaction path is collision-free, and §25.5's request field is now advisory `clientTransactionId`.
 - **O6 — Ancestor storage after auto-rebase. Resolved.** §13.3 now states the `base` block holds the current merge ancestor, captured at first touch and replaced only by explicit or automatic rebase (§28.4, §28.5) in one transaction, with `firstTouchedAt` never modified.

@@ -33,6 +33,12 @@ export type OverlayErrorCode =
   /* W4 — references (PRD §19.4 truncation, §19.5 integrity). */
   | 'OVERLAY_REFERENCE_DEPTH_EXCEEDED'
   | 'OVERLAY_REFERENCE_INTEGRITY'
+  /* Branch-local assets (PRD §24.3 step 4, §24.5, §24.6). */
+  | 'OVERLAY_ASSET_METADATA_UNAVAILABLE'
+  | 'OVERLAY_ASSET_IN_USE'
+  | 'OVERLAY_ASSET_REJECTED'
+  | 'OVERLAY_ASSET_NOT_FOUND'
+  | 'OVERLAY_ASSET_CHECKSUM_MISMATCH'
 
 export interface OverlayErrorDetails {
   readonly [key: string]: unknown

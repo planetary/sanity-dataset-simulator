@@ -22,6 +22,34 @@ export {OVERLAY_CACHE_TAG, createOverlayClient} from './client'
 export {createDocumentBaseSource, createHttpBaseSource} from './base'
 export type {HttpBaseSourceOptions} from './base'
 
+/**
+ * The host-level staging-write refusal (owner ruling, 2026-08-05): this system
+ * never writes to a real Sanity dataset, including its asset API. Exported so
+ * every enforcement point in the project quotes one policy rather than three.
+ */
+export {
+  SAFE_METHODS,
+  STAGING_WRITE_POLICY,
+  StagingWriteRefusedError,
+  assertNoStagingWrite,
+  createStagingSafeFetch,
+  hostOfRequest,
+  isSanityApiHost,
+  isStagingWrite,
+  normalizeHost,
+  normalizeMethod,
+} from './stagingHost'
+export type {StagingWriteTarget} from './stagingHost'
+
+/* Branch-local asset delivery — the §24.7 route, transport-neutral (PRD §24.3 step 7). */
+export {createOverlayAssetDelivery} from './assets'
+export type {
+  CreateOverlayAssetDeliveryOptions,
+  OverlayAssetDeliveryRequestInit,
+  OverlayAssetDeliveryResponse,
+  OverlayAssetSource,
+} from './assets'
+
 export {createFsOverlayStateLoader} from './fsLoader'
 export type {FsOverlayStateLoader, FsOverlayStateLoaderOptions} from './fsLoader'
 

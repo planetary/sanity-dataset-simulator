@@ -493,6 +493,251 @@ export function translateActions(actions) {
 }
 
 /* ------------------------------------------------------------------ *
+ * findability — the query Studio's structure list actually sends
+ * ------------------------------------------------------------------ *
+ *
+ * A structure list pane does NOT send `*[_type == "article"]`. It sends the
+ * search service's *findability* query, built by `createSearchQuery` in
+ * `sanity@6.8.0`:
+ *
+ *   // findability-mvi:5
+ *   // findability-source: list
+ *   *[_type in $__types && ([@, _id] match text::query($__query) ||
+ *      references($__rawQuery)) && (_type == $type)] {
+ *     _type, _id, _originalId, "orderings": [_updatedAt]
+ *   } | order(orderings[0] desc) [0...$__limit]
+ *
+ * Two things in it defeat `groq-js` 2.0.0, and both were fatal in Mode 2, where
+ * an unanswered query means an EMPTY CONTENT LIST rather than a fallback to
+ * staging:
+ *
+ *   1. `[0...$__limit]` — groq-js: "slicing must use constant numbers". The
+ *      whole query fails to PARSE, so not one document comes back.
+ *   2. `text::query(...)` — groq-js parses it and then throws "not implemented"
+ *      during evaluation. It is Content Lake's hosted full-text index.
+ *
+ * WHAT THE PARAMETERS ACTUALLY CARRY  (from `createSearchQuery` + `prefixLast`
+ * in the installed dist; `origin-findability.test.ts` extracts and RUNS
+ * Studio's own `prefixLast` rather than taking anyone's word for it)
+ *
+ *   unfiltered pane   the pane passes `searchQuery || ""`, so the raw term is
+ *                     `""`; `prefixLast("")` returns `"*"`.
+ *                     -> `$__query = "*"`, `$__rawQuery = ""`
+ *   typed term "Born" -> `$__query = "Born*"`, `$__rawQuery = "Born"`
+ *   always            -> `$__limit = (limit ?? 1000) + 1`
+ *
+ * That is the crux. For the case the structure list overwhelmingly uses — no
+ * search term — the predicate means "match everything of these types". Over a
+ * Mode 2 dataset, which IS the overlay in full, that answer is EXACT. Returning
+ * nothing was never the honest degradation; it was simply wrong.
+ *
+ * WHAT IS APPROXIMATE, AND HOW IT SAYS SO
+ * ---------------------------------------
+ * With a typed term, hosted `text::query` does stemming, language analysis and
+ * relevance ranking against an index this process does not have. Mode 2 does
+ * case-insensitive prefix token matching over the document's own text, using
+ * groq-js's own `match` operator so the tokenisation is at least the pinned
+ * evaluator's rather than a hand-rolled one. It is close, it is not the same,
+ * and it must not pretend: every such query answers with an
+ * `overlayApproximation` array naming `text::query`, the term and the reason.
+ * `"*"` is reported as exact, because it is.
+ *
+ * Anywhere `text::query` is used as a VALUE rather than as the right-hand side
+ * of `match`, there is no honest local answer at all, and Mode 2 raises 501.
+ */
+
+/** `[0...$__limit]` and friends. `...` before `..` — alternation order matters. */
+const PARAMETERISED_SLICE =
+  /\[\s*(-?\d+|\$[A-Za-z_][A-Za-z0-9_]*)\s*(\.\.\.|\.\.)\s*(-?\d+|\$[A-Za-z_][A-Za-z0-9_]*)\s*\]/g
+
+/**
+ * Replace `$param` slice endpoints with their integer values.
+ *
+ * Applied ONLY after groq-js has already refused the source, so a query that
+ * parses is never rewritten and this can introduce no behaviour of its own. A
+ * `$param` that is not a safe integer is deliberately left alone: the re-parse
+ * then fails again and the caller gets the parse error, rather than a silently
+ * unbounded list.
+ */
+export function substituteSliceParameters(source, params) {
+  return source.replace(PARAMETERISED_SLICE, (whole, left, dots, right) => {
+    const resolve = (side) => {
+      if (!side.startsWith('$')) return side
+      const value = isRecord(params) ? params[side.slice(1)] : undefined
+      return Number.isSafeInteger(value) ? String(value) : null
+    }
+    const a = resolve(left)
+    const b = resolve(right)
+    if (a === null || b === null) return whole
+    return `[${a}${dots}${b}]`
+  })
+}
+
+/** groq-js's own `match`, reused so the tokenisation is the evaluator's. */
+const MATCH_PROBE = parseGroq('$__haystack match $__pattern')
+
+/** Guards against a pathological document; the overlay is small, not trusted. */
+const MAX_TEXT_DEPTH = 12
+const MAX_TEXT_LEAVES = 5000
+
+/**
+ * Every searchable string reachable from a value.
+ *
+ * System fields are skipped by key prefix: `_rev`, `_createdAt`, `_key`, `_ref`
+ * and friends are bookkeeping, and hosted full-text search does not surface a
+ * document because its revision hash happened to contain your term. `_id` still
+ * participates, because Studio's predicate names it explicitly as its own array
+ * element (`[@, _id]`) rather than relying on `@`.
+ */
+function collectSearchableStrings(value, out = [], depth = 0) {
+  if (out.length >= MAX_TEXT_LEAVES || depth > MAX_TEXT_DEPTH) return out
+  if (typeof value === 'string') {
+    out.push(value)
+    return out
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectSearchableStrings(item, out, depth + 1)
+    return out
+  }
+  if (isRecord(value)) {
+    for (const [key, item] of Object.entries(value)) {
+      if (key.startsWith('_')) continue
+      collectSearchableStrings(item, out, depth + 1)
+    }
+  }
+  return out
+}
+
+function isTextQueryCall(node) {
+  return isRecord(node) && node.type === 'FuncCall' && node.namespace === 'text' && node.name === 'query'
+}
+
+/** A constant string argument, or `null` when it cannot be known before evaluation. */
+function constantString(node, params) {
+  if (!isRecord(node)) return null
+  if (node.type === 'Parameter') {
+    const value = isRecord(params) ? params[node.name] : undefined
+    return typeof value === 'string' ? value : null
+  }
+  if (node.type === 'Value' && typeof node.value === 'string') return node.value
+  return null
+}
+
+/** Pre-order walk yielding every `<expr> match text::query(<arg>)` node. */
+function collectTextQueryMatches(node, found = []) {
+  if (Array.isArray(node)) {
+    for (const item of node) collectTextQueryMatches(item, found)
+    return found
+  }
+  if (!isRecord(node)) return found
+  if (node.type === 'OpCall' && node.op === 'match' && isTextQueryCall(node.right)) found.push(node)
+  for (const value of Object.values(node)) collectTextQueryMatches(value, found)
+  return found
+}
+
+function containsTextQueryCall(node) {
+  if (Array.isArray(node)) return node.some((item) => containsTextQueryCall(item))
+  if (!isRecord(node)) return false
+  if (isTextQueryCall(node)) return true
+  return Object.values(node).some((value) => containsTextQueryCall(value))
+}
+
+/** Structural copy with the collected nodes swapped for their replacements. */
+function replaceNodes(node, replacements) {
+  if (Array.isArray(node)) return node.map((item) => replaceNodes(item, replacements))
+  if (!isRecord(node)) return node
+  const replacement = replacements.get(node)
+  if (replacement !== undefined) return replacement
+  const next = {}
+  for (const [key, value] of Object.entries(node)) next[key] = replaceNodes(value, replacements)
+  return next
+}
+
+/**
+ * Resolve every `text::query` match against the corpus, ahead of evaluation.
+ *
+ * The left-hand side is evaluated by groq-js once per document with that
+ * document as `@`, so this works for `[@, _id]`, for a plain field path, and for
+ * a dereference alike — no special-casing of the one query shape we happen to
+ * have captured. The predicate then becomes `_id in $<generated>`, which the
+ * pinned evaluator can run.
+ *
+ * @returns {Promise<{tree: object, params: object, approximations: object[]}>}
+ */
+async function resolveTextQueries(tree, params, documents, evaluateNode) {
+  const matches = collectTextQueryMatches(tree)
+  if (matches.length === 0) {
+    if (containsTextQueryCall(tree)) {
+      throw new OriginError(
+        501,
+        'OVERLAY_ORIGIN_UNIMPLEMENTED',
+        'Mode 2 (origin) does not implement `text::query()` anywhere except as the right-hand ' +
+          'side of a `match` predicate. As a value it is a handle into Content Lake\'s hosted ' +
+          'full-text index, which this process does not have and will not fake.',
+        {endpoint: 'text::query as a value'},
+      )
+    }
+    return {tree, params: {}, approximations: []}
+  }
+
+  const replacements = new Map()
+  const generated = {}
+  const approximations = []
+  let index = 0
+
+  for (const node of matches) {
+    const pattern = constantString(node.right.args?.[0], params)
+    if (pattern === null) {
+      throw new OriginError(
+        501,
+        'OVERLAY_ORIGIN_UNIMPLEMENTED',
+        'Mode 2 (origin) does not implement `text::query()` with a search term it cannot know ' +
+          'before evaluation. Studio passes it as a parameter (`$__query`); a computed term ' +
+          'would need the hosted index.',
+        {endpoint: 'text::query with a computed term'},
+      )
+    }
+
+    const ids = []
+    for (const document of documents) {
+      const left = await evaluateNode(node.left, {root: document})
+      const haystack = collectSearchableStrings(left)
+      if (haystack.length === 0) continue
+      const matched = await evaluateNode(MATCH_PROBE, {
+        params: {__haystack: haystack, __pattern: pattern},
+      })
+      if (matched === true) ids.push(document._id)
+    }
+
+    const name = `__overlayTextMatch${(index += 1)}`
+    generated[name] = ids
+    replacements.set(node, {
+      type: 'OpCall',
+      op: 'in',
+      left: {type: 'AccessAttribute', name: '_id'},
+      right: {type: 'Parameter', name},
+    })
+
+    /* `*` is `prefixLast('')` — "everything". Over a corpus that IS the overlay
+     * that is exact, so it is not reported as an approximation. Any other term
+     * is. */
+    if (pattern.trim() === '*') continue
+    if (approximations.some((entry) => entry.term === pattern)) continue
+    approximations.push({
+      function: 'text::query',
+      term: pattern,
+      matched: ids.length,
+      reason:
+        "Content Lake's hosted full-text index — stemming, language analysis and relevance " +
+        'ranking — has no local equivalent. Mode 2 substitutes case-insensitive prefix token ' +
+        "matching over the document's own text. Results may differ from the hosted dataset.",
+    })
+  }
+
+  return {tree: replaceNodes(tree, replacements), params: generated, approximations}
+}
+
+/* ------------------------------------------------------------------ *
  * the handler
  * ------------------------------------------------------------------ */
 
@@ -612,17 +857,68 @@ export async function createOriginHandler(options = {}) {
     return {documents, omitted}
   }
 
-  async function runQuery(queryText, params) {
-    let tree
+  /**
+   * Parse, with one narrowly-scoped retry.
+   *
+   * groq-js 2.0.0 rejects a parameterised slice (`[0...$__limit]`), which every
+   * findability query ends with. The retry substitutes integer parameters into
+   * slice endpoints and parses again. It runs ONLY after a real parse failure,
+   * so a query groq-js accepts is never rewritten.
+   */
+  function parseQuery(source, params) {
     try {
-      tree = parseGroq(String(queryText))
+      return parseGroq(source)
     } catch (cause) {
+      const substituted = substituteSliceParameters(source, params)
+      if (substituted !== source) {
+        try {
+          return parseGroq(substituted)
+        } catch {
+          /* fall through to the original, more informative error */
+        }
+      }
       throw new OriginError(400, 'OVERLAY_ORIGIN_INVALID_GROQ', `GROQ parse error: ${cause.message}`)
     }
+  }
+
+  async function runQuery(queryText, params) {
+    const source = String(queryText)
+    const tree = parseQuery(source, params)
+    const documents = datasetDocuments()
+
+    /* Sub-expression evaluation for the findability resolver: same corpus, same
+     * parameters, one document as `@`. */
+    const evaluateNode = async (node, {root, params: extra} = {}) => {
+      const value = await evaluateGroq(node, {
+        dataset: documents,
+        params: extra === undefined ? params : {...params, ...extra},
+        ...(root === undefined ? {} : {root}),
+      })
+      return value.get()
+    }
+
+    const prepared = await resolveTextQueries(tree, params, documents, evaluateNode)
+
     const startedAt = Date.now()
-    const value = await evaluateGroq(tree, {dataset: datasetDocuments(), params})
+    const value = await evaluateGroq(prepared.tree, {
+      dataset: documents,
+      params: {...params, ...prepared.params},
+    })
     const result = await value.get()
-    return {ms: Date.now() - startedAt, query: String(queryText), result}
+    const answer = {ms: Date.now() - startedAt, query: source, result}
+    if (prepared.approximations.length > 0) {
+      /* PRD §5.5: an approximation may never be silent. It rides in the body so
+       * a browser devtools panel shows it, and on the log so a terminal does. */
+      answer.overlayApproximation = prepared.approximations
+      for (const entry of prepared.approximations) {
+        log(
+          'warn',
+          `approximated ${entry.function} for term ${JSON.stringify(entry.term)} — ` +
+            `${entry.matched} local match(es); hosted ranking is not reproduced`,
+        )
+      }
+    }
+    return answer
   }
 
   /* ---------------------------------------------------------------- *

@@ -48,7 +48,7 @@ import {
   evaluateOverlayQuery,
 } from '../../sanity-overlay-query/src/index'
 import type {
-  BaseCandidateRequest,
+  PlannedCandidateRequest,
   OverlayQueryDefinition,
   OverlayQueryDiagnostics,
   OverlaySource,
@@ -194,7 +194,7 @@ async function answerSize(
  * ================================================================== */
 
 interface Recording {
-  readonly requests: BaseCandidateRequest[]
+  readonly requests: PlannedCandidateRequest[]
   readonly returned: number[]
   readonly source: QueryBaseSource
 }
@@ -203,10 +203,17 @@ interface Recording {
  * Wrap a base source so this file measures what the planner actually pulled.
  * `diagnostics.baseFetchDocuments` is then checked against this, which is why
  * a planner cannot pass by under-reporting its own work.
+ *
+ * BOTH port methods are wrapped. The core/extended split exists so that adding
+ * a request shape does not break adapters compiled against the original port
+ * (see `query-diagnostics.test.ts` §1b); a recorder that wrapped only
+ * `fetchCandidates` would silently stop seeing the predicate and top-K fetches
+ * — the exact fetches these ceilings are here to bound — so it wraps both and
+ * records them into one ordered list.
  */
 function recordingBaseSource(documents: readonly QueryDocument[]): Recording {
   const inner = createMemoryBaseSource(documents)
-  const requests: BaseCandidateRequest[] = []
+  const requests: PlannedCandidateRequest[] = []
   const returned: number[] = []
   return {
     requests,
@@ -215,6 +222,15 @@ function recordingBaseSource(documents: readonly QueryDocument[]): Recording {
       async fetchCandidates(request) {
         requests.push(request)
         const result = await inner.fetchCandidates(request)
+        returned.push(result.length)
+        return result
+      },
+      async fetchExtendedCandidates(request) {
+        requests.push(request)
+        // Non-null: `createMemoryBaseSource` implements the optional method,
+        // and if it ever stopped doing so every extended-plan case here would
+        // fail loudly rather than quietly skipping its measurement.
+        const result = await inner.fetchExtendedCandidates!(request)
         returned.push(result.length)
         return result
       },

@@ -110,6 +110,20 @@ export {createOverlayTransport} from './client/transport'
 export type {OverlayTransport} from './client/transport'
 export {wrapWithOverlay} from './client/facade'
 export type {OverlayWriteRecord} from './client/facade'
+
+/* The overlay-aware GROQ read path (PRD §22). Exported so a host can build its
+ * own reader — the same three outcomes, its own policy for strict mode. */
+export {createStudioReader, OverlayReadRefusedError} from './client/reads'
+export type {
+  StudioReadOutcome,
+  StudioReadRecord,
+  StudioReadRequest,
+  StudioReadRouter,
+  StudioReaderOptions,
+} from './client/reads'
+export {deriveStudioReadPlan, evaluateStudioRead} from './client/readPlan'
+export type {StudioReadDerivation, StudioReadPlan} from './client/readPlan'
+export {createBranchCandidateSource, overlaySourceFromBranch} from './client/readSource'
 export {classifyWriteEndpoint, normalizeRequestPath} from './client/writeGuard'
 export {createOverlayStatusLayout, overlayBannerViewModel} from './ui/statusLayout'
 export type {DefineOverlayConfigOptions} from './config'

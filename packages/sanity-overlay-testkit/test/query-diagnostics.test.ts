@@ -12,6 +12,11 @@
  * satisfy a weaker reading and is exactly what §22.2 forbids, so the assertions
  * are written as "rejects", never as "reports".
  */
+import {spawnSync} from 'node:child_process'
+import {mkdtempSync, rmSync, writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
+import {fileURLToPath} from 'node:url'
 import {describe, expect, it} from 'vitest'
 import {
   M_LOCAL_QUERIES,
@@ -61,6 +66,18 @@ const run = <T = unknown>(options: RunOptions) =>
     perspective: options.perspective ?? 'published',
     measureBytes: options.measureBytes,
   })
+
+/**
+ * Every parameter any registered query names, in one bag. Passing a superset is
+ * safe — a plan reads only the parameters it registered — and it lets a test
+ * sweep the whole registry without a per-query table to keep in sync.
+ */
+const PLANNABLE_PARAMS: Record<string, unknown> = {
+  id: 'article-01',
+  slug: 'article-7',
+  tag: 'odd',
+  authorId: 'author-2',
+}
 
 /** Assert a rejection carries the given §22.9 code, and produced no result. */
 async function rejectsWith(code: string, status: number, promise: Promise<unknown>) {
@@ -185,12 +202,12 @@ describe('§22.2/§5.5: an unsupported query fails structurally', () => {
     // the §22.9 code, because the tempting fallback — "ask for the type and
     // filter locally" — is exactly the over-fetch §22.6 exists to prevent, and
     // it would be invisible in every parity test.
+    //
+    // `coreOnly` implements the ORIGINAL port and nothing else. It is not a
+    // hypothetical: `sanity-overlay-client/src/base.ts` is exactly this shape.
     const coreOnly: QueryBaseSource = {
-      async fetchCandidates(request) {
-        if (request.kind === 'types' || request.kind === 'ids' || request.kind === 'field-equality') {
-          return []
-        }
-        throw new Error('this adapter serves only the core request shapes')
+      async fetchCandidates() {
+        return []
       },
     }
     for (const [queryId, params] of [
@@ -204,6 +221,9 @@ describe('§22.2/§5.5: an unsupported query fails structurally', () => {
         run({queryId, params, base: coreOnly}),
       )
       expect(error.message, queryId).toMatch(/base/i)
+      // The refusal must name the shape the adapter lacked, or the operator
+      // cannot tell which capability to implement.
+      expect(error.details.requestKind, queryId).toBeTypeOf('string')
     }
     // The same queries succeed against an adapter that DOES serve them, so the
     // refusal above is about the adapter and not about the registration.
@@ -220,8 +240,12 @@ describe('§22.2/§5.5: an unsupported query fails structurally', () => {
       {},
       {affectedIds: ['article-01', 'article-02']},
     )
-    expect(plan.baseRequests).toHaveLength(1)
-    const request = plan.baseRequests[0]
+    // The top-K fetch is an EXTENDED shape, so it must not appear in the core
+    // `baseRequests` array — an adapter reading only that array would otherwise
+    // silently issue no fetch at all and return an empty top-K.
+    expect(plan.baseRequests).toHaveLength(0)
+    expect(plan.extendedRequests).toHaveLength(1)
+    const request = plan.extendedRequests[0]
     if (request.kind !== 'order-slice') throw new Error(`expected order-slice, got ${request.kind}`)
     expect(request.limit).toBe(20)
     expect(request.order).toEqual([{field: 'publishedAt', direction: 'desc'}])
@@ -229,6 +253,138 @@ describe('§22.2/§5.5: an unsupported query fails structurally', () => {
     // The branch records themselves still have to join the candidate set, or
     // excluding them from the base fetch would LOSE them (§22.6 step 6).
     expect(plan.overlayTypes).toEqual(['article'])
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 1b. Port compatibility — the blast radius of a widened request union.
+ *
+ * `BaseCandidateRequest` is a discriminated union that TWO adapters outside
+ * this package switch over exhaustively, each closing with
+ * `const exhaustive: never = request`:
+ *
+ *   packages/sanity-overlay-client/src/base.ts   (the hosted HTTP adapter)
+ *   examples/kitchen-sink/spikeA/readQueries.ts  (the spike's in-memory one)
+ *
+ * That pattern makes ADDING a member to the union a compile error in both
+ * files. Neither is owned by this package, and CI's typecheck job
+ * (.github/workflows/ci.yml) is disabled pending a specific, enumerated list
+ * of remaining errors — silently adding two more would push that gate further
+ * away rather than closer.
+ *
+ * So the new §22.6 request shapes are additive: the core union keeps exactly
+ * its three original members, extended shapes live in their own union, and an
+ * adapter serves them through an OPTIONAL method. An adapter that does not
+ * implement it refuses (the test above) instead of over-fetching.
+ *
+ * The oracle below is the TypeScript compiler itself, not a reading of the
+ * source: it compiles a core-only adapter and requires the exhaustiveness
+ * check to hold. Nothing else in the suite would catch the regression, because
+ * vitest does not typecheck.
+ * ------------------------------------------------------------------ */
+
+describe('§10.1: the core base-source port stays compatible with existing adapters', () => {
+  const QUERY_SRC = fileURLToPath(new URL('../../sanity-overlay-query/src/index.ts', import.meta.url))
+  const TSC = fileURLToPath(new URL('../node_modules/.bin/tsc', import.meta.url))
+
+  /** Typecheck one throwaway module against the real package types. */
+  function typecheck(source: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'query-port-'))
+    try {
+      const file = join(dir, 'adapter.ts')
+      writeFileSync(file, source)
+      const result = spawnSync(
+        TSC,
+        [
+          '--noEmit',
+          '--strict',
+          '--target',
+          'ES2022',
+          '--module',
+          'ESNext',
+          '--moduleResolution',
+          'bundler',
+          '--skipLibCheck',
+          file,
+        ],
+        {encoding: 'utf8'},
+      )
+      if (result.error) throw result.error
+      return `${result.stdout ?? ''}${result.stderr ?? ''}`
+    } finally {
+      rmSync(dir, {recursive: true, force: true})
+    }
+  }
+
+  it(
+    'an adapter that handles the three original request kinds is still exhaustive',
+    {timeout: 60_000},
+    () => {
+      // Character-for-character the shape of `sanity-overlay-client/src/base.ts`
+      // and of spikeA's `createCandidateSource`. If this stops compiling, both
+      // of those files have stopped compiling too.
+      const output = typecheck(
+        `import type {QueryBaseSource} from ${JSON.stringify(QUERY_SRC)}\n` +
+          `export const coreOnly: QueryBaseSource = {\n` +
+          `  async fetchCandidates(request) {\n` +
+          `    switch (request.kind) {\n` +
+          `      case 'ids':\n` +
+          `      case 'types':\n` +
+          `      case 'field-equality':\n` +
+          `        return []\n` +
+          `      default: {\n` +
+          `        const exhaustive: never = request\n` +
+          `        throw new Error(String(exhaustive))\n` +
+          `      }\n` +
+          `    }\n` +
+          `  },\n` +
+          `}\n`,
+      )
+      expect(output, 'a core-only adapter must still typecheck').toBe('')
+    },
+  )
+
+  it(
+    'the same check is not vacuous: an adapter missing one core kind fails to compile',
+    {timeout: 60_000},
+    () => {
+      // Drop `field-equality` and the exhaustiveness check must go red. Without
+      // this, the test above would pass even if `never` had stopped meaning
+      // anything (e.g. if the port were typed `any`).
+      const output = typecheck(
+        `import type {QueryBaseSource} from ${JSON.stringify(QUERY_SRC)}\n` +
+          `export const partial: QueryBaseSource = {\n` +
+          `  async fetchCandidates(request) {\n` +
+          `    switch (request.kind) {\n` +
+          `      case 'ids':\n` +
+          `      case 'types':\n` +
+          `        return []\n` +
+          `      default: {\n` +
+          `        const exhaustive: never = request\n` +
+          `        throw new Error(String(exhaustive))\n` +
+          `      }\n` +
+          `    }\n` +
+          `  },\n` +
+          `}\n`,
+      )
+      expect(output).toMatch(/not assignable to type 'never'/)
+      expect(output).toMatch(/field-equality/)
+    },
+  )
+
+  it('the extended shapes are reachable through the optional capability', () => {
+    // The planner must be able to emit them, or the additive split would just
+    // be a way of never using the new shapes at all.
+    const kinds = M_LOCAL_QUERIES.filter((d) => d.status !== 'unsupported').flatMap((def) => {
+      try {
+        return planCandidateRequests(def, PLANNABLE_PARAMS, {affectedIds: []}).extendedRequests.map(
+          (r) => r.kind,
+        )
+      } catch {
+        return []
+      }
+    })
+    expect(new Set(kinds)).toEqual(new Set(['field-contains', 'references', 'order-slice']))
   })
 })
 

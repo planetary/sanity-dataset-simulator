@@ -18,7 +18,10 @@
   - ~30 articles so a `[0...20]` ordered slice exercises the §22.6 top-K proof
   - every §35.11 fixture line traces to specific seeded documents
 - **Example app** — `examples/kitchen-sink`: Next.js + embedded Studio consuming the overlay packages as a real user would. One page per registered query pattern (listing with ordered slice, page-by-slug, article with author dereference, reference-filtered list). Target for §35.12 Studio tests and §35.13 E2E scenarios; doubles as the §37 Phase 9 example application.
-- **Sanity test project** — dedicated project, never real staging (§11.3). Datasets: `parity` (re-seeded from the ndjson before each run) and `scratch` (promotion round-trip). Write tokens exist only in CI seeding/promotion jobs.
+- **Sanity test project** — dedicated project, never real staging (§11.3). Dataset: `parity` (re-seeded from the ndjson before each run), **read-only from the suite's point of view**. ~~`scratch` (promotion round-trip)~~ — struck 2026-08-05. A Sanity **write token exists only in the out-of-band seeding job** and is never available to a test run.
+
+> **Amended 2026-08-05 ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)).** This system never writes to a real Sanity dataset, so no test may either. Enforced structurally rather than by convention: `packages/sanity-overlay-testkit/vitest.setup.ts` installs an outbound-request monitor into every test file and fails the suite on any non-GET request to a `sanity.io` host. Its self-tests are in `test/no-staging-writes.test.ts`.
+
 
 ## 2. Parity oracles (§35.10)
 
@@ -26,7 +29,7 @@
 |---|---|---|
 | **Empty-overlay parity** | Registered query natively against hosted Sanity vs through the overlay with an empty overlay; deep-equal after metadata normalization | `groq-js` vs hosted Content Lake drift [S18][S19]; read-path non-transparency |
 | **Overlay parity** | Apply scripted mutations; compute the expected virtual dataset explicitly (base fixture + same mutations in memory); `groq-js` over the full expected dataset (oracle, no planning) vs the real planner + evaluator; exact equality | Candidate-planning bugs — planner fetched too few documents |
-| **Promotion round-trip** | Promote overlay to `scratch`, query natively, compare with virtual results modulo registered timestamp policies (§13.9) | End-to-end divergence between preview and promoted reality |
+| ~~**Promotion round-trip**~~ | **RETIRED 2026-08-05** — promotion is out of scope permanently, so there is no promoted reality to diverge from. The oracle it provided (does the virtual dataset match a real one?) is carried by empty-overlay parity, which needs no write. | — |
 | **Listener parity** | Record real pinned-Studio event traffic against the test dataset via proxy; recordings are golden fixtures for emulation tests | Gate B protocol mismatches (§36.1, §21.4.1) |
 
 ## 3. Three loops, by feedback speed
@@ -35,7 +38,7 @@
 |---|---|---|---|
 | **Inner** (seconds) | every save | none | Unit (§35.2–35.6), property-based (§35.1 list), §35.7 contract suite on memory + fs adapters, offline query parity against the fixture snapshot |
 | **PR** (minutes) | every PR | read token | Hosted empty-overlay + overlay parity; Playwright on example app in `fs` mode; network capture asserting **zero** Sanity mutation requests; dataset export before/after suite, diffed ("staging unchanged" as a hard assertion) |
-| **Nightly / labeled** (slow) | scheduled or label | Blob + write tokens | Real Vercel Blob contract + failure injection (§35.8, §35.15 — ETag semantics are not emulatable locally); two-tab stale-write races; preview-deployment E2E; promotion round-trip; **drift canary**: daily empty-overlay parity against pinned versions |
+| **Nightly / labeled** (slow) | scheduled or label | Blob credentials only — **no Sanity write token** (2026-08-05) | Real Vercel Blob contract + failure injection (§35.8, §35.15 — ETag semantics are not emulatable locally); two-tab stale-write races; preview-deployment E2E; **drift canary**: daily empty-overlay parity against pinned versions |
 
 ## 4. Sequencing
 

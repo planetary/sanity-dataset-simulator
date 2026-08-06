@@ -168,6 +168,8 @@ The one server-side oracle, `verifyPersistence` (line 1371), queries only `*[_id
 
 `test/spike-c-parity.test.ts:90-94` asserts `byId('recent-by-created-at').status === 'tier-b'` and `.systemTimestampPolicy === 'preview-diverges'` — i.e. that `registry.ts:27-31` contains the literals it contains. No overlay fixture in `spike-c/overlay.ts` ever modifies `_createdAt` or `_updatedAt`, so the `preview-diverges` behaviour has never been exercised. `decisions.md:22` marks D15 **RESOLVED**; the spike report's own caveat 3 defers the promotion-order regression test to Phase 6. The two are inconsistent — D15 should read "policy recorded; behaviour unverified until Phase 6".
 
+> **Note added 2026-08-05** ([PRD §0.0 scope amendment](../../../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)): the observation above is unchanged and still correct. Promotion has since gone out of scope permanently, so the deferred test cannot be a promotion-order test; the inconsistency it identifies in D15 remains open on its own terms.
+
 ### F11 (low-medium) — facade gaps 18-24: claim verified, still open
 
 For the record, since Gate E's remediation list depends on it. `localEcho.ts:1023` is still `const WRITE_URL_RE = /\/data\/(mutate|actions)\b/` — gap 20 (no leading slash) and gap 21 (`/assets/*`) untouched. `localEcho.ts:1246` is still `return result === t ? proxy : result` inside `blockFluentCommit` — the precise root cause of gaps 18 and 19. No mention of `agent`, `datasets`, `releases` or `assets` anywhere in the file's interception layer (`WRITE_METHODS`, line 1012, is seven method names). The Spike F follow-up checklist is accurate and current.

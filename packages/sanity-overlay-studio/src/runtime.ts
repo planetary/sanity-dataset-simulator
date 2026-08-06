@@ -13,7 +13,13 @@
 
 import {createOverlayEcho, type OverlayEcho} from './client/echo'
 import {wrapWithOverlay, type OverlayWriteRecord} from './client/facade'
-import {createOverlayTransport, type OverlayTransport} from './client/transport'
+import {createStudioReader, type StudioReadRecord} from './client/reads'
+import {overlaySourceFromBranch} from './client/readSource'
+import {
+  createOverlayTransport,
+  type OverlayHydrationDocument,
+  type OverlayTransport,
+} from './client/transport'
 import {readConflictReport, type OverlayConflictReport} from './conflicts'
 import type {ResolvedOverlayOptions} from './options'
 import {deriveOverlayStatus, type OverlayStatus} from './status'
@@ -42,12 +48,22 @@ export interface OverlayRuntime {
   conflicts(): OverlayConflictReport
   /** Recent messages, newest last, for the banner's detail view. */
   messages(): readonly string[]
+  /**
+   * Every GROQ read this session routed, newest last (PRD §22.8).
+   *
+   * The diagnostic surface §22.5 requires: a read recorded as `passthrough` was
+   * answered by the base dataset and may not reflect branch edits, and the only
+   * way an editor can know that is if something keeps the list.
+   */
+  reads(): readonly StudioReadRecord[]
   subscribe(listener: () => void): () => void
   /** Poll the overlay API once, updating connection, revision and conflicts. */
   refresh(): Promise<void>
 }
 
 const MAX_MESSAGES = 50
+/** The read ledger is a diagnostic, not a log: bounded, newest kept. */
+const MAX_READ_RECORDS = 200
 
 export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRuntime {
   const {resolved} = options
@@ -83,6 +99,55 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
 
   const echo = createOverlayEcho({onError: log})
 
+  /* ---------------------------------------------------------------- *
+   * The branch, as the READ path needs it.
+   *
+   * Keyed by logical id and fed from the two places the overlay API states
+   * what it holds: `GET /state` on every refresh, and the hydration documents
+   * every `POST /commit` answers with. Both speak `OverlayHydrationDocument`,
+   * so the read view and the write echo agree by construction rather than by a
+   * second translation that could drift.
+   *
+   * The echo's own document map is NOT this: it stores `null` as a deletion of
+   * its own entry, which spells "the branch has no opinion" — the exact reading
+   * that would make every tombstoned document reappear in a list pane.
+   * ---------------------------------------------------------------- */
+  const hydration = new Map<string, OverlayHydrationDocument>()
+  let overlayView = overlaySourceFromBranch([])
+  let overlayViewStale = false
+
+  function noteHydration(documents: readonly OverlayHydrationDocument[]): void {
+    let changed = false
+    for (const document of documents) {
+      if (typeof document?.logicalId !== 'string' || document.logicalId === '') continue
+      hydration.set(document.logicalId, document)
+      changed = true
+    }
+    if (changed) overlayViewStale = true
+  }
+
+  function overlaySource(): ReturnType<typeof overlaySourceFromBranch> {
+    if (overlayViewStale) {
+      overlayView = overlaySourceFromBranch([...hydration.values()])
+      overlayViewStale = false
+    }
+    return overlayView
+  }
+
+  const readRecords: StudioReadRecord[] = []
+
+  const reads = createStudioReader({
+    overlay: overlaySource,
+    strict: () => resolved.strictQueries,
+    onLog: log,
+    onRecord: (record) => {
+      readRecords.push(record)
+      if (readRecords.length > MAX_READ_RECORDS) {
+        readRecords.splice(0, readRecords.length - MAX_READ_RECORDS)
+      }
+    },
+  })
+
   const transport = createOverlayTransport({
     apiUrl: resolved.apiUrl,
     fetch: options.fetch,
@@ -114,6 +179,8 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
       transport,
       onError: log,
       onWrite,
+      reads,
+      onHydration: noteHydration,
       now: options.now,
     })
   }
@@ -136,6 +203,10 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
         )
       }
       conflictReport = readConflictReport(result.body)
+      /* The branch the read path answers over. Merged rather than replaced, so
+       * a `/state` answer that omits a document this session just committed
+       * cannot un-do the commit's own hydration. */
+      if (result.documents !== undefined) noteHydration(result.documents)
     } else if (result.outcome === 'degraded') {
       connection = 'unreachable'
     }
@@ -165,6 +236,7 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
       }),
     conflicts: () => conflictReport,
     messages: () => messages.slice(),
+    reads: () => readRecords.slice(),
     subscribe: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)

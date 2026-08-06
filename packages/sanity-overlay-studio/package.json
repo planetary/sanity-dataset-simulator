@@ -9,11 +9,18 @@
   "scripts": {
     "test": "echo 'tested via sanity-overlay-testkit'"
   },
+  "dependencies": {
+    "groq-js": "2.0.0"
+  },
   "peerDependencies": {
+    "@sanity/client": "^7.25.0",
     "react": "^19.0.0",
     "sanity": "^6.8.0"
   },
   "peerDependenciesMeta": {
+    "@sanity/client": {
+      "optional": false
+    },
     "react": {
       "optional": false
     },

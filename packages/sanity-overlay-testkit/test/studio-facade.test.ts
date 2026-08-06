@@ -49,6 +49,35 @@ const CONFIG: ClientConfig = {
   useCdn: false,
 }
 
+/**
+ * The rxjs `Observable` `@sanity/client` actually answers with, read off a real
+ * client rather than declared.
+ *
+ * EVERY observable double below is built with it. A `{subscribe}` literal is
+ * exactly what let `client.observable.request(...).pipe is not a function` reach
+ * a browser and kill Studio at boot: the double and the facade agreed with each
+ * other and both disagreed with the library. Building the doubles from the real
+ * class means these tests exercise the same path production does. The contract
+ * itself is pinned in `studio-observable-contract.test.ts`.
+ *
+ * Cold: building a request observable and dropping it makes no network call.
+ */
+type ColdSubscriber = {
+  next: (value: unknown) => void
+  error: (error: unknown) => void
+  complete: () => void
+}
+const RealObservable = Object.getPrototypeOf(
+  createClient(CONFIG).observable.fetch('*[_id == "__facade_double_probe__"][0]'),
+).constructor as new (
+  subscribe: (subscriber: ColdSubscriber) => (() => void) | void,
+) => {subscribe: (observer: unknown) => {unsubscribe: () => void}}
+
+/** A real Observable that never emits — the shape a live listener has at rest. */
+function silentObservable(): unknown {
+  return new RealObservable(() => undefined)
+}
+
 /* ─────────────────────────────────────────────────────── test doubles */
 
 interface RecordingTransport extends OverlayTransport {
@@ -98,7 +127,7 @@ function fakeClient(): Rec & {escaped: string[]} {
     action: escape('action'),
     dataRequest: escape('dataRequest'),
     request: escape('request'),
-    listen: () => ({subscribe: () => ({unsubscribe: (): void => {}})}),
+    listen: () => silentObservable(),
     config: () => ({...CONFIG}),
     withConfig: (): unknown => self,
     clone: (): unknown => self,
@@ -116,7 +145,7 @@ function fakeClient(): Rec & {escaped: string[]} {
     getDocuments: escape('observable.getDocuments'),
     action: escape('observable.action'),
     mutate: escape('observable.mutate'),
-    listen: () => ({subscribe: () => ({unsubscribe: (): void => {}})}),
+    listen: () => silentObservable(),
   }
   return self
 }
@@ -144,6 +173,35 @@ function harness(overrides: {transport?: RecordingTransport} = {}): Harness {
 
 async function settle(): Promise<void> {
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/** A cold, real `@sanity/client` observable: nothing runs until subscribe. */
+function observableOf(value: unknown): unknown {
+  return new RealObservable((subscriber) => {
+    subscriber.next(value)
+    subscriber.complete()
+  })
+}
+
+/** Subscribe to an observable read and resolve with its first value. */
+function drain(result: unknown): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const source = result as {
+      subscribe: (o: {
+        next: (v: unknown) => void
+        error: (e: unknown) => void
+        complete: () => void
+      }) => unknown
+    }
+    let last: unknown
+    source.subscribe({
+      next: (value) => {
+        last = value
+      },
+      error: reject,
+      complete: () => resolve(last),
+    })
+  })
 }
 
 /* ══════════════════════════════════════ no write reaches the real client */
@@ -712,12 +770,22 @@ describe('overlay reads', () => {
   it.each([
     ['getDocument', (c: Rec) => (c.getDocument as CallableFunction)('drafts.a')],
     ['fetch', (c: Rec) => (c.fetch as CallableFunction)('*[_id == "drafts.a"]')],
+    [
+      'observable.getDocument',
+      (c: Rec) => drain((((c.observable as Rec).getDocument) as CallableFunction)('drafts.a')),
+    ],
+    [
+      'observable.fetch',
+      (c: Rec) => drain((((c.observable as Rec).fetch) as CallableFunction)('*')),
+    ],
   ])('a stale %s must not reset an echo-owned revision', async (_label, invoke) => {
     const echo = createOverlayEcho()
     const client = fakeClient()
     const stale = {_id: 'drafts.a', _type: 'article', _rev: 'lake-1', _updatedAt: '2020-01-01T00:00:00.000Z'}
     client.getDocument = (): Promise<unknown> => Promise.resolve(stale)
     client.fetch = (): Promise<unknown> => Promise.resolve(stale)
+    ;(client.observable as Rec).getDocument = (): unknown => observableOf(stale)
+    ;(client.observable as Rec).fetch = (): unknown => observableOf(stale)
     const wrapped = wrapWithOverlay(client as unknown as SanityClient, {
       echo,
       transport: recordingTransport(),
@@ -729,6 +797,28 @@ describe('overlay reads', () => {
 
     await invoke(wrapped)
     expect(echo.revisionOf('drafts.a')).toBe('tx-1')
+  })
+
+  /**
+   * The authoritative read reaches Studio through BOTH client shapes: the pair
+   * listener uses `observable.getDocuments`, so pinning only the promise
+   * spelling would leave the shape Studio actually calls unguarded.
+   */
+  it('lets the observable pair snapshot fetch reset the chain too', async () => {
+    const echo = createOverlayEcho()
+    const client = fakeClient()
+    ;(client.observable as Rec).getDocuments = (): unknown =>
+      observableOf([{_id: 'drafts.a', _type: 'article', _rev: 'lake-2'}])
+    const wrapped = wrapWithOverlay(client as unknown as SanityClient, {
+      echo,
+      transport: recordingTransport(),
+    }) as unknown as Rec
+
+    echo.seedFromResult({_id: 'drafts.a', _type: 'article', _rev: 'lake-1'}, true)
+    echo.emit([{documentId: 'drafts.a', transition: 'update', patch: {set: {t: 1}}}], 'tx-1')
+
+    await drain((((wrapped.observable as Rec).getDocuments) as CallableFunction)(['drafts.a']))
+    expect(echo.revisionOf('drafts.a')).toBe('lake-2')
   })
 
   it('lets the pair snapshot fetch reset the chain, because Studio resets from it too', async () => {

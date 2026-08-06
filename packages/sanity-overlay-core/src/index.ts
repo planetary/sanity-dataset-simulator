@@ -149,5 +149,19 @@ export * from './invariants/index'
 /* Phase 3/7 — canonical checkpoint export and import (PRD §14.1, §14.3, §29). */
 export * from './checkpoint/index'
 
-/* Phase 8 — promotion planning only (PRD §30). Apply is deliberately absent. */
-export * from './promotion/index'
+/* Branch-local assets, the pure half (PRD §24; §24.9 promotion out of scope). */
+export * from './assets/index'
+
+/*
+ * Promotion — REMOVED, permanently (owner ruling, 2026-08-05).
+ *
+ * This system never writes to a real Sanity dataset. Branch edits live in
+ * `.sanity-overlay/` or, later, in a private Vercel Blob namespace; pushing
+ * content back to staging is out of scope, not deferred. The `promotion/`
+ * planner (PRD §30) was deleted rather than repurposed so that no module in this
+ * repository has "write to staging" as its stated purpose and nothing is left
+ * for a future contributor to finish. See the scope amendment at the top of
+ * `docs/PRD-v1.md`, and the structural guards in
+ * `packages/sanity-overlay-testkit/test/no-staging-writes.test.ts` and
+ * `packages/sanity-overlay-studio/src/client/stagingHost.ts`.
+ */

@@ -9,6 +9,67 @@
 
 ---
 
+## 0.0 SCOPE AMENDMENT — 2026-08-05 — this system never writes to Sanity
+
+**Status:** Owner ruling. Binding. Supersedes every conflicting statement below.
+**Decided by:** Product owner, 2026-08-05.
+**Nature:** A scope change, not a preference and not a deferral.
+
+### The ruling
+
+**This system must NEVER write to a real Sanity dataset. Ever.**
+
+Branch edits go to local files under `.sanity-overlay/` or, later, to a private Vercel Blob namespace for preview deployments. Reading the live staging dataset remains the premise of the product (§0.2 "shared base"); writing to it is out of scope **permanently**, not deferred to a later milestone.
+
+Two consequences follow, and the second is broader than the first:
+
+1. **Promotion is out of scope permanently.** Pushing approved branch content back to staging — the §30 planner, its apply path, its plan model, its authorization model, and the `[M-PROMO]` release it was the acceptance list for — is not deferred work. It will not be built.
+2. **Assets are never pushed to Sanity either.** Nothing in this system calls Sanity's asset API. Uploading a branch asset to `client.assets.upload` against a real Sanity host is the same violation as a mutate, and is refused on the same grounds.
+
+### What this supersedes
+
+| Section | Ruling |
+|---|---|
+| §0.2 "Promotion" row | **Superseded.** No promotion plan is generated or applied. |
+| §0.2 "Assets" row | **Partially superseded.** Branch assets are stored locally or in private Blob, as written; "then upload them to Sanity during promotion" is struck. |
+| §8.7 Promote approved changes | **Superseded.** The workflow does not exist. |
+| §24.9 Asset promotion | **Superseded.** The Sanity upload and reference-rewrite steps are struck. |
+| §24 (remainder) | **In scope, unchanged** — see "What remains in scope" below. |
+| §25.12 Promotion endpoints | **Superseded.** These routes are not built. |
+| §30 Promotion to Sanity (all of §30.1–§30.9) | **Superseded in full.** |
+| §37 Phase 7 (assets), promotion tasks only | **Superseded.** "Sanity upload during promotion" and "reference rewrite" are struck; the rest of Phase 7 stands. |
+| §37 Phase 8 (promotion) | **Superseded in full.** |
+| §38.4 `[M-PROMO]` acceptance list | **Superseded in full**, including the "Branch assets upload to Sanity" line. There is no `[M-PROMO]` release. |
+| §39.3 D01 | **Half settled.** Whether branch assets are ever uploaded to Sanity is decided: **never**. Whether *local* branch asset uploads are launch-critical remains an open product decision. |
+| §39.3 D10, D11 | **Moot.** Both ask a question about promotion. No decision is required. |
+| `[M-PROMO]` milestone tag (§1.2, §1.3 row 30) | **Retired.** No requirement carries it any more. |
+
+Statements elsewhere in this document that mention promotion in passing — §5.1, §17.4, §19.7, §20.5, §22.3, §28.1, §35 and the §39.1 risk table — are read as follows: wherever a rule says something "blocks promotion", the rule still stands for **branch publish and checkpoint**, and its promotion clause is inert. The lifecycle states `promoted` (§12.3) and the manifest `promotion` block (§13.1) remain in the data model as reserved, never-written fields rather than being migrated out; nothing sets them.
+
+### What remains in scope
+
+§24's local half is **unaffected and still required**, because without it a branch cannot contain a new image at all — a functional hole, not a safety boundary:
+
+- local file upload into the overlay (§24.3) and private Blob upload for preview (§24.4);
+- synthetic asset documents, metadata extraction, and branch asset URL resolution (§24.2, §24.7);
+- authenticated preview delivery and asset security (§24.5);
+- asset usage tracking, delete protection, and the degradation notice (§24.6, §24.8).
+
+### Current state of asset support — a known gap, not a resolved item
+
+`client.assets.upload` is **refused outright** by the Studio facade today. An upload cannot be echoed locally, and answering it with a synthetic `{transactionId}` would hand Studio a value shaped nothing like an asset document. That refusal is consistent with this ruling — but it means **adding a new image to a branch does not work yet**. The design direction is local-only upload into the overlay per §24.3/§24.4; it is unbuilt.
+
+### How the ruling is enforced, structurally
+
+It is not a promise made by documentation:
+
+- `packages/sanity-overlay-core/src/promotion/**` was **deleted**, along with its five test files, so no module in this repository has "write to staging" as its stated purpose and there is nothing for a future contributor to finish.
+- `packages/sanity-overlay-testkit/vitest.setup.ts` installs an outbound-request monitor into **every** test file: any non-GET request to a `sanity.io` host fails the suite.
+- `packages/sanity-overlay-client/src/stagingHost.ts` refuses, at runtime, any unsafe-method request bound for a real Sanity API host — wired into the Studio overlay transport, the Studio client facade, and the HTTP base source.
+- The pre-existing guards are unchanged and still enforced: the default-deny Track B proxy write guard, the facade's write-plane refusals, and the Spike F attack corpus in `packages/sanity-overlay-testkit/src/writeGuardContract.ts`.
+
+---
+
 ## 0. Read this first
 
 ### 0.1 Product in one sentence
@@ -28,10 +89,10 @@ Create a virtual Sanity dataset per branch by combining a live, read-only Sanity
 | First edit | Capture the complete base document and base revision, then track field-level changes and a complete materialized branch document. |
 | Query behavior | Parse and evaluate supported GROQ over a complete finite candidate set. Fail clearly when exact results cannot be guaranteed. |
 | Studio integration | Validate a client-factory facade and an HTTP API proxy in parallel. Select an approach only after core editing, authentication, listener, and upgrade tests pass. |
-| Assets | Reuse existing Sanity assets. Store new branch-only assets in local files or private Vercel Blob, then upload them to Sanity during promotion. |
+| Assets | Reuse existing Sanity assets. Store new branch-only assets in local files or private Vercel Blob, ~~then upload them to Sanity during promotion~~ — **PARTIALLY SUPERSEDED, see [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity): local and private-Blob storage stand; the Sanity upload is out of scope permanently.** |
 | Collaboration | Optimize for one active editor or agent per branch. Do not reproduce Sanity collaborative editing in V1. |
 | Git | Local overlay files are immediately visible in Git. Blob overlay state is exported to canonical JSON files at an explicit checkpoint. |
-| Promotion | Generate a conflict-checked promotion plan, then apply approved changes to staging through normal Sanity actions and mutations. |
+| Promotion | **OUT OF SCOPE — SUPERSEDED by [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity).** ~~Generate a conflict-checked promotion plan, then apply approved changes to staging through normal Sanity actions and mutations.~~ This system never writes to a real Sanity dataset. |
 
 ### 0.3 Critical feasibility gates
 
@@ -117,7 +178,7 @@ Abort or pivot thresholds:
 | `[M-LOCAL]` | Local filesystem MVP |
 | `[M-PREVIEW]` | Writable Vercel Preview MVP |
 | `[M-PROD]` | Production-ready branch preview release |
-| `[M-PROMO]` | Promotion-ready release |
+| ~~`[M-PROMO]`~~ | **RETIRED — SUPERSEDED.** No requirement carries this tag; there is no promotion release. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity). |
 
 Use combined tags when a requirement is written or changed:
 
@@ -141,7 +202,7 @@ Existing unqualified requirements inherit the default milestone below. New requi
 | 23, 25, 26 | `[M-PREVIEW]` | Preview UI, API, authentication, trust boundary |
 | 24 | `[M-PROD]` unless branch asset uploads are explicitly deferred | Assets |
 | 27 through 29 | `[M-PROD]` | Performance, conflicts, checkpointing, CI |
-| 30 | `[M-PROMO]` | Promotion |
+| ~~30~~ | ~~`[M-PROMO]`~~ | **OUT OF SCOPE — SUPERSEDED.** §30 is not implemented. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity). |
 | 31 through 35 | `[M-PROD]` | Observability, degradation, invariants, testing |
 | 36 | Gate-specific | Feasibility evidence |
 | 37 and 38 | Explicit phase or release heading | Delivery plan and acceptance |
@@ -181,7 +242,7 @@ The branch must support:
 - Studio reads and writes through the same virtual content state.
 - Agent edits through JSON or APIs.
 - Explicit Git checkpointing.
-- Conflict-aware promotion to staging.
+- ~~Conflict-aware promotion to staging.~~ **OUT OF SCOPE — SUPERSEDED** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)).
 - Zero accidental staging writes.
 
 ---
@@ -440,6 +501,9 @@ Sanity's hosted roles do not automatically protect local files or Blob objects. 
 
 ### 8.7 Promote approved changes
 
+> **OUT OF SCOPE — SUPERSEDED.** Owner ruling, 2026-08-05: this system never writes to a real Sanity dataset. The text below is retained as the historical specification and is **not** to be implemented. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity).
+
+
 1. Publisher generates a promotion plan.
 2. Promotion planner fetches current staging revisions.
 3. Planner performs three-way conflict checks.
@@ -471,8 +535,7 @@ flowchart TD
     H --> L[Checkpoint exporter]
     G --> L
     L --> M[Canonical .sanity-overlay files in Git]
-    M --> N[Promotion planner]
-    N --> O[Sanity staging mutations after approval]
+    M --> N[Git review and merge]
 ```
 
 ### 9.1 Core components
@@ -492,7 +555,7 @@ flowchart TD
 | Conflict engine | Compare ancestor, current base, and local values. |
 | Validator | Run schema validation and overlay-specific integrity checks. Sanity validation is client-side and not enforced by Content Lake, so application-layer validation is required for programmatic writes. [S31] |
 | Checkpoint exporter | Convert runtime state into deterministic repository files. |
-| Promotion planner | Produce a dry-run set of Sanity actions and mutations. |
+| ~~Promotion planner~~ | **REMOVED — SUPERSEDED 2026-08-05** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)). The module and its tests were deleted. |
 | Cleanup worker | Expire overlays, orphan Blob revisions, and unreferenced branch assets. |
 
 ### 9.2 Environment matrix
@@ -624,7 +687,7 @@ export interface SanityOverlayConfig {
 | `SANITY_BASE_DATASET` | Yes | Overlay modes | Read-only base dataset |
 | `SANITY_API_VERSION` | Yes | All | Hard-coded API version |
 | `SANITY_API_READ_TOKEN` | Yes for private drafts | Server only | Read base drafts and private content |
-| `SANITY_API_WRITE_TOKEN` | No in overlay modes | Promotion worker only | Apply approved promotion |
+| ~~`SANITY_API_WRITE_TOKEN`~~ | **Never. In any mode.** | **Never** | **SUPERSEDED 2026-08-05** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)): this system holds no Sanity write credential, because it performs no Sanity write. |
 | `OVERLAY_MODE` | Yes | All | `off`, `fs`, `blob`, or `memory` |
 | `OVERLAY_ROOT_DIR` | Local | Local | Filesystem overlay root |
 | `OVERLAY_HMAC_SECRET` | Preview | Server only | Sign overlay sessions and CSRF tokens |
@@ -2424,6 +2487,10 @@ Requirements:
 
 ## 24. Assets
 
+> **PARTIALLY SUPERSEDED.** Owner ruling, 2026-08-05: nothing in this system writes to Sanity, **including its asset API**. §24.9 (asset promotion) is out of scope in full, as is `promotedSanityAssetId` in §24.2 and the "until promotion" framing in §24.6. Everything else in §24 — local upload, private Blob upload, synthetic asset documents, metadata extraction, authenticated preview delivery, usage tracking, delete protection — **remains in scope and is still required**, because without it a branch cannot contain a new image at all. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity).
+>
+> **Known gap, unresolved:** `client.assets.upload` is refused outright by the Studio facade today, so adding a new image to a branch does not work yet. The design direction is local-only upload per §24.3/§24.4; it is unbuilt.
+
 Sanity provides hosted asset documents, metadata, CDN delivery, image transformations, and Studio asset UIs. Custom asset sources can be added or replace defaults. [S21] [S22]
 
 ### 24.1 Existing Sanity assets
@@ -2520,6 +2587,9 @@ For branch-only assets:
 - No Media Library folders, versions, usage tracking, or organization-wide search.
 
 ### 24.9 Asset promotion
+
+> **OUT OF SCOPE — SUPERSEDED.** Owner ruling, 2026-08-05: this system never writes to a real Sanity dataset. The text below is retained as the historical specification and is **not** to be implemented. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity). Branch assets are never uploaded to Sanity; there is no asset mapping and no reference rewrite.
+
 
 1. Upload original file to Sanity.
 2. Capture resulting Sanity asset document ID.
@@ -2682,6 +2752,9 @@ Supported action types:
 - `POST /api/sanity-overlay/checkpoint/:checkpointId/confirm`
 
 ### 25.12 Promotion endpoints
+
+> **OUT OF SCOPE — SUPERSEDED.** Owner ruling, 2026-08-05: this system never writes to a real Sanity dataset. The text below is retained as the historical specification and is **not** to be implemented. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity). These routes are not built.
+
 
 - `POST /api/sanity-overlay/promote/plan`
 - `GET /api/sanity-overlay/promote/plans/:planId`
@@ -3208,6 +3281,9 @@ When a preview starts:
 - Reset local files to Git with normal Git tools.
 
 ## 30. Promotion to Sanity
+
+> **OUT OF SCOPE — SUPERSEDED IN FULL.** Owner ruling, 2026-08-05: this system never writes to a real Sanity dataset, so no promotion plan is generated, reviewed, applied or verified. All of §30.1–§30.9 below is retained as the historical specification and is **not** to be implemented. The implementing module (`packages/sanity-overlay-core/src/promotion/**`) and its 108 tests were **deleted** on 2026-08-05, deliberately rather than repurposed, so that no code in this repository has "write to staging" as its stated purpose. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity).
+
 
 ### 30.1 Promotion principles
 
@@ -4613,11 +4689,14 @@ The section 1.3 default milestone map places core Studio editing (section 21) an
 - [ ] Asset usage tracking.
 - [ ] Delete protection.
 - [ ] Checkpoint metadata.
-- [ ] Sanity upload during promotion.
+- [ ] ~~Sanity upload during promotion.~~ **OUT OF SCOPE — SUPERSEDED** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)): branch assets are never uploaded to Sanity.
 - [ ] Reference rewrite.
 - [ ] Asset cleanup.
 
 ### Phase 8: promotion
+
+> **OUT OF SCOPE — SUPERSEDED.** Owner ruling, 2026-08-05: this system never writes to a real Sanity dataset. The text below is retained as the historical specification and is **not** to be implemented. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity). There is no Phase 8.
+
 
 **Exit:** Approved content can move to staging through a conflict-checked, verified plan.
 
@@ -4701,6 +4780,9 @@ Phases 2 through 5 close against their own acceptance checklists above. Phases 6
 
 ### 38.4 Promotion-ready release `[M-PROMO]`
 
+> **OUT OF SCOPE — SUPERSEDED IN FULL.** Owner ruling, 2026-08-05. There is no `[M-PROMO]` release and the acceptance list below — including the "Branch assets upload to Sanity" line — is void. The `[M-PROMO]` milestone tag (§1.2, §1.3 row 30) is retired; no requirement carries it. See [§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity).
+
+
 - [ ] Promotion plan is deterministic.
 - [ ] Current staging revision conflicts are detected.
 - [ ] Target schema validation passes.
@@ -4728,7 +4810,7 @@ Phases 2 through 5 close against their own acceptance checklists above. Phases 6
 | Schema changes make inherited documents uneditable | Broken Studio forms | Compatibility scan and explicit migration | Spike D |
 | Checkpoint files create unreviewable full-document diffs | Review failure | Intent files, generated snapshots, semantic PR summary | Phase 6 |
 | Branch assets lose Sanity image functionality | Preview differences | Existing assets remain native; clear branch asset limitations; promote before final | Phase 7 |
-| Promotion changes shared staging unexpectedly | Data loss | Dry-run, revisions, permissions, transactions, verification | Phase 8 |
+| ~~Promotion changes shared staging unexpectedly~~ **RETIRED — SUPERSEDED 2026-08-05** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)) | ~~Data loss~~ | The risk is removed at the root: the system never writes to Sanity, enforced by a suite-wide outbound-request monitor and a runtime host guard | — |
 | Runtime Blob state is not checkpointed | Work omitted from PR | Banner, CI policy, retention warning, optional GitHub App | Phase 6 |
 
 ### 39.2 Decisions already made
@@ -4764,7 +4846,7 @@ Owner codes:
 
 | ID | Decision | Owner | Deadline or gate | Default when unanswered |
 |---|---|---|---|---|
-| D01 | Are branch asset uploads required for initial launch? | PO, CMS | Phase 0 audit, before spike scheduling completes | Existing Sanity assets only; branch uploads deferred |
+| D01 | Are branch asset uploads required for initial launch? **PARTLY SETTLED 2026-08-05:** whether branch assets are ever uploaded *to Sanity* is decided — **never** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)). What remains open is whether *local / private-Blob* branch asset uploads are launch-critical. | PO, CMS | Phase 0 audit, before spike scheduling completes | Existing Sanity assets only; local branch uploads deferred |
 | D02 | Can reviewers checkpoint directly from Studio? | PO | Before Phase 6 | Agent and CLI checkpoint only |
 | D03 | Which identity provider controls preview edit versus read-only access? | SEC | Gate E | Vercel Authentication plus application role mapping |
 | D04 | Are soft conflicts allowed at branch publish without acknowledgement? | PO, TO | Before Phase 4 | Require acknowledgement |
@@ -4773,8 +4855,8 @@ Owner codes:
 | D07 | Which document types exceed bounded candidate-query guardrails? | TO | Spike C | Mark unsupported until a custom planner exists |
 | D08 | Which Studio plugins are mandatory? | PO, TO | Phase 0 audit | Disable unvalidated plugins in overlay workspace |
 | D09 | Is Presentation click-to-edit required for launch? | PO | Phase 0 exit | No; iframe preview only |
-| D10 | Which target dataset receives first promotion support? | PO, CMS | Before Phase 8 | Staging only |
-| D11 | Must promotion support deletes in the first release? | PO, CMS | Before Phase 8 | Defer deletes or require manual approval workflow |
+| ~~D10~~ | **MOOT — SUPERSEDED 2026-08-05** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)). ~~Which target dataset receives first promotion support?~~ No dataset ever receives promotion support. | — | — | No decision required |
+| ~~D11~~ | **MOOT — SUPERSEDED 2026-08-05** ([§0.0](#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)). ~~Must promotion support deletes in the first release?~~ There is no promotion. | — | — | No decision required |
 | D12 | Should base webhook invalidation ship at launch? | TO | Before Phase 3 | Scheduled drift scan only |
 | D13 | Which Studio interception strategy is selected? | TO | Gate A | No default. If neither passes, PO and TO jointly issue a written pivot decision per section 0.6, choosing the custom document tool (section 0.5) or a hosted alternative |
 | D14 | Which preview trust topology is selected? | SEC | Gate E | Trusted-repository with no fork secrets |

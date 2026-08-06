@@ -7,13 +7,27 @@
 
 ---
 
+## 0. SCOPE AMENDMENT — 2026-08-05 — promotion is out of scope permanently
+
+**Owner ruling, 2026-08-05.** This system must never write to a real Sanity dataset. Branch edits live in `.sanity-overlay/` or a private Vercel Blob namespace; pushing content back to staging is out of scope **permanently, not deferred**. Nothing is written to Sanity's asset API either. The binding statement is [PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity); this document is corrected to match it.
+
+What changed here:
+
+- **Roadmap Phase 8 is now assets only.** Its promotion half is struck. There is no `[M-PROMO]` exit.
+- **The `[M-PROMO]` milestone tracker (§9.2) is retired.**
+- **The Phase 7→8 promotion sequencing constraint (§5.1) is void**, as is the promotion half of the §5.2 overlap note.
+- **D01 is half settled:** branch assets are never uploaded to Sanity. Whether *local* branch asset uploads are launch-critical is still open.
+- **Assets remain in scope** in their local and private-Blob form. Without them a branch cannot contain a new image at all.
+
+---
+
 ## 1. Project summary and product boundary
 
-The Sanity Branch Overlay creates a virtual Sanity dataset per branch by combining a live, read-only Sanity staging base with a branch-scoped copy-on-write overlay stored as local JSON files or private Vercel Blob objects (PRD §0.1). The architecture is fixed by PRD §0.2: the shared base is the live staging dataset and is never cloned per branch; local persistence lives under `.sanity-overlay/`; Vercel preview persistence lives in a private Vercel Blob namespace because normal Vercel Functions cannot persist writes to the deployed filesystem; schema changes stay in branch code and are never serialized into overlay storage; all branch Studio content writes route to the overlay and never mutate staging; reads resolve current staging content and then apply branch-local drafts, published versions, field overrides, new documents, and tombstones; queries are parsed and evaluated over a complete finite candidate set and fail clearly when exactness cannot be guaranteed; and promotion is a conflict-checked plan applied through normal Sanity actions and mutations.
+The Sanity Branch Overlay creates a virtual Sanity dataset per branch by combining a live, read-only Sanity staging base with a branch-scoped copy-on-write overlay stored as local JSON files or private Vercel Blob objects (PRD §0.1). The architecture is fixed by PRD §0.2: the shared base is the live staging dataset and is never cloned per branch; local persistence lives under `.sanity-overlay/`; Vercel preview persistence lives in a private Vercel Blob namespace because normal Vercel Functions cannot persist writes to the deployed filesystem; schema changes stay in branch code and are never serialized into overlay storage; all branch Studio content writes route to the overlay and never mutate staging; reads resolve current staging content and then apply branch-local drafts, published versions, field overrides, new documents, and tombstones; queries are parsed and evaluated over a complete finite candidate set and fail clearly when exactness cannot be guaranteed; and **promotion is out of scope permanently** — see [section 0](#0-scope-amendment--2026-08-05--promotion-is-out-of-scope-permanently) and [PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity). Branch content is never written back to staging.
 
 **Product boundary (PRD §0.4).** This product is a branch-preview authoring layer. It is **not** a full replacement for Sanity Content Lake. Core document editing is in scope. Hosted collaboration, history, releases, scheduling, search infrastructure, source maps, automations, and third-party integrations are either degraded, custom, deferred, or unavailable. Production and shared staging continue to use Sanity Content Lake directly with `OVERLAY_MODE=off` (PRD §9.2).
 
-Architecture vocabulary used throughout the phase plans — environment-aware client, Studio adapter, Overlay API, base client, overlay resolver, filesystem store, Blob store, query planner, GROQ evaluator, event bus, conflict engine, validator, checkpoint exporter, promotion planner, cleanup worker — is defined in PRD §9.1. Package names (`sanity-overlay-core`, `-store-fs`, `-store-blob`, `-query`, `-studio`, `-next`, `-cli`, `-testkit`) are defined in PRD §10.
+Architecture vocabulary used throughout the phase plans — environment-aware client, Studio adapter, Overlay API, base client, overlay resolver, filesystem store, Blob store, query planner, GROQ evaluator, event bus, conflict engine, validator, checkpoint exporter, cleanup worker — is defined in PRD §9.1. (§9.1's "promotion planner" is retired; the module was deleted on 2026-08-05.) Package names (`sanity-overlay-core`, `-store-fs`, `-store-blob`, `-query`, `-studio`, `-next`, `-cli`, `-testkit`) are defined in PRD §10.
 
 ---
 
@@ -30,7 +44,7 @@ Architecture vocabulary used throughout the phase plans — environment-aware cl
 | 5 | Studio core parity | PRD Phase 4 | Studio E2E suite passes, no staging writes |
 | 6 | GROQ query layer and frontend migration | PRD Phase 5 | Empty-overlay and fixture parity exact |
 | 7 | Conflicts, checkpoint and CI | PRD Phase 6 | `[M-PROD]` acceptance (§38.3) |
-| 8 | Assets and promotion | PRD Phases 7 + 8 | `[M-PROMO]` acceptance (§38.4) |
+| 8 | Assets (local and preview only) | PRD Phase 7, minus its Sanity-upload tasks | Branch assets can be authored, previewed and checkpointed — **no `[M-PROMO]`; promotion is out of scope** |
 | 9 | Hardening and reusable release | PRD Phase 9 | Versioned package release, security review passed |
 
 ---
@@ -51,7 +65,11 @@ Architecture vocabulary used throughout the phase plans — environment-aware cl
 
 **Phase 7 — Conflicts, checkpoint and CI (PRD §37 Phase 6).** Goal: branch state is reviewable, reproducible, and safe to retain. Workstreams: conflict UX (conflict list tool, document conflict panel, keep local, accept base, manual value, remove override, base deletion resolution, conflict acknowledgement); checkpoint (Blob export, canonical file generation, checksum manifest, downloadable bundle, CLI apply, checkpoint confirmation, import and seed on preview startup, divergence detection); and CI (validate overlay file schemas, validate branch schema, validate strong references, run query parity tests, check unsupported plugins, check no write tokens in preview configuration, check checkpoint status policy, report conflict summary on PR, schedule recurring base drift scan, refresh PR status when drift changes conflicts). Exit: PRD §37 Phase 6 exit plus the `[M-PROD]` acceptance list in §38.3, evidenced against the §39.5 definition of done, whose preamble scopes it to "the production-ready preview release". Milestone alignment: `[M-PROD]` (§1.3 defaults for §§27–29 and §§31–35). **Scope caveat:** this phase's exit closes the §38.3 acceptance list only, not every requirement carrying a `[M-PROD]` default. §1.3 also defaults §24 (Assets) to `[M-PROD]` "unless branch asset uploads are explicitly deferred", and those asset requirements are scheduled in roadmap Phase 8 — so `[M-PROD]` is not fully discharged at Phase 7 unless D01 removes §24 from `[M-PROD]` scope. Per §1.4 this phase must not be recorded as completing requirements it did not build; see [section 10](#10-open-questions), resolution log row 6 and open decision D01.
 
-**Phase 8 — Assets and promotion (PRD §37 Phases 7 and 8).** Goal: branch-only assets can be authored and promoted safely, and approved content can move to staging through a conflict-checked, verified plan. Asset workstream (PRD Phase 7): custom asset source, local file upload, private Blob upload, signed operation URLs, metadata extraction, synthetic asset documents, authenticated preview delivery, asset usage tracking, delete protection, checkpoint metadata, Sanity upload during promotion, reference rewrite, asset cleanup. Promotion workstream (PRD Phase 8): promotion plan model, target revision fetch, conflict recomputation, schema validation, asset mapping, minimal patch generation, document action generation, operation ordering, human-readable diff, plan checksum and expiry, separate publisher authorization, apply with revision recheck, verify resulting revisions, recovery plan for partial multi-transaction apply, mark promoted and retain audit. Exit: PRD §37 Phase 7 and Phase 8 exits plus the `[M-PROMO]` acceptance list in §38.4. Milestone alignment: §24 assets default `[M-PROD]` unless branch uploads are explicitly deferred by D01; §30 promotion is `[M-PROMO]` (§1.3, §39.3).
+**Phase 8 — Branch assets, local and preview only (PRD §37 Phase 7).** Goal: a branch can contain a new image, stored where the branch stores everything else. Asset workstream: custom asset source, local file upload, private Blob upload, signed operation URLs, metadata extraction, synthetic asset documents, authenticated preview delivery, asset usage tracking, delete protection, checkpoint metadata, asset cleanup. Exit: PRD §37 Phase 7 exit, minus its Sanity-upload tasks. Milestone alignment: §24 assets default `[M-PROD]` unless branch uploads are explicitly deferred by D01.
+
+> **Struck 2026-08-05 ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)).** The promotion workstream (PRD §37 Phase 8, §30) and the two asset tasks that existed only to serve it — *Sanity upload during promotion* and *reference rewrite* — are out of scope permanently. `packages/sanity-overlay-core/src/promotion/**` and its 108 tests were deleted on the same day. There is no `[M-PROMO]` exit for this phase.
+>
+> **Known gap, unresolved:** `client.assets.upload` is refused outright by the Studio facade today, so adding a new image to a branch does not work yet. The design direction is local-only upload into the overlay; it is unbuilt.
 
 **Phase 9 — Hardening and reusable release (PRD §37 Phase 9).** Goal: the package is safe for repeated use across codebases. Workstreams: performance budgets pass (§5.4), failure injection passes (§33), security review passes (§5.5: no unresolved P0 or P1 findings), documentation complete, example application, migration guide for existing Sanity clients, plugin compatibility guide, query registry guide, on-call and incident runbook, cleanup automation, versioned package release, and a Sanity upgrade compatibility process. Exit: versioned package release with security review passed (§37 Phase 9). Milestone alignment: PRD §38 defines no fifth release milestone, so Phase 9 exit evidence is measured against the §37 Phase 9 checklist, the §5.4 performance targets, and the §5.5 quality targets rather than an `[M-*]` acceptance list — codified since v1.1 in the §37 exit evidence policy. §39.5 is **not** Phase 9 evidence: its preamble scopes it to the production-ready preview release, which this roadmap places at Phase 7.
 
@@ -59,7 +77,7 @@ Architecture vocabulary used throughout the phase plans — environment-aware cl
 
 ## 4. PRD phase-number mapping
 
-The PRD's §37 implementation plan is zero-indexed (Phase 0 through Phase 9). This roadmap is one-indexed. **Roadmap Phase N = PRD §37 Phase N-1 for N = 1 through 7; roadmap Phase 8 covers PRD §37 Phases 7 and 8; roadmap Phase 9 = PRD §37 Phase 9 (the one-phase offset closes at the merge).** Every phase plan document must restate this mapping wherever it cites §37.
+The PRD's §37 implementation plan is zero-indexed (Phase 0 through Phase 9). This roadmap is one-indexed. **Roadmap Phase N = PRD §37 Phase N-1 for N = 1 through 8; roadmap Phase 9 = PRD §37 Phase 9.** (Before 2026-08-05, roadmap Phase 8 merged PRD Phases 7 and 8 and the offset closed at the merge. With PRD Phase 8 out of scope, roadmap Phase 8 maps to PRD Phase 7 alone and the offset closes because PRD Phase 8 no longer exists.) Every phase plan document must restate this mapping wherever it cites §37.
 
 | Roadmap phase | PRD §37 phase | PRD §37 phase title | Notes |
 |---|---|---|---|
@@ -70,10 +88,10 @@ The PRD's §37 implementation plan is zero-indexed (Phase 0 through Phase 9). Th
 | 5 | Phase 4 | Studio core parity | |
 | 6 | Phase 5 | Query layer and frontend migration | |
 | 7 | Phase 6 | Conflicts, checkpoint, and CI | |
-| 8 | Phase 7 **and** Phase 8 | Assets; promotion | **Merged.** Two PRD phases, one roadmap phase |
+| 8 | Phase 7 | Assets | PRD Phase 8 (promotion) is **out of scope permanently** (2026-08-05), so the merge no longer applies |
 | 9 | Phase 9 | Hardening and reusable release | Numbering realigns because the Phase 8 merge closes the offset; still PRD Phase 9 |
 
-Any bare "Phase N" in the PRD's §39 risk table or §39.3 decision table means the **PRD** phase, without exception; translate every occurrence through the table above. Examples: §39.1 "Phase 0 and 4" → roadmap Phases 1 and 5; D09 "Phase 0 exit", D01 "Phase 0 audit, before spike scheduling completes" (v1.1), and D08 "Phase 0 audit" → roadmap Phase 1; D06 retention and D12 base webhook invalidation, both due "Before Phase 3", → before roadmap Phase 4; PRD Phase 6 → roadmap Phase 7; PRD Phases 7 and 8 → roadmap Phase 8.
+Any bare "Phase N" in the PRD's §39 risk table or §39.3 decision table means the **PRD** phase, without exception; translate every occurrence through the table above. Examples: §39.1 "Phase 0 and 4" → roadmap Phases 1 and 5; D09 "Phase 0 exit", D01 "Phase 0 audit, before spike scheduling completes" (v1.1), and D08 "Phase 0 audit" → roadmap Phase 1; D06 retention and D12 base webhook invalidation, both due "Before Phase 3", → before roadmap Phase 4; PRD Phase 6 → roadmap Phase 7; PRD Phase 7 → roadmap Phase 8. D10 and D11 are moot (2026-08-05) — both asked a question about promotion.
 
 ---
 
@@ -89,7 +107,7 @@ Any bare "Phase N" in the PRD's §39 risk table or §39.3 decision table means t
 - **Gate F blocks the Phase 2 manifest type.** The overlay identity input, the `sha256(canonical-json-input).slice(0, 32)` hash rule, and the lifecycle state set (§12.1–§12.3) are consumed directly by `OverlayManifest.overlayId`, `status` and `source` (§13.1), so identity must be settled before the manifest type is frozen. See the [Phase 2 plan](phase-2-core-domain.md), section 2, and the [Phase 1 plan](phase-1-audit-and-feasibility.md), section 7.2.
 - **Phase 2 blocks Phases 3 and 4.** Both store adapters implement the same contract (§10.1) and must pass the same contract test suite (§5.1), which is defined in Phase 2.
 - **Phase 7 checkpoint depends on Phase 4 Blob state.** Blob export and canonical file generation operate on the manifest and revision layout produced in Phase 4 (§37 Phase 6 checkpoint tasks; §29).
-- **Phase 8 promotion depends on Phase 7 conflict recomputation.** Promotion recomputes conflicts against current staging revisions (§37 Phase 8; §30).
+- ~~**Phase 8 promotion depends on Phase 7 conflict recomputation.**~~ **VOID — 2026-08-05** ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)): there is no promotion, so this constraint is removed rather than reordered.
 - **PRD §1.4 constraint.** Phase plans may implement later-milestone foundations early, but cannot redefine an earlier milestone as complete. A phase that lands a partial `[M-PROD]` slice does not thereby claim `[M-PROD]`.
 
 ### 5.2 Overlap opportunities — Plan-level guidance
@@ -99,7 +117,7 @@ The following is sequencing guidance added by this plan, not a PRD requirement:
 - Design and test-harness scaffolding for Phase 2 (core domain) may proceed while gates are still open, but no Phase 2 implementation is accepted as complete until all six gates A–F pass (§0.3 preamble; §0.6 requires a written pivot decision before more implementation begins on a failed gate). Once the gates close, Phase 2 has no Studio, Blob, or query dependency (§10.1) and can proceed independently of Phases 4, 5 and 6.
 - Phases 5 (Studio parity) and 6 (query layer) can run in parallel after Phase 3 lands, provided both consume the same environment-aware client contract. Studio structure and reference queries (§37 Phase 5 "Studio queries") are the shared seam and should be owned by one of the two workstreams explicitly.
 - Phase 4 (Blob) and Phase 5 (Studio parity) can overlap: Blob work is store-layer and identity-layer, Studio work is client-facade and form-layer.
-- Within Phase 8, the assets track (PRD Phase 7) and the promotion-plan model (PRD Phase 8) can start together; asset mapping and reference rewrite are the join point and must not be started until the asset store shape is fixed.
+- ~~Within Phase 8, the assets track (PRD Phase 7) and the promotion-plan model (PRD Phase 8) can start together; asset mapping and reference rewrite are the join point.~~ **VOID — 2026-08-05** ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)): Phase 8 is a single assets track. Asset mapping and reference rewrite existed only to serve promotion and are struck.
 - Phase 9 documentation, runbook, and migration-guide work can start during Phase 7 and be finished in Phase 9.
 - Everything downstream of Phase 1 is blocked in full if the §0.6 abort thresholds are hit; overlap planning does not survive a pivot.
 
@@ -150,7 +168,7 @@ Execution rules that apply to every phase (§0.6): each spike runs in an isolate
 | 5 | `phase-5-studio-parity.md` | Plan doc not yet written |
 | 6 | `phase-6-query-layer.md` | Plan doc not yet written |
 | 7 | `phase-7-conflicts-checkpoint-ci.md` | Plan doc not yet written |
-| 8 | `phase-8-assets-promotion.md` | Plan doc not yet written |
+| 8 | `phase-8-assets.md` | Plan doc not yet written — assets only; promotion is out of scope (2026-08-05) |
 | 9 | `phase-9-hardening-release.md` | Plan doc not yet written |
 | Cross-phase | [testing-strategy.md](testing-strategy.md) | Written |
 
@@ -175,7 +193,7 @@ Every plan document under `docs/plans/` must follow these rules.
 
 **Naming and location.** Roadmap index lives at `docs/plans/README.md`. Phase documents are `docs/plans/phase-N-<slug>.md`, using the filenames in [section 7](#7-document-index). Links between documents are relative (for example `[Phase 2 plan](phase-2-core-domain.md)`, `[PRD](../PRD-v1.md)`).
 
-**Tagging.** Use the PRD's normative tags verbatim: `[MUST]`, `[SHOULD]`, `[LATER]`, `[VALIDATE]`, `[OUT]`, plus milestone tags `[M-LOCAL]`, `[M-PREVIEW]`, `[M-PROD]`, `[M-PROMO]` (§1.1, §1.2). Combine them as `[MUST][M-LOCAL]`. Requirements inherit the default milestone map in §1.3 unless tagged explicitly. CI rejects newly added bare `[MUST]` or `[SHOULD]` tags outside sections with an explicit default milestone (§1.4).
+**Tagging.** Use the PRD's normative tags verbatim: `[MUST]`, `[SHOULD]`, `[LATER]`, `[VALIDATE]`, `[OUT]`, plus milestone tags `[M-LOCAL]`, `[M-PREVIEW]`, `[M-PROD]` (§1.1, §1.2). **`[M-PROMO]` is retired (2026-08-05) — do not add it to any new requirement.** Combine them as `[MUST][M-LOCAL]`. Requirements inherit the default milestone map in §1.3 unless tagged explicitly. CI rejects newly added bare `[MUST]` or `[SHOULD]` tags outside sections with an explicit default milestone (§1.4).
 
 **Traceability.** Every task, gate, and exit criterion cites its PRD section inline, e.g. `(PRD §36.2)`. Do not invent requirements, targets, or scope that are not in the PRD. Where a plan adds sequencing, grouping, or staffing structure that is not itself in the PRD, label it **"Plan-level guidance"**.
 
@@ -200,7 +218,7 @@ Every plan document under `docs/plans/` must follow these rules.
 | 5 | Studio core parity | Not started | `phase-5-studio-parity.md` | TBD |
 | 6 | GROQ query layer and frontend migration | Not started | `phase-6-query-layer.md` | TBD |
 | 7 | Conflicts, checkpoint and CI | Not started | `phase-7-conflicts-checkpoint-ci.md` | TBD |
-| 8 | Assets and promotion | Not started | `phase-8-assets-promotion.md` | TBD |
+| 8 | Branch assets (local and preview only) | Not started | `phase-8-assets.md` | TBD |
 | 9 | Hardening and reusable release | Not started | `phase-9-hardening-release.md` | TBD |
 
 ### 9.1 Gate tracker (PRD §0.3)
@@ -251,16 +269,11 @@ Every plan document under `docs/plans/` must follow these rules.
 - [ ] Observability and alerts exist.
 - [ ] Feature degradation is documented in Studio.
 
-`[M-PROMO]` — Promotion-ready release (§38.4), roadmap Phase 8:
+~~`[M-PROMO]` — Promotion-ready release (§38.4), roadmap Phase 8~~ — **RETIRED 2026-08-05** ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)).
 
-- [ ] Promotion plan is deterministic.
-- [ ] Current staging revision conflicts are detected.
-- [ ] Target schema validation passes.
-- [ ] Branch assets upload to Sanity (waived when D01 defers branch asset uploads; existing Sanity assets need no upload).
-- [ ] Operations apply in safe order.
-- [ ] Apply is permission-gated.
-- [ ] Final target is verified.
-- [ ] Audit record is retained.
+There is no promotion-ready release. The eight acceptance lines that stood here — deterministic plan, staging revision conflicts, target schema validation, **branch assets upload to Sanity**, safe operation order, permission-gated apply, target verification, audit record — are all void, because none of them can be satisfied without writing to a real Sanity dataset. The milestone tag itself is retired: no requirement carries `[M-PROMO]`.
+
+Roadmap Phase 8's exit is now PRD §37 Phase 7's asset checklist minus its Sanity-upload tasks. It carries no `[M-*]` acceptance list of its own.
 
 ---
 
@@ -276,13 +289,14 @@ Nine questions were recorded here when this roadmap was first written. The PRD v
 | 2 | Query registry ownership at `[M-LOCAL]` was unclear | Same fix: a reduced registry with only the ID and slug entries ships in roadmap Phase 3; the full registry, codemod, and lint enforcement remain roadmap Phase 6 (§22.5). |
 | 3 | Blob export was required at `[M-PREVIEW]` but built at `[M-PROD]` | §37 Phase 3 now includes a "Minimal checkpoint export" task satisfying §38.2 through the CLI; the full checkpoint workflow, confirmation, and import remain PRD Phase 6 (roadmap Phase 7). |
 | 4 | Gate D scope contradicted Spike C scope | §0.3 Gate D now requires every launch-critical query to be Tier A or accepted Tier B, with Tier C below the §0.6 threshold and no launch-critical query in Tier C, and names the Spike C pass criteria (§36.3) as the closing standard. "Launch-critical" is now a defined term (§6). |
-| 5 | §38.4 unconditionally required branch asset upload | §38.4 now reads "waived when D01 defers branch asset uploads; existing Sanity assets need no upload". The D01 decision itself remains open — see 10.2. |
-| 6 | `[M-PROD]` did not fully close at roadmap Phase 7 | The Phase 7 narrative scope caveat stands, and the new §37 "Exit evidence policy" confirms PRD Phases 6–8 close against the §38.3/§38.4 checklists only. Whether §24 stays in `[M-PROD]` scope still follows D01 — see 10.2. |
+| 5 | §38.4 unconditionally required branch asset upload | v1.1 made the line conditional on D01. **Overtaken 2026-08-05:** §38.4 is superseded in full and branch assets are never uploaded to Sanity, so the line is void rather than conditional. |
+| 6 | `[M-PROD]` did not fully close at roadmap Phase 7 | The Phase 7 narrative scope caveat stands. **Amended 2026-08-05:** with §38.4 retired, PRD Phases 6–7 close against the §38.3 checklist only. Whether §24 stays in `[M-PROD]` scope still follows D01 — see 10.2. |
 | 7 | Roadmap Phase 9 had no §38 milestone | The §37 "Exit evidence policy" now states PRD Phase 9 closes against its own task list plus the §5.4 performance targets and §5.5 quality targets, and scopes §39.5 to the production-ready preview release (§38.3). |
 | 8 | PRD Phases 6–9 had no acceptance checklists | Same fix: the §37 "Exit evidence policy" makes the §38.3/§38.4 derivation explicit rather than assumed. |
 | 9 | Gate A failure had no continuation path | §39.3 D13 now states: if neither strategy passes, PO and TO jointly issue a written pivot decision per §0.6, choosing the custom document tool (§0.5) or a hosted alternative. |
 
 ### 10.2 Still open — product decisions (PRD §39.3)
 
-1. **D01 — Are branch asset uploads required for initial launch?** Owner: PO, CMS. Due: during the Phase 0 audit (roadmap Phase 1), before spike scheduling completes. Default: existing Sanity assets only; branch uploads deferred. Determines whether Spike E runs, whether §24 stays in `[M-PROD]` scope, and whether the §38.4 upload line applies.
+1. **D01 — Are *local* branch asset uploads required for initial launch?** Owner: PO, CMS. Due: during the Phase 0 audit (roadmap Phase 1), before spike scheduling completes. Default: existing Sanity assets only; local branch uploads deferred. Determines whether Spike E runs and whether §24 stays in `[M-PROD]` scope.
+   - **Half settled 2026-08-05** ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)): whether branch assets are ever uploaded **to Sanity** is decided — *never*. The §38.4 upload line is void regardless of how the rest of D01 lands, so that clause no longer forms part of this decision.
 2. **D09 — Is Presentation click-to-edit required for launch?** Owner: PO. Due: Phase 0 exit (roadmap Phase 1). Default: no; iframe preview only. If yes, Spike A instrumentation extends to the Presentation Tool per §36.1.

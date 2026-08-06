@@ -11,6 +11,7 @@
  *     `fetch`. It issues only GET requests to `/query/<dataset>`.
  */
 import {createMemoryBaseSource, type QueryDocument} from '../../sanity-overlay-query/src/index'
+import {createStagingSafeFetch} from './stagingHost'
 import type {OverlayClientBaseSource} from './types'
 
 /**
@@ -57,10 +58,15 @@ const REQUEST_QUERIES = {
  * hostile slug.
  */
 export function createHttpBaseSource(options: HttpBaseSourceOptions): OverlayClientBaseSource {
-  const doFetch = options.fetchImpl ?? globalThis.fetch
-  if (typeof doFetch !== 'function') {
+  const rawFetch = options.fetchImpl ?? globalThis.fetch
+  if (typeof rawFetch !== 'function') {
     throw new Error('createHttpBaseSource needs a `fetch` implementation')
   }
+  /* This module is GET-only by design; the guard makes that structural rather
+   * than conventional, so an edit that introduces a non-GET here fails at the
+   * call site instead of writing to the shared dataset (owner ruling,
+   * 2026-08-05 — see `stagingHost.ts`). */
+  const doFetch = createStagingSafeFetch(rawFetch, 'the base dataset source is read-only')
   const host = options.baseUrl ?? `https://${options.projectId}.api.sanity.io`
 
   async function run<T>(query: string, params: Record<string, unknown>): Promise<T> {

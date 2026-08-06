@@ -15,6 +15,10 @@
  * `fetch` is injected, so nothing here needs a network or a browser to test.
  */
 
+import {
+  assertNoStagingWrite,
+  createStagingSafeFetch,
+} from '../../../sanity-overlay-client/src/stagingHost'
 import type {OverlayCommit} from './echo'
 
 type Rec = Record<string, unknown>
@@ -100,10 +104,30 @@ function messageOf(body: Rec | undefined, fallback: string): string {
 
 export function createOverlayTransport(options: OverlayTransportOptions): OverlayTransport {
   const base = options.apiUrl.replace(/\/+$/, '')
+
+  /**
+   * REFUSE AT CONSTRUCTION, NOT AT COMMIT.
+   *
+   * `call()` below converts any throwing `fetch` into `degraded`, which the
+   * editor renders as "saved, loudly" — the right answer for a transient outage
+   * and precisely the wrong one for a write aimed at the shared dataset. So a
+   * misconfigured `apiUrl` has to fail before a transport exists at all. The
+   * commit path POSTs, so this is the one place where an `OVERLAY_API_URL`
+   * pointing at Sanity would otherwise turn every branch edit into a staging
+   * write (owner ruling, 2026-08-05).
+   */
+  assertNoStagingWrite(
+    {method: 'POST', url: `${base}/commit`},
+    'the overlay API URL must point at the overlay, never at Sanity',
+  )
+
   const noteError = options.onError ?? ((): void => {})
-  const doFetch =
+  const rawFetch =
     options.fetch ??
     (typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined)
+  /* Defence in depth: even a relative or later-rewritten target is re-checked. */
+  const doFetch =
+    rawFetch === undefined ? undefined : createStagingSafeFetch(rawFetch, 'overlay API transport')
 
   /**
    * Commits are serialized.

@@ -34,8 +34,25 @@ export type {
   OverlayIntentState,
 } from './intent'
 
+/* Branch-local assets: content-addressed blobs and §24.2 records (PRD §24.3). */
+export {FsOverlayAssetStore} from './assetStore'
+export type {
+  AssetIntegrityReport,
+  FsOverlayAssetStoreHooks,
+  FsOverlayAssetStoreOptions,
+  OverlayAssetCheckpointEntry,
+  OverlayAssetCheckpointManifest,
+  PutAssetInput,
+  PutAssetResult,
+  ReadBlobOptions,
+  RemoveAssetOptions,
+  RemoveAssetResult,
+} from './assetStore'
+
 /* Canonical layout and path-containment guard (PRD §14.1, §35.9). */
 export {
+  ASSET_BLOBS_DIR,
+  ASSET_RECORDS_DIR,
   ASSETS_DIR,
   BROKEN_SUFFIX,
   DOCUMENTS_DIR,

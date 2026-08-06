@@ -2,6 +2,8 @@
 
 **Date:** 2026-08-04 · **Suite: 2650 tests, 40 files, green** (`pnpm --filter sanity-overlay-testkit test`) · **Uncommitted work in the tree** — see §6.
 
+> **SCOPE AMENDMENT — 2026-08-05.** Owner ruling: **this system never writes to a real Sanity dataset**, including its asset API. Promotion is out of scope **permanently, not deferred**. `packages/sanity-overlay-core/src/promotion/**` and its 108 tests were deleted; two structural guards replaced them (a suite-wide outbound-request monitor and a runtime host refusal). Binding statement: [PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity).
+
 Read this first, then [gate-review.md](evidence/phase-1/gate-review.md), [live-validation-2026-08-04.md](evidence/phase-1/live-validation-2026-08-04.md), [evidence-review-2026-08-04.md](evidence/phase-1/evidence-review-2026-08-04.md), and [phase-2/acceptance-audit.md](evidence/phase-2/acceptance-audit.md).
 
 ---
@@ -69,7 +71,7 @@ Proven live, 2026-08-04, with disk and upstream-API evidence ([live-validation](
 
 1. **Vercel project + private Blob token** → Spike B → Gates C, F, and E's deployed half. *This single unblock is worth more than everything else outstanding.*
 2. **§0.6 human validation** — one human validation of the real Studio workflow per spike. The 2026-08-04 sessions were agent-driven and do not satisfy this by definition.
-3. **D13 ratification; D01 and D09 sign-off** ([decisions.md](evidence/phase-1/decisions.md)).
+3. **D13 ratification; D01 and D09 sign-off** ([decisions.md](evidence/phase-1/decisions.md)). D01 is now only about *local* branch uploads — the Sanity-upload half was settled on 2026-08-05 (never). D10 and D11 are moot.
 4. **Approve the launch-critical query list.** Gate D's Tier-C *ratio* has no denominator without it (numerator is zero, so the conclusion holds regardless).
 5. **Ratify `query.maxCandidateDocuments`** — PRD §11.1 defines no value and it cannot be 5,000: `article-type-list` legitimately materialises 5,833 and `multi-type-list` 6,333. Either the cap sits above the largest legitimate answer, or list queries paginate.
 6. **§28.6 conflict acknowledgements have no storage home.** PRD §13.3/§13.11 define no field. The invalidation rule is implemented; the schema field was deliberately **not** invented. Needs a spec decision.

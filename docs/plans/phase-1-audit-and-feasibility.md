@@ -168,7 +168,7 @@ Reproduced from PRD §36. Execution bounds and required evidence artifacts are f
 | B: Blob transaction | One implementation pass and one failure-injection repair pass | Store contract report, ETag conflict trace, orphan recovery trace, lifecycle and export trace |
 | C: GROQ corpus | One inventory pass, one planner pass, one parity repair pass | Query registry, parity report, candidate counts, Tier C list |
 | D: Schema compatibility | One fixture pass and one migration repair pass | Compatibility matrix and validation report |
-| E: Assets | Run only when D01, decided during the Phase 0 audit before spike scheduling completes, classifies branch uploads as launch-critical | Upload, preview, checkpoint, and promotion trace |
+| E: Assets | Run only when D01, decided during the Phase 0 audit before spike scheduling completes, classifies **local** branch uploads as launch-critical | Upload, preview and checkpoint trace. ~~Promotion trace~~ — struck 2026-08-05: branch assets are never uploaded to Sanity |
 | F: Safety boundary | One attack pass after a provisional topology is selected (§36.6 ordering rule) | Secret scan, network trace, fork test, native-write test |
 
 Universal rules (§0.6): each spike runs in an isolated branch with a reproducible fixture and an evidence report; a spike passes only with automated tests **plus one human validation of the actual Studio workflow**; a partial prototype does not count as a pass.
@@ -349,7 +349,10 @@ Expected behavior per change type is tabulated in §20.2; the compatibility scan
 
 **Feeds:** no lettered gate; conditional on D01. **Runs only when D01 classifies branch uploads as launch-critical (§36.0, §37 Phase 0).** Per PRD v1.1, D01 is decided **during the Phase 0 audit, before spike scheduling completes** (§39.3), so the spike is either scheduled or formally skipped with no circularity; record the outcome in `decisions.md` either way. The default when unanswered is "Existing Sanity assets only; branch uploads deferred".
 
-**Goal:** Prove branch-only upload, preview, checkpoint metadata, and promotion.
+**Goal:** Prove branch-only upload, preview and checkpoint metadata.
+
+> **Amended 2026-08-05 ([PRD §0.0 scope amendment](../PRD-v1.md#00-scope-amendment--2026-08-05--this-system-never-writes-to-sanity)).** "and promotion" is struck: branch assets are never uploaded to Sanity. The local and private-Blob half of §24 remains in scope and is what this spike proves.
+
 
 - [ ] Add custom asset source.
 - [ ] Upload local image.
@@ -357,8 +360,8 @@ Expected behavior per change type is tabulated in §20.2; the compatibility scan
 - [ ] Create synthetic asset reference.
 - [ ] Render in preview.
 - [ ] Enforce authentication.
-- [ ] Upload to Sanity during promotion.
-- [ ] Rewrite reference.
+- [ ] ~~Upload to Sanity during promotion.~~ **STRUCK 2026-08-05** — out of scope permanently.
+- [ ] ~~Rewrite reference.~~ **STRUCK 2026-08-05** — the rewrite existed only to serve promotion.
 
 Reference behavior: existing-asset guarantees in §24.1, the `OverlayAssetRecord` shape in §24.2, the local and Blob workflows in §24.3 and §24.4, and asset security requirements in §24.5.
 
@@ -366,7 +369,7 @@ Reference behavior: existing-asset guarantees in §24.1, the `OverlayAssetRecord
 
 - Existing and branch assets coexist.
 - Draft asset is not public.
-- Promotion produces normal Sanity asset reference.
+- ~~Promotion produces normal Sanity asset reference.~~ **STRUCK 2026-08-05** — replaced by: a branch asset resolves through the overlay's own asset URL (§24.7) and is never uploaded to Sanity.
 
 **Fail response:** the PRD specifies **no spike-specific fail response** for Spike E (§36.5 has no fail-response block, and §0.6 lists no asset abort trigger). A failure routes to the generic §0.6 response — architecture review and a written pivot decision — and falls back to the D01 default, "Existing Sanity assets only; branch uploads deferred" (§39.3). Per PRD v1.1 the deferral target is PRD Phase 7 (roadmap Phase 8) — see §9, resolution log OQ-9. Existing Sanity assets remain native and usable regardless (§24.1, §39.2).
 
@@ -451,7 +454,7 @@ docs/plans/evidence/phase-1/
                                 # candidate-counts.md, tier-c-list.md
   spike-d-schema-compatibility/ # report.md, compatibility-matrix.md, validation-report.md
   spike-e-assets/               # only if D01 makes branch uploads launch-critical:
-                                # report.md, upload-preview-checkpoint-promotion-trace.md
+                                # report.md, upload-preview-checkpoint-trace.md
   spike-f-safety-boundary/      # report.md, secret-scan.md, network-trace.md,
                                 # fork-test.md, native-write-test.md
   decisions.md                  # running log for §4.1 and §4.2
@@ -522,7 +525,7 @@ Future-phase plan documents are named but not yet written; their filenames are t
 | Spike C / Gate D / D07 / D15 / approved V1 query registry | Roadmap Phase 6 — GROQ query layer and frontend migration (`phase-6-query-layer.md`, PRD Phase 5): registry, planners, parity fixtures. Also gates the minimal ID and slug query slice pulled forward into roadmap Phase 3 (roadmap section 5.3) and the §35.11 fixture coverage carried by the roadmap Phase 2 testkit |
 | Spike D | Schema conflict and migration work in roadmap Phase 3 (`phase-3-local-fs-mode.md`, basic) and roadmap Phase 7 (`phase-7-conflicts-checkpoint-ci.md`, full) |
 | Spike F / Gate E / D03 / D14 | Roadmap Phase 4 preview topology and roadmap Phase 5 preview Studio deployment |
-| Spike E / D01 | Roadmap Phase 8 — Assets and promotion (`phase-8-assets-promotion.md`, PRD Phases 7 and 8) |
+| Spike E / D01 | Roadmap Phase 8 — Branch assets, local and preview only (`phase-8-assets.md`, PRD Phase 7). Promotion (PRD Phase 8) is out of scope permanently (2026-08-05) |
 | Approved launch feature degradation list | Roadmap Phase 5 onwards; drives the §32 parity matrix and the disabled-feature list |
 | Approved Blob physical layout | Roadmap Phase 4 storage adapter |
 
@@ -531,7 +534,7 @@ Future-phase plan documents are named but not yet written; their filenames are t
 ## 8. Out of scope for this phase
 
 - **No production implementation.** "The project does not enter full implementation until all six gates pass" (§0.3). Spike code is throwaway evidence code on `spike/*` branches; it is not the roadmap Phase 2 (PRD §37 Phase 1) core engine and must not be promoted into `packages/` without being rewritten under the roadmap Phase 2 test regime.
-- **No milestone claims.** Per §1.4, phase plans may implement later-milestone foundations early, but cannot redefine an earlier milestone as complete. Nothing in Phase 1 may be reported as `[M-LOCAL]`, `[M-PREVIEW]`, `[M-PROD]`, or `[M-PROMO]` acceptance.
+- **No milestone claims.** Per §1.4, phase plans may implement later-milestone foundations early, but cannot redefine an earlier milestone as complete. Nothing in Phase 1 may be reported as `[M-LOCAL]`, `[M-PREVIEW]` or `[M-PROD]` acceptance. (`[M-PROMO]` was retired on 2026-08-05 — promotion is out of scope permanently.)
 - **No architecture lock-in by inertia.** "Do not preserve the overlay architecture merely because implementation has started" (§0.5 decision rule 2).
 - **Spike E is conditional**, not default; skipping it is the PRD default (§39.3 D01).
 - Decisions D02, D04, D05, D06, D10, D11, D12 are not resolved here (§4.2).

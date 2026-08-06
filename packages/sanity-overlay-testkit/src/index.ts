@@ -54,3 +54,18 @@ export type {
   WriteGuardPredicate,
   WriteGuardRequest,
 } from './writeGuardContract'
+
+/**
+ * The suite-wide outbound-request monitor, installed by `vitest.setup.ts` into
+ * every test file: no non-GET request may reach a Sanity host from anywhere in
+ * the suite (owner ruling, 2026-08-05).
+ */
+export {
+  OUTBOUND_REFUSAL_CODE,
+  StagingWriteInTestError,
+  installOutboundRequestMonitor,
+  isMonitoredSanityHost,
+  isOutboundRequestMonitorInstalled,
+  outboundAttempts,
+} from './outboundMonitor'
+export type {OutboundAttempt} from './outboundMonitor'

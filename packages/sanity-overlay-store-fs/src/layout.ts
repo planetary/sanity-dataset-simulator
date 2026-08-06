@@ -16,7 +16,12 @@
  * ```
  */
 import {isAbsolute, join, resolve, sep} from 'node:path'
-import {encodeLogicalId, isEncodedLogicalId, toPublishedId} from '../../sanity-overlay-core/src/index'
+import {
+  encodeLogicalId,
+  isEncodedLogicalId,
+  isOverlayAssetDocumentId,
+  toPublishedId,
+} from '../../sanity-overlay-core/src/index'
 import {OverlayInvalidRequestError, OverlayPathEscapeError} from './errors'
 
 export const OVERLAY_DIR = '.sanity-overlay'
@@ -25,6 +30,10 @@ export const DOCUMENTS_DIR = 'documents'
 export const INTENT_FILE = 'intent.json'
 export const SNAPSHOTS_DIR = 'snapshots'
 export const ASSETS_DIR = 'assets'
+/** Content-addressed asset bytes: `assets/blobs/<sha256>.bin` (PRD §14.1, §24.3 step 3). */
+export const ASSET_BLOBS_DIR = 'blobs'
+/** Review-facing §24.2 records: `assets/records/<assetDocumentId>.json`. */
+export const ASSET_RECORDS_DIR = 'records'
 export const MIGRATIONS_DIR = 'migrations'
 export const RUNTIME_DIR = '.runtime'
 export const MATERIALIZED_DIR = 'materialized'
@@ -43,9 +52,17 @@ export const BROKEN_SUFFIX = '.broken'
 /** Prefix of the temporary file used by every atomic write (§14.3 MUST). */
 export const TEMP_PREFIX = '.tmp-'
 
-/** PRD §14.1 recommended `.gitattributes`. */
+/**
+ * PRD §14.1 recommended `.gitattributes`.
+ *
+ * The asset blob line is not cosmetic. `assets/blobs/**` holds opaque bytes
+ * addressed by their SHA-256; marking it `binary` stops Git attempting a text
+ * diff or a line-ending conversion on content whose checksum is its identity —
+ * a CRLF rewrite would silently invalidate every record that names it.
+ */
 export const GITATTRIBUTES_CONTENT = `${OVERLAY_DIR}/${SNAPSHOTS_DIR}/** linguist-generated=true
 ${OVERLAY_DIR}/${RUNTIME_DIR}/** export-ignore
+${OVERLAY_DIR}/${ASSETS_DIR}/${ASSET_BLOBS_DIR}/** binary
 `
 
 /** PRD §14.1 "Runtime-only files must be ignored", expressed relative to `.sanity-overlay/`. */
@@ -162,6 +179,18 @@ export class OverlayLayout {
     return this.resolve(SNAPSHOTS_DIR)
   }
 
+  get assetsDir(): string {
+    return this.resolve(ASSETS_DIR)
+  }
+
+  get assetBlobsDir(): string {
+    return this.resolve(ASSETS_DIR, ASSET_BLOBS_DIR)
+  }
+
+  get assetRecordsDir(): string {
+    return this.resolve(ASSETS_DIR, ASSET_RECORDS_DIR)
+  }
+
   get runtimeDir(): string {
     return this.resolve(RUNTIME_DIR)
   }
@@ -193,6 +222,37 @@ export class OverlayLayout {
   snapshotPath(snapshotRef: string): string {
     assertSafeComponent(snapshotRef, 'snapshot ref')
     return this.resolve(SNAPSHOTS_DIR, `${snapshotRef}.json`)
+  }
+
+  /**
+   * `assets/blobs/<sha256>.bin` — PRD §14.1 content addressing.
+   *
+   * The digest is validated before it is joined, so the only strings that can
+   * ever reach the filesystem are 64 lowercase hex characters. There is no
+   * sanitizing step to get wrong: a traversal attempt is simply not a SHA-256.
+   */
+  assetBlobPath(checksum: string): string {
+    if (!/^[a-f0-9]{64}$/.test(checksum)) {
+      throw new OverlayPathEscapeError(checksum, 'asset checksum', {kind: 'asset checksum'})
+    }
+    return this.resolve(ASSETS_DIR, ASSET_BLOBS_DIR, `${checksum}.bin`)
+  }
+
+  /**
+   * `assets/records/<assetDocumentId>.json`.
+   *
+   * Same argument as {@link assetBlobPath}: an overlay asset document ID is
+   * `image-<40 hex>-<w>x<h>-<ext>` or `file-<40 hex>-<ext>`, a grammar with no
+   * `/`, no `.` and no `%`, so containment is a property of the identifier rather
+   * than of a filter applied to it.
+   */
+  assetRecordPath(assetDocumentId: string): string {
+    if (!isOverlayAssetDocumentId(assetDocumentId)) {
+      throw new OverlayPathEscapeError(assetDocumentId, 'asset document id', {
+        kind: 'asset document id',
+      })
+    }
+    return this.resolve(ASSETS_DIR, ASSET_RECORDS_DIR, `${assetDocumentId}.json`)
   }
 
   materializedPath(logicalId: string): string {

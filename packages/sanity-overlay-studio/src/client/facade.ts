@@ -37,7 +37,13 @@ import {
   type OverlayEchoPlan,
   type PlannedEvent,
 } from './echo'
-import type {OverlayTransport, OverlayTransportResult} from './transport'
+import {STAGING_WRITE_POLICY, isStagingWrite} from '../../../sanity-overlay-client/src/stagingHost'
+import type {StudioReadRouter} from './reads'
+import type {
+  OverlayHydrationDocument,
+  OverlayTransport,
+  OverlayTransportResult,
+} from './transport'
 import {
   classifyWriteEndpoint,
   identityProofFrom,
@@ -67,6 +73,19 @@ export interface OverlayFacadeOptions {
   transport: OverlayTransport
   onError?: (message: string) => void
   onWrite?: (record: OverlayWriteRecord) => void
+  /**
+   * Overlay-aware GROQ reads (PRD §22.6). ABSENT MEANS UNCHANGED: `fetch` is
+   * delegated to the real client exactly as it was before reads were wired, so
+   * a caller that has not opted in cannot be altered by this path.
+   */
+  reads?: StudioReadRouter
+  /**
+   * Every hydration document a commit answered with, so the caller can keep the
+   * read side's view of the branch current without polling `/state`. The echo
+   * map cannot serve this: it stores `null` as a DELETE of its own entry, which
+   * spells "no opinion" and loses the tombstone the read path needs.
+   */
+  onHydration?: (documents: readonly OverlayHydrationDocument[]) => void
   /** Injected clock for the write ledger. */
   now?: () => number
 }
@@ -93,55 +112,108 @@ function normalizeObserver<T>(
   return typeof observer === 'function' ? {next: observer} : observer
 }
 
+type SubscribeFn<T> = (subscriber: Required<MinimalSubscriber<T>>) => (() => void) | void
+
+type ObservableCtor = new <T>(subscribe: SubscribeFn<T>) => MinimalObservable<T>
+
 /**
- * A cold observable with just enough of the contract for Studio's consumers.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE VALUE THIS LAYER HANDS BACK MUST BE AN rxjs `Observable`, NOT A LOOKALIKE.
  *
- * Deliberately minimal rather than rxjs: this package must not add a dependency
- * the consumer's Studio does not already pin, and every consumer of these values
- * inside Studio calls `.subscribe()`.
+ * `@sanity/client`'s observable surface answers with rxjs `Observable`s, and
+ * Studio treats them as such the moment it gets one:
+ *
+ *     client.observable.request({uri: `/projects/${projectId}`}).pipe(…)
+ *         — sanity 6.8.0 `createProjectStore`
+ *
+ * This module used to return a hand-rolled `{subscribe}`. Studio's very first
+ * datastore therefore died with `…request(...).pipe is not a function`, inside
+ * `<StudioTelemetryProvider>`, before anything rendered.
+ *
+ * A `{subscribe, pipe}` duck would not have been enough either. rxjs operators
+ * are `lift`-based — `operate()` throws `Unable to lift unknown Observable type`
+ * on anything that is not a genuine `Observable` — so `pipe(map(…))` would still
+ * have failed. The only correct answer is the real class.
+ *
+ * It is adopted from the client being wrapped rather than imported, so the
+ * facade cannot introduce a SECOND rxjs copy: Studio's own `isObservable()` is
+ * an `instanceof` check, and a foreign copy would fail it.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
-function makeObservable<T>(
-  onSubscribe: (subscriber: Required<MinimalSubscriber<T>>) => (() => void) | void,
-): MinimalObservable<T> {
-  return {
-    subscribe(observer) {
-      const target = normalizeObserver(observer)
-      let closed = false
-      const safe = {
-        next: (value: T): void => {
-          if (!closed) target.next?.(value)
-        },
-        error: (error: unknown): void => {
-          if (!closed) target.error?.(error)
-        },
-        complete: (): void => {
-          if (!closed) target.complete?.()
-        },
-      }
-      const teardown = onSubscribe(safe)
-      return {
-        unsubscribe: (): void => {
-          if (closed) return
-          closed = true
-          teardown?.()
-        },
-      }
-    },
+const OBSERVABLE_PROBE_QUERY = '*[_id == "__sanity_overlay_observable_probe__"][0]'
+
+/**
+ * Is this an `@sanity/client` client instance, as opposed to any other object
+ * that happens to have a `fetch`?
+ *
+ * The probe below *calls* a method on whatever this admits, so admitting too
+ * much would mean calling a caller's code behind its back. Both real clients are
+ * class instances and carry these methods on a PROTOTYPE; an object literal — a
+ * test double, a stub — carries them as own properties and is rejected.
+ *
+ * Structural rather than `x instanceof SanityClient`, because that would need a
+ * RUNTIME import of `@sanity/client`, which the package declares only as a peer:
+ * it does not resolve in a workspace that has not installed one.
+ */
+function isSanityClientInstance(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false
+  /* All four are class methods on BOTH `SanityClient` and
+   * `ObservableSanityClient` in @sanity/client 7.26.0. `listen` deliberately is
+   * not among them: it is assigned to the INSTANCE, so it proves nothing about
+   * the class. The whole chain is walked rather than one level, since a
+   * `withConfig()` clone may sit a level down. */
+  const required = ['fetch', 'getUrl', 'getDataUrl', 'withConfig']
+  const found = new Set<string>()
+  let proto = Object.getPrototypeOf(value) as Rec | null
+  while (proto !== null && proto !== Object.prototype) {
+    for (const name of required) {
+      if (typeof proto[name] === 'function') found.add(name)
+    }
+    proto = Object.getPrototypeOf(proto) as Rec | null
   }
+  return required.every((name) => found.has(name))
 }
 
-function observableOf<T>(value: T, onDelivered?: () => void): MinimalObservable<T> {
-  return makeObservable<T>((subscriber) => {
-    subscriber.next(value)
-    subscriber.complete()
-    onDelivered?.()
-  })
-}
+/**
+ * Last resort, used only if the rxjs constructor could not be adopted — which in
+ * a real Studio cannot happen, since `@sanity/client` is a required peer and
+ * every wrapped client descends from it. `pipe` is a plain left-fold, so
+ * `lift`-based operators will NOT work against it: reaching this class is itself
+ * the bug, which is why `makeObservable` reports it.
+ */
+class ShimObservable<T> implements MinimalObservable<T> {
+  readonly #onSubscribe: SubscribeFn<T>
 
-function observableThrowing<T>(error: unknown): MinimalObservable<T> {
-  return makeObservable<T>((subscriber) => {
-    subscriber.error(error)
-  })
+  constructor(onSubscribe: SubscribeFn<T>) {
+    this.#onSubscribe = onSubscribe
+  }
+
+  subscribe(observer: MinimalSubscriber<T> | ((value: T) => void)): MinimalSubscription {
+    const target = normalizeObserver(observer)
+    let closed = false
+    const teardown = this.#onSubscribe({
+      next: (value: T): void => {
+        if (!closed) target.next?.(value)
+      },
+      error: (error: unknown): void => {
+        if (!closed) target.error?.(error)
+      },
+      complete: (): void => {
+        if (!closed) target.complete?.()
+      },
+    })
+    return {
+      unsubscribe: (): void => {
+        if (closed) return
+        closed = true
+        teardown?.()
+      },
+    }
+  }
+
+  pipe(...operators: Array<(source: unknown) => unknown>): unknown {
+    return operators.reduce<unknown>((source, operator) => operator(source), this)
+  }
 }
 
 function isObservableLike(value: unknown): value is MinimalObservable<unknown> {
@@ -172,7 +244,35 @@ const WRITE_METHODS = new Set([
   'mutate',
 ])
 
+/**
+ * The version family: top-level document writes that reach the wire WITHOUT
+ * going through `mutate`, `action`, `dataRequest` or `request` — each calls
+ * `_dataRequest` with the raw client — so no other guard here could see them.
+ *
+ * sanity 6.8.0 calls all four from `useBundleDocuments` and
+ * `useScheduledDraftMenuActions`: they are Content Releases plumbing, the same
+ * plane `client.releases.*` is already refused on. Refused rather than echoed
+ * for the same reason: the overlay has no spelling for a release, and letting
+ * one through writes to the shared dataset (PRD §11.3).
+ */
+const RELEASE_VERSION_METHODS = new Set([
+  'createVersion',
+  'replaceVersion',
+  'discardVersion',
+  'unpublishVersion',
+])
+
+const RELEASE_PLANE_REASON =
+  'Content Releases are hosted version infrastructure the overlay does not reproduce'
+
 const READ_TAP_METHODS = new Set(['getDocument', 'getDocuments'])
+/**
+ * The ONE read Studio itself resets its base revision from: the document pair
+ * listener's snapshot fetch is `getDocuments`. Every other read still answers
+ * with the stale Content Lake revision once writes are intercepted, so only
+ * this one may overwrite an echo-owned revision. See `tapRead`.
+ */
+const AUTHORITATIVE_READ_METHODS = new Set(['getDocuments'])
 const MUTATING_DATA_ENDPOINTS = new Set(['mutate', 'actions'])
 const CLONING_METHODS = new Set(['withConfig', 'clone', 'withUrlSourceMapping'])
 
@@ -187,14 +287,57 @@ function namespaceRefusalReason(path: string): string {
   if (path === 'assets') return UNECHOABLE_REASON.asset
   if (path === 'agent.action') return UNECHOABLE_REASON['agent-action']
   if (path === 'datasets') return UNECHOABLE_REASON['dataset-admin']
-  if (path === 'releases') {
-    return 'Content Releases are hosted version infrastructure the overlay does not reproduce'
-  }
+  if (path === 'releases') return RELEASE_PLANE_REASON
   return 'this namespace method is not one the overlay knows how to represent'
 }
 
 /** `*[_id in $ids]` — the document *pair* listener, the only one worth echoing. */
 const PAIR_QUERY_RE = /^\*\[\s*_id\s+in\s+\$ids\s*\]$/
+
+/**
+ * The absolute URL a raw `request({url | uri})` would actually be sent to, using
+ * the WRAPPED CLIENT'S OWN URL builder.
+ *
+ * Asking the client rather than reconstructing the host is the whole point: in
+ * the Track B topology `apiHost` is a local proxy, so `/data/mutate/<ds>` is not
+ * a staging write and must not be refused as one. `getUrl` is `@sanity/client`'s
+ * public accessor for exactly this (`getUrl(uri, canUseCdn)`), and it already
+ * applies the `useProjectHostname` and resource-scoping rules that a hand-rolled
+ * reconstruction would get wrong.
+ *
+ * Returns `''` when the destination cannot be determined — a test double with no
+ * `getUrl` and no `config`, typically. The path-anchored guards below still run;
+ * this one abstains rather than guessing (see `stagingHost.ts`).
+ */
+function absoluteRequestUrl(client: object, target: unknown): string {
+  const path = typeof target === 'string' ? target : ''
+  const getUrl = (client as Rec).getUrl
+  if (typeof getUrl === 'function') {
+    try {
+      const resolved = (getUrl as (uri: string) => unknown).call(client, path)
+      if (typeof resolved === 'string' && resolved !== '') return resolved
+    } catch {
+      /* Fall through to the config-derived host. */
+    }
+  }
+
+  const config = (client as Rec).config
+  if (typeof config !== 'function') return ''
+  try {
+    const resolved = (config as () => unknown).call(client)
+    if (!isRec(resolved)) return ''
+    const apiHost = typeof resolved.apiHost === 'string' ? resolved.apiHost : 'https://api.sanity.io'
+    const projectId = typeof resolved.projectId === 'string' ? resolved.projectId : ''
+    /* `@sanity/client` defaults `useProjectHostname` to true. */
+    const useProjectHostname = resolved.useProjectHostname !== false && projectId !== ''
+    const host = useProjectHostname
+      ? apiHost.replace(/^(https?:\/\/)/i, (scheme) => `${scheme}${projectId}.`)
+      : apiHost
+    return `${host.replace(/\/+$/, '')}/${path.replace(/^\//, '')}`
+  } catch {
+    return ''
+  }
+}
 
 /* ------------------------------------------------------------ the facade */
 
@@ -223,6 +366,82 @@ function createFacade(options: OverlayFacadeOptions): {
   const methodCache = new WeakMap<object, Map<PropertyKey, unknown>>()
   const namespaceCache = new WeakMap<object, object>()
   const namespaceMethodCache = new WeakMap<object, Map<PropertyKey, unknown>>()
+
+  /* ------------------------------------------- the client's own Observable */
+
+  let observableCtor: ObservableCtor | undefined
+  let shimReported = false
+
+  /**
+   * Adopt the constructor of a real observable that just went past. Free, and it
+   * pins the wrapper to the exact rxjs copy the wrapped client returns.
+   */
+  function captureObservableCtor(value: unknown): void {
+    if (observableCtor || typeof value !== 'object' || value === null) return
+    const proto = Object.getPrototypeOf(value) as Rec | null
+    if (!proto || typeof proto.subscribe !== 'function' || typeof proto.pipe !== 'function') return
+    const ctor = proto.constructor
+    if (typeof ctor === 'function') observableCtor = ctor as unknown as ObservableCtor
+  }
+
+  /**
+   * Adopt it before anything has flowed, so a write that happens to be the first
+   * observable call of the session is answered as correctly as a read.
+   *
+   * Cold: `_requestObservable` in `@sanity/client` v7 is
+   * `new Observable(sub => httpRequest(…).subscribe(sub))`, so building one and
+   * dropping it makes no request. Gated on {@link isSanityClientInstance} rather
+   * than on the presence of a `fetch` method, so a test double is never called
+   * behind the caller's back — only a real `@sanity/client` is probed.
+   */
+  function probeObservableCtor(target: object): void {
+    if (observableCtor) return
+    /* The PROMISE client's `fetch` answers with a Promise, so the observable
+     * sibling is the one that can hand back the class. */
+    const sibling = (target as Rec).observable
+    const source = isSanityClientInstance(sibling)
+      ? (sibling as Rec)
+      : isSanityClientInstance(target)
+        ? (target as Rec)
+        : undefined
+    if (!source) return
+    try {
+      const fetch = source.fetch
+      if (typeof fetch !== 'function') return
+      captureObservableCtor((fetch as (query: string) => unknown).call(source, OBSERVABLE_PROBE_QUERY))
+    } catch (error) {
+      noteError(
+        `[sanity-overlay-studio] could not adopt @sanity/client's Observable: ${String(error)}`,
+      )
+    }
+  }
+
+  function makeObservable<T>(onSubscribe: SubscribeFn<T>): MinimalObservable<T> {
+    const Ctor = observableCtor
+    if (Ctor) return new Ctor<T>(onSubscribe)
+    if (!shimReported) {
+      shimReported = true
+      noteError(
+        `[sanity-overlay-studio] answering an observable call without @sanity/client's own ` +
+          `Observable — rxjs operators (.pipe) will not compose against the fallback`,
+      )
+    }
+    return new ShimObservable<T>(onSubscribe)
+  }
+
+  function observableOf<T>(value: T, onDelivered?: () => void): MinimalObservable<T> {
+    return makeObservable<T>((subscriber) => {
+      subscriber.next(value)
+      subscriber.complete()
+      onDelivered?.()
+    })
+  }
+
+  function observableThrowing<T>(error: unknown): MinimalObservable<T> {
+    return makeObservable<T>((subscriber) => {
+      subscriber.error(error)
+    })
+  }
 
   function recordWrite(record: OverlayWriteRecord): void {
     options.onWrite?.(record)
@@ -270,6 +489,7 @@ function createFacade(options: OverlayFacadeOptions): {
         break
       }
       if (result.outcome === 'degraded') committed = 'degraded'
+      if (result.documents !== undefined) options.onHydration?.(result.documents)
       for (const document of result.documents ?? []) {
         if (document.draft !== undefined) {
           echo.setOverlayDocument(`drafts.${document.logicalId}`, document.draft ?? null)
@@ -401,6 +621,7 @@ function createFacade(options: OverlayFacadeOptions): {
 
     if (isObservableLike(result)) {
       const source = result
+      captureObservableCtor(source)
       return makeObservable((subscriber) => {
         const subscription = source.subscribe({
           next: (value) => {
@@ -463,6 +684,7 @@ function createFacade(options: OverlayFacadeOptions): {
     }
     if (isObservableLike(result)) {
       const source = result
+      captureObservableCtor(source)
       return makeObservable((subscriber) => {
         const subscription = source.subscribe({
           next: (value) => subscriber.next(substitute(value)),
@@ -476,6 +698,105 @@ function createFacade(options: OverlayFacadeOptions): {
       })
     }
     return substitute(result)
+  }
+
+  /* ------------------------------------------------------- GROQ reads */
+
+  /** The first value of whatever a client method answered with, as a Promise. */
+  function firstValueOf(result: unknown): Promise<unknown> {
+    if (isPromiseLike(result)) return Promise.resolve(result)
+    if (isObservableLike(result)) {
+      const source = result
+      captureObservableCtor(source)
+      return new Promise((resolve, reject) => {
+        let settled = false
+        const subscription = source.subscribe({
+          next: (value) => {
+            if (settled) return
+            settled = true
+            resolve(value)
+            /* Defensive: a cold single-value observable completes on its own,
+             * but nothing here should hold a subscription open once the value
+             * it asked for has arrived. */
+            queueMicrotask(() => subscription?.unsubscribe())
+          },
+          error: (error) => {
+            if (settled) return
+            settled = true
+            reject(error)
+          },
+          complete: () => {
+            if (settled) return
+            settled = true
+            resolve(undefined)
+          },
+        })
+      })
+    }
+    return Promise.resolve(result)
+  }
+
+  /**
+   * `client.fetch` / `client.observable.fetch` — PRD §22.6 in the one place a
+   * Studio actually reads content from.
+   *
+   * The router decides; this function only plumbs. When it declines, the
+   * caller's own arguments are replayed against the REAL method, so a delegated
+   * read is byte-identical to the un-wrapped one — including its errors, which
+   * still reach {@link noteAuthFailureFrom}.
+   *
+   * `baseFetch` deliberately calls `fn` (the real method) and never the proxy:
+   * routing a candidate fetch back through this wrapper would recurse.
+   *
+   * AN OVERLAY-ANSWERED READ IS NOT SEEDED INTO THE ECHO, and that is the point
+   * rather than an omission. `tapReadErrors` seeds `docState` from what a read
+   * returned so revisions can be learned from base traffic; an answer this
+   * function produced is branch state projected through the caller's own GROQ,
+   * so seeding it would teach the revision store an overlay body as though the
+   * Content Lake had said it. A DELEGATED read still seeds, because that really
+   * is base traffic.
+   */
+  function interceptFetch(
+    target: object,
+    fn: (...args: unknown[]) => unknown,
+    args: unknown[],
+    kind: Kind,
+  ): unknown {
+    const router = options.reads
+    const delegate = (): unknown => tapReadErrors(fn.apply(target, args))
+    if (router === undefined || typeof args[0] !== 'string') return delegate()
+
+    const answered = router({
+      query: args[0],
+      params: args[1],
+      options: args[2],
+      baseFetch: (query, params) => firstValueOf(fn.call(target, query, params)),
+    }).then((answer) => (answer.answered ? answer.result : firstValueOf(delegate())))
+
+    if (kind !== 'observable') {
+      return answered.catch((error: unknown) => {
+        noteAuthFailureFrom(error, 'read')
+        throw error
+      })
+    }
+    return makeObservable((subscriber) => {
+      let closed = false
+      void answered.then(
+        (value) => {
+          if (closed) return
+          subscriber.next(value)
+          subscriber.complete()
+        },
+        (error: unknown) => {
+          if (closed) return
+          noteAuthFailureFrom(error, 'read')
+          subscriber.error(error)
+        },
+      )
+      return () => {
+        closed = true
+      }
+    })
   }
 
   function tapReadErrors(result: unknown): unknown {
@@ -493,6 +814,7 @@ function createFacade(options: OverlayFacadeOptions): {
     }
     if (isObservableLike(result)) {
       const source = result
+      captureObservableCtor(source)
       return makeObservable((subscriber) => {
         const subscription = source.subscribe({
           next: (value) => subscriber.next(value),
@@ -534,6 +856,7 @@ function createFacade(options: OverlayFacadeOptions): {
           : []
 
       const upstream = real.apply(self, args)
+      captureObservableCtor(upstream)
       if (ids.length === 0) return tapReadErrors(upstream)
 
       return makeObservable((subscriber) => {
@@ -688,6 +1011,7 @@ function createFacade(options: OverlayFacadeOptions): {
   function wrap<T extends object>(target: T, kind: Kind): T {
     const cached = proxyCache.get(target)
     if (cached) return cached as T
+    probeObservableCtor(target)
 
     const proxy = new Proxy(target, {
       get(t, prop) {
@@ -715,6 +1039,8 @@ function createFacade(options: OverlayFacadeOptions): {
 
         if (name === 'listen') {
           wrapped = wrapListen(fn, t)
+        } else if (name === 'fetch') {
+          wrapped = (...args: unknown[]): unknown => interceptFetch(t, fn, args, kind)
         } else if (name === 'action') {
           wrapped = (...args: unknown[]): unknown => {
             const transactionId =
@@ -760,8 +1086,42 @@ function createFacade(options: OverlayFacadeOptions): {
               echo.logout()
               return fn.apply(t, args)
             }
-            if (isIdentityProbeEndpoint(url)) {
+            /**
+             * The identity probes are `GET /users/me` and `GET /auth/id`. The
+             * method test is load-bearing, not decoration:
+             * `IDENTITY_PROBE_RE` matches any path UNDER `/users/me`, so
+             * `PUT /users/me/keyvalue/<k>` — a real, write-capable
+             * `@sanity/client` endpoint that the write-guard contract names as
+             * one of the four nobody had heard of — was read as a probe and
+             * DELEGATED. Restricting the tap to safe methods drops the whole
+             * family through to the write classification below instead.
+             */
+            if (isIdentityProbeEndpoint(url) && (method === 'GET' || method === 'HEAD')) {
               return tapIdentityProbe(fn.apply(t, args), `request(${String(url)})`)
+            }
+
+            /**
+             * THE HOST-LEVEL REFUSAL, and the gap it closes.
+             *
+             * `classifyWriteEndpoint` below is an inventory of write PATHS, and
+             * Spike F's finding was that no such inventory is complete:
+             * `POST /projects/<p>/tokens`, `PUT /users/me/keyvalue/<k>`,
+             * `POST /schedules/<p>/<d>` and `POST /descriptors/claim` all fall
+             * through it and were delegated straight to `*.api.sanity.io`.
+             *
+             * This asks a question that needs no inventory — *is an unsafe
+             * method about to leave for a real Sanity API host?* — and it runs
+             * AFTER the two session signals above, because `/auth/logout` is a
+             * POST that must still reach Sanity: it destroys a token rather than
+             * writing content, and swallowing it would leave a live credential
+             * behind (Gate E).
+             */
+            if (isStagingWrite({method, url: absoluteRequestUrl(t, url)})) {
+              return refuseUnechoable(
+                kind,
+                `request(${String(url)})`,
+                `${STAGING_WRITE_POLICY}, and this request is addressed to a real Sanity API host`,
+              )
             }
 
             const plane = classifyWriteEndpoint(url)
@@ -791,6 +1151,8 @@ function createFacade(options: OverlayFacadeOptions): {
             const plan = echo.planWrite(name, args[0], args[1])
             return blockedResult(kind, name, plan, transactionId, true)
           }
+        } else if (RELEASE_VERSION_METHODS.has(name)) {
+          wrapped = (): unknown => refuseUnechoable(kind, name, RELEASE_PLANE_REASON)
         } else if (name === 'patch' || name === 'transaction') {
           wrapped = (...args: unknown[]): unknown => {
             const result = fn.apply(t, args)
@@ -805,8 +1167,9 @@ function createFacade(options: OverlayFacadeOptions): {
             return isRec(result) ? wrap(result as object, kind) : result
           }
         } else if (READ_TAP_METHODS.has(name)) {
+          const authoritative = AUTHORITATIVE_READ_METHODS.has(name)
           wrapped = (...args: unknown[]): unknown =>
-            tapRead(fn.apply(t, args), requestedIdsFrom(args))
+            tapRead(fn.apply(t, args), requestedIdsFrom(args), authoritative)
         } else {
           wrapped = (...args: unknown[]): unknown => tapReadErrors(fn.apply(t, args))
         }

@@ -88,48 +88,124 @@ jobs:
       - run: pnpm --filter sanity-overlay-testkit test
 
   # ---------------------------------------------------------------------------
-  # DISABLED: typecheck
+  # typecheck
   #
-  # `tsc --noEmit` cannot gate anything yet. @types/node is not installed
-  # anywhere in this workspace -- it appears in pnpm-lock.yaml only as an
-  # unsatisfied optional peer, and there is no node_modules/@types directory --
-  # so `node:fs`, `node:crypto`, `Buffer`, `process` and the `NodeJS` namespace
-  # are all unresolved. That is ~155 of the ~180 errors `tsc` currently reports
-  # for sanity-overlay-testkit, which means typechecking today proves nothing
-  # and the test suite is the only real gate.
+  # This job was disabled on the grounds that @types/node was installed nowhere,
+  # so `tsc` reported ~180 unresolved-builtin errors for the testkit alone and a
+  # typecheck proved nothing. That is no longer true: @types/node is now declared
+  # and installed for sanity-overlay-store-fs and sanity-overlay-testkit, and
+  # three packages typecheck completely clean. Those three are gated here.
   #
-  # BLOCKING INSTALL (dependency changes are out of this workflow's scope):
+  # WHAT IT COVERS, and why each one is in:
   #
-  #   pnpm --filter sanity-overlay-testkit  add -D -E "@types/node@^22"
-  #   pnpm --filter sanity-overlay-store-fs add -D -E "@types/node@^22"
+  #   sanity-overlay-core      0 errors. No node: builtins at all, so it needs
+  #                            no @types/node and cannot regress on one.
+  #   sanity-overlay-store-fs  0 errors. Declares @types/node itself, and the
+  #                            entry IS in pnpm-lock.yaml, so a frozen install
+  #                            reproduces the clean run.
+  #   sanity-overlay-query     0 errors. Its only node: imports live in
+  #                            lint/check-queries.mjs, which is JavaScript and
+  #                            outside the tsconfig `include` roots -- tsc never
+  #                            opens it, so no @types/node is needed for this
+  #                            project to be gated.
   #
-  # ^22 tracks the pinned Node 22.22.2 runtime; -E writes the resolved exact
-  # version, matching this repo's exact-pin convention. sanity-overlay-core
-  # needs nothing -- it typechecks clean today. Both commands update
-  # pnpm-lock.yaml; commit it, or `pnpm install --frozen-lockfile` above breaks.
+  # WHAT IT DOES NOT COVER. Each exclusion is a measured error count, not a
+  # guess, and each names the one thing that clears it:
   #
-  # Even after that install this job would still be red: measured with a
-  # borrowed @types/node, 11 genuine errors remain, all in files this workflow
-  # does not own -- 6x TS2322 in spike-d/scanner.ts, 3x TS7016 for untyped
-  # .mjs imports from examples/kitchen-sink, 1x TS2339 in core-boundaries.test.ts,
-  # 1x TS2578 unused @ts-expect-error in write-guard.test.ts. Fix those, then
-  # uncomment. Shipping it now would just paint every run red.
+  #   sanity-overlay-client    16 errors, ALL of them missing-@types/node
+  #                            (TS2307 on node:fs / node:path, TS2503 NodeJS,
+  #                            TS2580 process). Verified: with @types/node
+  #                            reachable the project is clean, 0 errors. Blocked
+  #                            on a dependency install:
   #
-  # typecheck:
-  #   name: typecheck
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 15
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: pnpm/action-setup@v4
-  #     - uses: actions/setup-node@v4
-  #       with:
-  #         node-version: '22.22.2'
-  #         cache: pnpm
-  #     - run: pnpm install --frozen-lockfile
-  #     # tsc is invoked from the testkit for every project: it is the only
-  #     # package that pins typescript. `-p <dir>` still uses each project's own
-  #     # tsconfig, and each project's own node_modules/@types is still found.
-  #     - run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-core
-  #     - run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-store-fs
-  #     - run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit
+  #                              pnpm --filter sanity-overlay-client add -D -E "@types/node@^22.20.1"
+  #
+  #                            (Also pinned as KNOWN_MISSING in
+  #                            packages/sanity-overlay-testkit/test/repo-manifests.test.ts,
+  #                            which goes red when the entry is added and the
+  #                            list is not cleaned up.)
+  #
+  #   sanity-overlay-cli       30 errors, same class and same cause -- but cli
+  #                            ALREADY declares "@types/node": "^22.20.1". It is
+  #                            simply not installed, because packages/sanity-overlay-cli
+  #                            is absent from the `importers` block of
+  #                            pnpm-lock.yaml. Verified: with @types/node
+  #                            reachable the project is clean, 0 errors. Blocked
+  #                            on re-locking, NOT on adding anything:
+  #
+  #                              pnpm install     # at the repo root, then commit pnpm-lock.yaml
+  #
+  #                            NOTE this is not only a typecheck problem. While
+  #                            cli and studio are missing from `importers`, the
+  #                            `pnpm install --frozen-lockfile` step in the test
+  #                            job above fails outright, so the whole workflow
+  #                            is down before any test runs. Run that command
+  #                            first.
+  #
+  #   sanity-overlay-studio    1 error: TS2307 `Cannot find module 'groq-js'` at
+  #                            src/client/readPlan.ts:39. That is a real
+  #                            undeclared dependency -- an ERR_MODULE_NOT_FOUND
+  #                            at Studio boot on a consumer's machine, invisible
+  #                            in-repo only because the workspace root hoists it.
+  #                            Two independent tests already report it
+  #                            (test/repo-manifests.test.ts and
+  #                            test/studio-install.test.ts). groq-js must be a
+  #                            HARD dependency, not a peer -- no Studio ships it
+  #                            as a resolvable top-level module, and unlike
+  #                            @sanity/client it has no cross-copy identity
+  #                            problem. Blocked on:
+  #
+  #                              pnpm --filter sanity-overlay-studio add -E "groq-js@2.0.0"
+  #
+  #                            2.0.0 is the version sanity-overlay-query and the
+  #                            testkit already pin; a different one would mean
+  #                            two evaluators disagreeing about the same query.
+  #
+  #   sanity-overlay-testkit   24 errors, none of them in this package's own
+  #                            harness: 7 in test/assets-model.test.ts, 6 in
+  #                            test/studio-observable-contract.test.ts, 2 each in
+  #                            test/write-guard.test.ts and
+  #                            test/client-revalidate.test.ts, 1 each in
+  #                            test/proxy-tls-live.test.ts,
+  #                            test/core-boundaries.test.ts and the three
+  #                            TS7016s for untyped .mjs imports from
+  #                            examples/kitchen-sink, plus the studio groq-js
+  #                            error above reached through a relative import.
+  #                            Add this project once those land.
+  #
+  # The exclusion list is not free-form: the set of packages named below is
+  # pinned in test/repo-manifests.test.ts ("the typecheck gate covers every
+  # package it can"), which goes red if a package is added to packages/ and
+  # neither gated nor excluded, or if this list and that one drift.
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Deliberately NOT matrixed, unlike the test job. `typescript` is pinned to
+    # an exact version in the testkit manifest and resolved by the lockfile, so
+    # every leg of that matrix would run the identical compiler over the
+    # identical sources and produce the identical answer. The test job's matrix
+    # exists to catch filesystem and Node-runtime drift; tsc sees neither.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # tsc is invoked from the testkit for every project: it is the only
+      # package that pins typescript. `-p <dir>` still uses each project's own
+      # tsconfig, and each project's own node_modules/@types is still found.
+      #
+      # One step per project on purpose. A single chained command would stop at
+      # the first failure and the log would name only that project; separate
+      # steps make the failing one obvious in the checks UI.
+      - name: typecheck sanity-overlay-core
+        run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-core
+      - name: typecheck sanity-overlay-store-fs
+        run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-store-fs
+      - name: typecheck sanity-overlay-query
+        run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-query

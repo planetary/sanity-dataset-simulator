@@ -11,7 +11,7 @@
  * without a dataset.
  */
 import {OverlayQueryError} from './errors'
-import type {BaseCandidateRequest} from './baseSource'
+import type {BaseCandidateRequest, ExtendedCandidateRequest} from './baseSource'
 import type {OverlayQueryDefinition} from './types'
 
 /**
@@ -30,8 +30,22 @@ export interface CandidatePlanContext {
 }
 
 export interface CandidatePlanRequests {
-  /** Base fetches to issue (§22.6 step 5). */
+  /**
+   * CORE base fetches to issue (§22.6 step 5) — the three shapes every adapter
+   * serves.
+   */
   readonly baseRequests: readonly BaseCandidateRequest[]
+  /**
+   * EXTENDED base fetches to issue, in the same step and under the same
+   * contract. Separate from {@link CandidatePlanRequests.baseRequests} so that
+   * adding a request shape stays additive for adapters compiled against the
+   * original port; see the note on {@link BaseCandidateRequest}.
+   *
+   * A caller that issues only `baseRequests` under-fetches rather than
+   * over-fetches, and `evaluate.ts` refuses when the adapter cannot serve
+   * these — so the split cannot turn into a silent approximation.
+   */
+  readonly extendedRequests: readonly ExtendedCandidateRequest[]
   /**
    * IDs that must be resolved virtually even when base returns nothing for
    * them — a branch-created document at a requested ID (§22.6 step 6).
@@ -119,12 +133,18 @@ export function planCandidateRequests(
 
     case 'ids': {
       const ids = plan.idsFromParams.flatMap((name) => idsParam(def, params, name))
-      return {baseRequests: [{kind: 'ids', ids}], explicitIds: ids, overlayTypes: []}
+      return {
+        baseRequests: [{kind: 'ids', ids}],
+        extendedRequests: [],
+        explicitIds: ids,
+        overlayTypes: [],
+      }
     }
 
     case 'ids-literal':
       return {
         baseRequests: [{kind: 'ids', ids: plan.ids}],
+        extendedRequests: [],
         explicitIds: plan.ids,
         overlayTypes: [],
       }
@@ -135,9 +155,8 @@ export function planCandidateRequests(
       // The predicate reads a LOCAL field, so the base can answer it exactly;
       // the branch delta covers everything the base could not have known about.
       return {
-        baseRequests: [
-          {kind: 'field-equality', types: plan.types, path: plan.path, value},
-        ],
+        baseRequests: [{kind: 'field-equality', types: plan.types, path: plan.path, value}],
+        extendedRequests: [],
         explicitIds: [],
         overlayTypes: plan.types,
       }
@@ -147,7 +166,10 @@ export function planCandidateRequests(
       const value = requiredParam(def, params, plan.valueFromParam)
       // Array membership over a LOCAL array: same exactness argument as `slug`.
       return {
-        baseRequests: [{kind: 'field-contains', types: plan.types, path: plan.path, value}],
+        baseRequests: [],
+        extendedRequests: [
+          {kind: 'field-contains', types: plan.types, path: plan.path, value},
+        ],
         explicitIds: [],
         overlayTypes: plan.types,
       }
@@ -166,7 +188,8 @@ export function planCandidateRequests(
         )
       }
       return {
-        baseRequests: [{kind: 'references', types: plan.types, id: value}],
+        baseRequests: [],
+        extendedRequests: [{kind: 'references', types: plan.types, id: value}],
         explicitIds: [],
         overlayTypes: plan.types,
       }
@@ -193,7 +216,8 @@ export function planCandidateRequests(
         )
       }
       return {
-        baseRequests: [
+        baseRequests: [],
+        extendedRequests: [
           {
             kind: 'order-slice',
             types: plan.types,
@@ -210,6 +234,7 @@ export function planCandidateRequests(
     case 'types':
       return {
         baseRequests: [{kind: 'types', types: plan.types}],
+        extendedRequests: [],
         explicitIds: [],
         overlayTypes: plan.types,
       }

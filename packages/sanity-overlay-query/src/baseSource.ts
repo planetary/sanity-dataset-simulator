@@ -19,6 +19,19 @@
  */
 import type {CandidateOrderTerm, QueryDocument} from './types'
 
+/**
+ * The CORE request shapes. Every base adapter must serve all three.
+ *
+ * CLOSED ON PURPOSE — do not add a member here. Adapters outside this package
+ * switch over this union exhaustively and close with
+ * `const exhaustive: never = request`, so a new member is a compile error in
+ * files this package does not own (`sanity-overlay-client/src/base.ts` and
+ * `examples/kitchen-sink/spikeA/readQueries.ts` both do exactly that today).
+ * New shapes go in {@link ExtendedCandidateRequest} instead, which is an
+ * OPTIONAL capability and therefore purely additive. See
+ * `query-diagnostics.test.ts` §1b, which compiles a core-only adapter and fails
+ * if this union grows.
+ */
 export type BaseCandidateRequest =
   /** Documents with these exact IDs. */
   | {readonly kind: 'ids'; readonly ids: readonly string[]}
@@ -29,6 +42,20 @@ export type BaseCandidateRequest =
       readonly path: readonly string[]
       readonly value: unknown
     }
+  /** Every document of these types. */
+  | {readonly kind: 'types'; readonly types: readonly string[]}
+
+/**
+ * Request shapes an adapter MAY serve, added after the port had implementors.
+ *
+ * Each one exists because a §22.6 plan cannot be bounded without it: expressing
+ * `articles-by-tag`, `references($id)` or a top-K slice through the core shapes
+ * would mean fetching the whole type and filtering locally, which is precisely
+ * the over-fetch §22.6 exists to prevent and which no parity test can see.
+ * An adapter that does not implement {@link QueryBaseSource.fetchExtendedCandidates}
+ * gets `UNSUPPORTED_GROQ`, never a silent scan.
+ */
+export type ExtendedCandidateRequest =
   /** Documents of these types whose local ARRAY at `path` contains `value`. */
   | {
       readonly kind: 'field-contains'
@@ -59,16 +86,24 @@ export type BaseCandidateRequest =
       readonly limit: number
       readonly excludeIds: readonly string[]
     }
-  /** Every document of these types. */
-  | {readonly kind: 'types'; readonly types: readonly string[]}
+
+/** Anything a planner can ask for: core plus extended. */
+export type PlannedCandidateRequest = BaseCandidateRequest | ExtendedCandidateRequest
 
 export interface QueryBaseSource {
   /**
-   * Resolve one base request. Implementations MUST return documents in stable
-   * base order and MUST NOT return documents the request did not select —
-   * over-returning silently defeats §22.6.
+   * Resolve one core base request. Implementations MUST return documents in
+   * stable base order and MUST NOT return documents the request did not select
+   * — over-returning silently defeats §22.6.
    */
   fetchCandidates(request: BaseCandidateRequest): Promise<readonly QueryDocument[]>
+  /**
+   * Resolve one extended base request, under the same contract.
+   *
+   * OPTIONAL. Absent means "this adapter cannot serve these shapes", and the
+   * evaluator refuses the query rather than widening the fetch.
+   */
+  fetchExtendedCandidates?(request: ExtendedCandidateRequest): Promise<readonly QueryDocument[]>
 }
 
 /** Read `path` out of a document, following plain objects only. */
@@ -153,6 +188,19 @@ export function createMemoryBaseSource(documents: readonly QueryDocument[]): Que
             (d) => types.has(d._type) && readPath(d, request.path) === request.value,
           )
         }
+        case 'types': {
+          const types = new Set(request.types)
+          return documents.filter((d) => types.has(d._type))
+        }
+        default: {
+          const exhaustive: never = request
+          throw new Error(`unhandled base request ${JSON.stringify(exhaustive)}`)
+        }
+      }
+    },
+
+    async fetchExtendedCandidates(request) {
+      switch (request.kind) {
         case 'field-contains': {
           const types = new Set(request.types)
           return documents.filter((d) => {
@@ -179,13 +227,9 @@ export function createMemoryBaseSource(documents: readonly QueryDocument[]): Que
           // dataset whose order GROQ can observe through a tie.
           return pool.filter((d) => top.has(d._id))
         }
-        case 'types': {
-          const types = new Set(request.types)
-          return documents.filter((d) => types.has(d._type))
-        }
         default: {
           const exhaustive: never = request
-          throw new Error(`unhandled base request ${JSON.stringify(exhaustive)}`)
+          throw new Error(`unhandled extended request ${JSON.stringify(exhaustive)}`)
         }
       }
     },

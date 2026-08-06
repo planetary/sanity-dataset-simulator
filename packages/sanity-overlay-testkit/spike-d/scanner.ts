@@ -83,8 +83,12 @@ function checkValue(
   index: Map<string, FixtureDocument>,
   findings: Finding[],
 ): void {
-  const mismatch = (detail: string) =>
+  // Explicit `: void` (and a block body) so the `return mismatch(...)` early-exits
+  // below are genuinely void-returning. An expression-bodied arrow would return
+  // Array.prototype.push's number, which `checkValue`'s `: void` rejects (TS2322).
+  const mismatch = (detail: string): void => {
     findings.push({code: 'TYPE_MISMATCH', severity: 'hard', documentId, path, detail})
+  }
 
   switch (spec.type) {
     case 'string':
