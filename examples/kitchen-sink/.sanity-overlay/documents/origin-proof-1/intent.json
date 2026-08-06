@@ -1,0 +1,28 @@
+{
+  "base": {},
+  "checksum": "6d717d4ddf2a743c0d258c8b2f322b396e15d3369935a6ac4749c1e517426b0f",
+  "conflicts": [],
+  "formatVersion": 1,
+  "logicalId": "origin-proof-1",
+  "published": {
+    "mode": "replace",
+    "replacement": {
+      "_createdAt": "2026-08-05T13:47:23.810Z",
+      "_id": "origin-proof-1",
+      "_rev": "overlay.2.61018f4ad451",
+      "_type": "article",
+      "_updatedAt": "2026-08-05T13:47:23.810Z",
+      "title": "Born with no Sanity project 🌱"
+    }
+  },
+  "tombstones": {
+    "draft": false,
+    "published": false
+  },
+  "touchedPaths": [
+    [
+      "title"
+    ]
+  ],
+  "type": "article"
+}

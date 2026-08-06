@@ -62,7 +62,7 @@ interface Ctx {
   params: Record<string, unknown>
 }
 
-type BoundClass = 'constant' | 'result-proportional' | 'type-linear'
+type BoundClass = 'constant' | 'result-proportional' | 'referrer-proportional' | 'type-linear'
 
 interface BoundSpec {
   /** Hand-assigned. `type-linear` is an admission, not a pass. */
@@ -102,6 +102,29 @@ async function baseFetch(c: Ctx, groq: string): Promise<number> {
 /** Documents of the candidate types present in the resolved virtual dataset. */
 function typeScan(c: Ctx, types: string[]): number {
   return applyOverlay(c.dataset, c.overlay).filter((d) => types.includes(d._type)).length
+}
+
+/** True when `value` holds a reference to `id` anywhere inside it. */
+function hasRefTo(value: unknown, id: string): boolean {
+  if (Array.isArray(value)) return value.some((v) => hasRefTo(v, id))
+  if (value && typeof value === 'object') {
+    const o = value as Record<string, unknown>
+    if (o._ref === id) return true
+    return Object.values(o).some((v) => hasRefTo(v, id))
+  }
+  return false
+}
+
+/**
+ * §22.6 step 10's blast radius: BASE documents of `types` that reference any id
+ * the branch touched. Editing a reference TARGET can add or remove a referrer
+ * from the answer, so no exact reverse-reference plan may fetch fewer than
+ * these — and none needs to fetch more.
+ */
+function referrersOfTouched(c: Ctx, types: string[]): number {
+  const touched = [...c.overlay.documents.keys(), ...c.overlay.tombstones]
+  return c.dataset.filter((d) => types.includes(d._type) && touched.some((id) => hasRefTo(d, id)))
+    .length
 }
 
 /** Size of the ANSWER, measured through the oracle (never through the plan). */
@@ -208,31 +231,47 @@ const BOUNDS: Record<string, BoundSpec> = {
     why: 'as article-type-list, over two types',
   },
 
+  // --- aggregate pushdown, 2026-08-06 (was `type-linear`) -------------------
+  // The virtual dataset partitions exactly into {base documents the branch did
+  // not touch} and {resolved touched documents}; count() and math::sum() are
+  // additive over that partition. A base that aggregates the first half
+  // server-side therefore leaves ONLY the branch delta to materialize, and the
+  // answer stays exact because every document is aggregated in exactly one half.
   'article-count': {
-    klass: 'type-linear',
+    klass: 'constant',
     types: ['article'],
-    ceiling: async (c) => typeScan(c, ['article']) + branchDelta(c, ['article']),
+    ceiling: async (c) => branchDelta(c, ['article']),
     why:
-      'NOT BOUNDED. §22.6 step 14 evaluates the ORIGINAL query over the candidate set, ' +
-      'so an aggregate must materialize every document it aggregates. A 1-number answer ' +
-      'costs a full type scan. Fixable only by an aggregate-pushdown planner ' +
-      '(base count + overlay delta), which §22.6 does not describe. Tier B.',
+      'an additive aggregate needs no document the base can aggregate itself. What is ' +
+      'left is the branch delta, which does not grow with the dataset.',
   },
   'stats-aggregate': {
-    klass: 'type-linear',
+    klass: 'constant',
     types: ['article'],
-    ceiling: async (c) => typeScan(c, ['article']) + branchDelta(c, ['article']),
-    why: 'as article-count: math::sum over a type materializes the whole type. Tier B.',
+    ceiling: async (c) => branchDelta(c, ['article']),
+    why: 'as article-count: math::sum is additive over the same partition.',
   },
+
+  // --- §22.6 step 10 reverse-reference expansion, 2026-08-06 ---------------
   'articles-by-author-name': {
-    klass: 'type-linear',
+    klass: 'referrer-proportional',
     types: ['article'],
-    ceiling: async (c) => typeScan(c, ['article']) + branchDelta(c, ['article']),
+    // Three terms, each measured from the query text and the fixture data:
+    //   base matches         — referrers already matching in the BASE state;
+    //   referrers-of-touched — the ONLY base non-matches a branch edit to a
+    //                          target can turn into matches;
+    //   branch delta         — branch records of the referrer type (step 6).
+    // No fourth case exists, so this is the optimum for an exact planner, and
+    // it is derived without reading `def.candidatePlan`.
+    ceiling: async (c) =>
+      (await baseFetch(c, `*[_type == "article" && author->name == $name]`)) +
+      referrersOfTouched(c, ['article']) +
+      branchDelta(c, ['article']),
     why:
-      'NOT BOUNDED. The filter traverses a reference, so editing an author can add a ' +
-      'referrer that no base fetch selected. Exactness without a scan needs §22.6 step ' +
-      '10 (reverse-reference expansion over touched targets), which the spike planner ' +
-      'does not implement. Tier B until it does.',
+      'BOUNDED BUT NOT CONSTANT. §22.6 step 10 replaces the §22.7-sanctioned type scan ' +
+      'with the referrers of the touched targets. The bound is the branch blast radius, ' +
+      'which is a property of the DATA — touching every author still pulls in every ' +
+      'article — so the honest tier stays B.',
   },
 }
 
@@ -285,6 +324,7 @@ describe('§22.6: every registered query carries a hand-written bound classifica
     expect(of('constant')).toEqual([
       'article-by-id',
       'article-by-slug',
+      'article-count',
       'article-with-author',
       'articles-ordered-sliced',
       'object-spread',
@@ -293,6 +333,7 @@ describe('§22.6: every registered query carries a hand-written bound classifica
       'projection-rename',
       'pt-text',
       'recent-by-created-at',
+      'stats-aggregate',
     ])
     expect(of('result-proportional')).toEqual([
       'article-type-list',
@@ -300,20 +341,35 @@ describe('§22.6: every registered query carries a hand-written bound classifica
       'multi-type-list',
       'references-author',
     ])
-    // These three are the honest admissions. Growing this list is a Tier
-    // regression; shrinking it means a planner improvement — either way the
-    // evidence document must be updated with it.
-    expect(of('type-linear')).toEqual([
-      'article-count',
-      'articles-by-author-name',
-      'stats-aggregate',
-    ])
+    expect(of('referrer-proportional')).toEqual(['articles-by-author-name'])
+    // The 2026-08-04 admissions. Empty since 2026-08-06: aggregate pushdown
+    // moved two entries to `constant` and §22.6 step 10 moved the third to
+    // `referrer-proportional`. Growing this list again is a Tier regression and
+    // the evidence document must record it.
+    expect(of('type-linear')).toEqual([])
   })
 
   it('every type-linear query is registered Tier B, never Tier A', () => {
     for (const [id, spec] of Object.entries(BOUNDS)) {
       if (spec.klass !== 'type-linear') continue
       expect(byId(id).status, `${id} is type-linear (${spec.why})`).toBe('tier-b')
+    }
+  })
+
+  it('the referrer-proportional query is registered Tier B: bounded is not constant', () => {
+    // §22.6's claim is about candidate sets that do not grow with the dataset.
+    // A bound whose size is the branch's referrer fan-out satisfies "not a type
+    // scan" without satisfying that, so Tier A would overstate it.
+    for (const [id, spec] of Object.entries(BOUNDS)) {
+      if (spec.klass !== 'referrer-proportional') continue
+      expect(byId(id).status, `${id} is referrer-proportional (${spec.why})`).toBe('tier-b')
+    }
+  })
+
+  it('every constant-class aggregate is registered Tier A: §22.3 "aggregates over a proven finite candidate set"', () => {
+    for (const id of ['article-count', 'stats-aggregate']) {
+      expect(BOUNDS[id].klass).toBe('constant')
+      expect(byId(id).status, `${id} materializes only the branch delta`).toBe('tier-a')
     }
   })
 })
@@ -467,6 +523,19 @@ describe('§22.6: boundedness at 10x dataset scale', () => {
       at10,
       `${def.id}: 1x ${at1} -> 10x ${at10}. ${BOUNDS[def.id].why}`,
     ).toBeGreaterThanOrEqual(at1 * 5)
+  })
+
+  it('no query is type-linear any more, and the 10x sweep is what proves it', async () => {
+    // The `it.each` above is now empty, and an empty parameterised block proves
+    // nothing. This is the positive form: every supported query is either
+    // bounded by its own answer or does not grow at all.
+    expect(supported.filter((d) => BOUNDS[d.id].klass === 'type-linear')).toHaveLength(0)
+    for (const def of supported) {
+      if (BOUNDS[def.id].klass !== 'constant') continue
+      const at1 = await planSelected(ctxFor(def, base, 'empty'))
+      const at10 = await planSelected(ctxFor(def, scaled, 'empty'))
+      expect(at10, `${def.id}: 1x ${at1} -> 10x ${at10}`).toBe(at1)
+    }
   })
 })
 

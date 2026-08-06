@@ -35,6 +35,7 @@ import type {
   OverlayClientBaseSource,
   OverlayStateLoader,
 } from '../../sanity-overlay-client/src/index'
+import {resolveOverlayOptions} from '../../sanity-overlay-studio/src/options'
 import {OverlayQueryError} from '../../sanity-overlay-query/src/index'
 import {loadFixtureDataset, publishedPerspective, type FixtureDocument} from '../src/fixtures'
 
@@ -382,8 +383,116 @@ describe('registry discipline', () => {
  * ------------------------------------------------------------------ */
 
 describe('environment configuration', () => {
-  it('defaults to mode: off when the environment says nothing', () => {
-    expect(overlayClientConfigFromEnv({})).toMatchObject({mode: 'off'})
+  /* ──────────────────────────────────────────────────────────────────────────
+   * AN ABSENT KEY MUST NOT PICK A MODE.
+   *
+   * This used to be `env.SANITY_OVERLAY_MODE ?? 'off'`. `off` reads the BASE
+   * dataset — staging — so a misspelled, unset or unpropagated variable put a
+   * reader on staging while every other signal in the deployment said "branch".
+   * That is the exact failure this package exists to prevent, and it arrived
+   * silently, which is what made it expensive.
+   *
+   * `off` is still a perfectly good setting. It just has to be CHOSEN.
+   * ────────────────────────────────────────────────────────────────────────── */
+
+  it('REFUSES to guess when the environment names no mode', () => {
+    expect(() => overlayClientConfigFromEnv({})).toThrow(/mode/i)
+  })
+
+  it('names every accepted spelling when it refuses, and says "off" is a choice', () => {
+    let message = ''
+    try {
+      overlayClientConfigFromEnv({})
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message).toContain('SANITY_STUDIO_OVERLAY_MODE')
+    expect(message).toContain('SANITY_OVERLAY_MODE')
+    expect(message).toContain('OVERLAY_MODE')
+    expect(message).toMatch(/\boff\b/)
+  })
+
+  /** Spike A's scar: a blank value read as "configured" at one site and falsy at another. */
+  it.each(['', '   ', '\t'])('treats a blank value (%j) as unset, not as a mode', (raw) => {
+    expect(() => overlayClientConfigFromEnv({SANITY_OVERLAY_MODE: raw})).toThrow(/mode/i)
+  })
+
+  it('accepts an explicit off', () => {
+    expect(overlayClientConfigFromEnv({SANITY_OVERLAY_MODE: 'off'})).toMatchObject({mode: 'off'})
+  })
+
+  /* ──────────────────────────────────────────────────────────────────────────
+   * ONE VOCABULARY.
+   *
+   * Three spellings were in use across the packages — `SANITY_STUDIO_OVERLAY_MODE`
+   * (the only prefix Vite exposes to a browser bundle), `OVERLAY_MODE` (PRD §11.2's
+   * server spelling) and `SANITY_OVERLAY_MODE` (this package's own). A deployment
+   * that set one and was read by a package expecting another got the silent
+   * default above.
+   * ────────────────────────────────────────────────────────────────────────── */
+
+  it.each(['SANITY_STUDIO_OVERLAY_MODE', 'SANITY_OVERLAY_MODE', 'OVERLAY_MODE'])(
+    'accepts %s as a spelling of the mode',
+    (key) => {
+      expect(overlayClientConfigFromEnv({[key]: 'off'})).toMatchObject({mode: 'off'})
+    },
+  )
+
+  it.each(['SANITY_STUDIO_OVERLAY_ROOT', 'SANITY_OVERLAY_ROOT', 'OVERLAY_ROOT'])(
+    'accepts %s as a spelling of the overlay root',
+    (key) => {
+      expect(
+        overlayClientConfigFromEnv({SANITY_OVERLAY_MODE: 'fs', [key]: '/srv/checkout'}),
+      ).toMatchObject({mode: 'fs', overlayRoot: '/srv/checkout'})
+    },
+  )
+
+  it.each(['SANITY_STUDIO_OVERLAY_PERSPECTIVE', 'SANITY_OVERLAY_PERSPECTIVE', 'OVERLAY_PERSPECTIVE'])(
+    'accepts %s as a spelling of the perspective',
+    (key) => {
+      expect(overlayClientConfigFromEnv({SANITY_OVERLAY_MODE: 'off', [key]: 'published'})).toMatchObject(
+        {perspective: 'published'},
+      )
+    },
+  )
+
+  it('accepts the same value written under two spellings', () => {
+    expect(
+      overlayClientConfigFromEnv({SANITY_OVERLAY_MODE: 'off', OVERLAY_MODE: 'off'}),
+    ).toMatchObject({mode: 'off'})
+  })
+
+  /**
+   * When two spellings disagree the most REACHABLE one wins, matching the
+   * Studio resolver. The prefixes address different runtimes — the bare
+   * spelling is the server's and the CLI's, `SANITY_STUDIO_` is the only one a
+   * Vite bundle can see — so divergence is coherent rather than a
+   * misconfiguration, and a value that is actually readable must never be
+   * shadowed by one that is not.
+   */
+  it('prefers the most reachable spelling when two disagree', () => {
+    expect(
+      overlayClientConfigFromEnv({
+        SANITY_STUDIO_OVERLAY_MODE: 'off',
+        SANITY_OVERLAY_MODE: 'fs',
+        OVERLAY_MODE: 'fs',
+        SANITY_OVERLAY_ROOT: '/srv/checkout',
+      }),
+    ).toMatchObject({mode: 'off'})
+
+    expect(
+      overlayClientConfigFromEnv({
+        SANITY_OVERLAY_MODE: 'off',
+        OVERLAY_MODE: 'fs',
+      }),
+    ).toMatchObject({mode: 'off'})
+  })
+
+  /** A present-but-empty variable falls through to the next spelling. */
+  it('treats a blank spelling as unset and falls through to the next', () => {
+    expect(
+      overlayClientConfigFromEnv({SANITY_STUDIO_OVERLAY_MODE: '  ', OVERLAY_MODE: 'off'}),
+    ).toMatchObject({mode: 'off'})
   })
 
   it('reads mode and overlay root from the environment', () => {
@@ -402,7 +511,20 @@ describe('environment configuration', () => {
 
   it('requires an overlay root when mode is fs', () => {
     expect(() => overlayClientConfigFromEnv({SANITY_OVERLAY_MODE: 'fs'})).toThrow(
-      /SANITY_OVERLAY_ROOT/,
+      /OVERLAY_ROOT/,
     )
   })
+
+  /**
+   * THE UNIFICATION, PROVED ACROSS THE PACKAGE BOUNDARY. One env map, two
+   * independent readers, the same answer. This is the assertion that "three
+   * vocabularies" made impossible.
+   */
+  it.each(['SANITY_STUDIO_OVERLAY_MODE', 'SANITY_OVERLAY_MODE', 'OVERLAY_MODE'])(
+    'agrees with the Studio resolver about %s',
+    (key) => {
+      const env = {[key]: 'off'}
+      expect(overlayClientConfigFromEnv(env).mode).toBe(resolveOverlayOptions({}, env).mode)
+    },
+  )
 })

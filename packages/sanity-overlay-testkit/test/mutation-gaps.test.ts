@@ -62,12 +62,18 @@ async function expectParity(
 // ===========================================================================
 
 // Tier reclassification 2026-08-04 (evidence review F6): article-count,
-// stats-aggregate and articles-by-author-name moved tier-a -> tier-b. Each
-// materializes EVERY document of its type to answer a small question, which
-// §22.6 forbids at scale ("never fetch every document of a large type merely
-// because the query is type-constrained"). The reasoning is recorded per entry
-// in registry.ts and swept by test/spike-c-boundedness.test.ts, which fails if
-// a type-linear query is registered tier-a.
+// stats-aggregate and articles-by-author-name moved tier-a -> tier-b, each
+// materializing EVERY document of its type to answer a small question.
+//
+// Tier reclassification 2026-08-06 (latency-2026-08-04.md §8): two of those
+// three moved BACK to tier-a because the planner stopped doing that.
+// article-count and stats-aggregate now push the aggregate down to the base and
+// materialize only the branch delta, which is §22.3 Tier A's "aggregates over a
+// proven finite candidate set". articles-by-author-name stays tier-b: §22.6
+// step 10 replaced its type scan with the referrers of the touched targets,
+// which is bounded by the branch's blast radius rather than constant. The
+// reasoning is recorded per entry in registry.ts and swept by
+// test/spike-c-boundedness.test.ts.
 const EXPECTED_TIER_A = [
   'article-by-id',
   'page-by-slug',
@@ -82,13 +88,10 @@ const EXPECTED_TIER_A = [
   'page-featured-refs',
   'references-author',
   'pt-text',
-]
-const EXPECTED_TIER_B = [
   'article-count',
   'stats-aggregate',
-  'articles-by-author-name',
-  'recent-by-created-at',
 ]
+const EXPECTED_TIER_B = ['articles-by-author-name', 'recent-by-created-at']
 const EXPECTED_UNSUPPORTED = ['unconstrained-star']
 const EXPECTED_OVERLAY_FIXTURES = [
   'empty',
@@ -174,6 +177,13 @@ function planUpperBound(
       return plan.idsFromParams.map((p) => String(params[p])).length
     case 'ids-literal':
       return plan.ids.length
+    // `aggregate` and `reverse-reference` both fetch a SUBSET of their candidate
+    // types — the branch delta, and the referrers of the touched targets. This
+    // block's stated scope is the type BOUNDARY only, so the ceiling here is the
+    // type; the tight, semantics-derived ceilings for both live in
+    // test/spike-c-boundedness.test.ts and test/spike-c-latency.test.ts.
+    case 'aggregate':
+    case 'reverse-reference':
     case 'base-filter':
     case 'slug':
     case 'types': {

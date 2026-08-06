@@ -97,6 +97,27 @@ export function analyzeDerefPaths(tree: unknown): DerefPaths {
 }
 
 /**
+ * The deepest CHAIN of `->` applied to the result of another `->`: `a->b` is 1,
+ * `a->b->c` is 2, and two independent single hops in one query are still 1.
+ *
+ * §22.6 step 10 bounds a filter-through-reference by the referrers of the
+ * touched documents, and that is complete for ONE hop. With `a->b->name`, a
+ * referrer whose GRANDCHILD was edited references neither the edited document
+ * nor anything the base-state disjunct selects, so it would be missed. The
+ * evaluator refuses those rather than returning a plausible subset (§5.5), and
+ * this is the measurement it refuses on.
+ */
+export function derefChainDepth(node: unknown, inside = 0): number {
+  if (Array.isArray(node)) return Math.max(0, ...node.map((child) => derefChainDepth(child, inside)))
+  if (!isNode(node)) return 0
+  const here = node.type === 'Deref' ? inside + 1 : inside
+  const children = Object.entries(node)
+    .filter(([key]) => key !== 'type' && key !== 'name')
+    .map(([, value]) => derefChainDepth(value, here))
+  return Math.max(here, 0, ...children)
+}
+
+/**
  * Collect the reference targets of one document that the query can actually
  * dereference. Returns nothing when the query contains no `->`.
  */

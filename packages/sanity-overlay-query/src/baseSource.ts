@@ -86,6 +86,44 @@ export type ExtendedCandidateRequest =
       readonly limit: number
       readonly excludeIds: readonly string[]
     }
+  /**
+   * §22.6 step 10's base half, in ONE request: documents of `types` whose
+   * reference at `referencePath` resolves to a document whose `targetPath`
+   * equals `value`, UNION documents of `types` that reference any of
+   * `touchedIds`. A hosted adapter issues
+   * `*[_type in $types && (<referencePath>-><targetPath> == $value ||
+   *   references($touched))]`.
+   *
+   * The two disjuncts travel together on purpose. Asking for the matching
+   * TARGETS and then for their referrers is two round trips for one candidate
+   * set, and would take the query past §22.6's step 5 + step 14 evaluation
+   * budget.
+   */
+  | {
+      readonly kind: 'reverse-reference'
+      readonly types: readonly string[]
+      readonly referencePath: readonly string[]
+      readonly targetPath: readonly string[]
+      readonly value: unknown
+      readonly touchedIds: readonly string[]
+    }
+
+/**
+ * The base half of an aggregate pushdown. Answered with ONE NUMBER, which is
+ * why it is not a {@link ExtendedCandidateRequest}: the entire point is that no
+ * document crosses the wire.
+ *
+ * `excludeIds` is every ID the branch touched. Excluding them is what makes the
+ * base half and the branch half a PARTITION of the virtual dataset rather than
+ * two overlapping views of it, so that adding the two results is exact.
+ */
+export interface AggregateRequest {
+  readonly aggregate: 'count' | 'sum'
+  readonly types: readonly string[]
+  /** Path to the summed value; numeric segments index arrays. Unused by `count`. */
+  readonly path?: readonly string[]
+  readonly excludeIds: readonly string[]
+}
 
 /** Anything a planner can ask for: core plus extended. */
 export type PlannedCandidateRequest = BaseCandidateRequest | ExtendedCandidateRequest
@@ -104,6 +142,19 @@ export interface QueryBaseSource {
    * evaluator refuses the query rather than widening the fetch.
    */
   fetchExtendedCandidates?(request: ExtendedCandidateRequest): Promise<readonly QueryDocument[]>
+  /**
+   * Aggregate over the base, returning a scalar.
+   *
+   * OPTIONAL, and the evaluator refuses an aggregate query when it is absent
+   * rather than fetching the type and aggregating locally — that returns the
+   * right answer by transferring everything, which is exactly the degradation
+   * §22.2 forbids and which no parity test can see.
+   *
+   * `null` is a legitimate answer: GROQ's `math::sum` is null over a sequence
+   * holding a non-numeric value, and an adapter must reproduce that rather than
+   * substituting 0.
+   */
+  fetchAggregate?(request: AggregateRequest): Promise<number | null>
 }
 
 /** Read `path` out of a document, following plain objects only. */
@@ -116,6 +167,28 @@ function readPath(doc: QueryDocument, path: readonly string[]): unknown {
   return cursor
 }
 
+/**
+ * Read `path` allowing NUMERIC segments to index arrays (`sections.1.count`).
+ *
+ * Separate from {@link readPath} rather than folded into it: `field-equality`
+ * and `field-contains` register object paths only, and widening their reader
+ * would change which documents those plans select.
+ */
+function readIndexedPath(doc: QueryDocument, path: readonly string[]): unknown {
+  let cursor: unknown = doc
+  for (const segment of path) {
+    if (cursor === null || typeof cursor !== 'object') return undefined
+    if (Array.isArray(cursor)) {
+      const index = Number(segment)
+      if (!Number.isInteger(index)) return undefined
+      cursor = cursor[index]
+    } else {
+      cursor = (cursor as Record<string, unknown>)[segment]
+    }
+  }
+  return cursor
+}
+
 /** True when `value` contains a reference to `id` anywhere inside it. */
 function referencesId(value: unknown, id: string): boolean {
   if (Array.isArray(value)) return value.some((item) => referencesId(item, id))
@@ -123,6 +196,22 @@ function referencesId(value: unknown, id: string): boolean {
   const object = value as Record<string, unknown>
   if (object._ref === id) return true
   return Object.values(object).some((child) => referencesId(child, id))
+}
+
+/**
+ * GROQ's `math::sum`, as pinned `groq-js` implements it and as this adapter must
+ * reproduce for the pushdown to be exact: `null` and absent members are SKIPPED,
+ * an empty sequence sums to 0, and any non-numeric member makes the whole sum
+ * `null`. Measured against `groq-js` 2.0.0, not assumed.
+ */
+function groqSum(values: readonly unknown[]): number | null {
+  let total = 0
+  for (const value of values) {
+    if (value === null || value === undefined) continue
+    if (typeof value !== 'number') return null
+    total += value
+  }
+  return total
 }
 
 /**
@@ -227,11 +316,38 @@ export function createMemoryBaseSource(documents: readonly QueryDocument[]): Que
           // dataset whose order GROQ can observe through a tie.
           return pool.filter((d) => top.has(d._id))
         }
+        case 'reverse-reference': {
+          const types = new Set(request.types)
+          const byId = new Map(documents.map((d) => [d._id, d]))
+          const touched = request.touchedIds
+          return documents.filter((doc) => {
+            if (!types.has(doc._type)) return false
+            // Disjunct 1: matches in the BASE state.
+            const reference = readPath(doc, request.referencePath) as
+              | {_ref?: unknown}
+              | undefined
+            const ref = reference && typeof reference._ref === 'string' ? reference._ref : undefined
+            const target = ref === undefined ? undefined : byId.get(ref)
+            if (target && readPath(target, request.targetPath) === request.value) return true
+            // Disjunct 2: could BECOME a match because a target was touched.
+            return touched.some((id) => referencesId(doc, id))
+          })
+        }
         default: {
           const exhaustive: never = request
           throw new Error(`unhandled extended request ${JSON.stringify(exhaustive)}`)
         }
       }
+    },
+
+    async fetchAggregate(request) {
+      const types = new Set(request.types)
+      const excluded = new Set(request.excludeIds)
+      const pool = documents.filter((d) => types.has(d._type) && !excluded.has(d._id))
+      if (request.aggregate === 'count') return pool.length
+      const path = request.path
+      if (!path) throw new Error('a sum aggregate request must carry a path')
+      return groqSum(pool.map((d) => readIndexedPath(d, path)))
     },
   }
 }

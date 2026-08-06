@@ -22,6 +22,7 @@ import {
   OVERLAY_BLOCKED_ACTIONS,
   OVERLAY_ROUTED_ACTIONS,
   overlayActionDecision,
+  overlayDocumentActionsResolver,
   resolveOverlayDocumentActions,
 } from '../../sanity-overlay-studio/src/actions'
 
@@ -145,5 +146,72 @@ describe('resolveOverlayDocumentActions', () => {
 
   it('is empty in, empty out', () => {
     expect(resolveOverlayDocumentActions([])).toEqual([])
+  })
+})
+
+/* ══════════════════════════════ installing the Phase 5 actions (§28, §29) */
+
+/**
+ * THE DELIVERY SEAM.
+ *
+ * `resolveOverlayDocumentActions` only ever REMOVED actions. Rebase, resolve
+ * conflict and checkpoint are actions the overlay ADDS, and until the resolver
+ * that actually runs in `config.ts` appends them they exist only as exported
+ * functions nobody calls — the same "shipped but unreachable" failure the
+ * barrel test covers, one layer further out.
+ *
+ * A FACTORY rather than a second bare function, because these actions need the
+ * runtime (transport, the overlay's documents) that the availability filter
+ * deliberately knows nothing about.
+ */
+describe('overlayDocumentActionsResolver — the overlay’s own actions reach the menu', () => {
+  const OVERLAY_OWN: FakeAction[] = [
+    {action: 'overlayRebase', displayName: 'OverlayRebaseAction'},
+    {action: 'overlayResolveConflict', displayName: 'OverlayConflictResolutionAction'},
+    {action: 'overlayCheckpoint', displayName: 'OverlayCheckpointAction'},
+  ]
+
+  it('appends the overlay’s actions to the built-ins', () => {
+    const actions = overlayDocumentActionsResolver(OVERLAY_OWN)(BUILT_INS).map((e) => e.action)
+    expect(actions).toEqual(
+      expect.arrayContaining(['overlayRebase', 'overlayResolveConflict', 'overlayCheckpoint']),
+    )
+  })
+
+  it('still removes the blocked actions while appending its own', () => {
+    const actions = overlayDocumentActionsResolver(OVERLAY_OWN)(BUILT_INS).map((e) => e.action)
+    for (const blocked of OVERLAY_BLOCKED_ACTIONS) expect(actions).not.toContain(blocked)
+    /* And the routed built-ins survive — appending must not replace the menu. */
+    for (const routed of OVERLAY_ROUTED_ACTIONS) expect(actions).toContain(routed)
+  })
+
+  it('puts the overlay’s actions last, after the built-ins the editor expects first', () => {
+    const actions = overlayDocumentActionsResolver(OVERLAY_OWN)(BUILT_INS).map((e) => e.action)
+    expect(actions.slice(-3)).toEqual([
+      'overlayRebase',
+      'overlayResolveConflict',
+      'overlayCheckpoint',
+    ])
+  })
+
+  it('never appends the same action twice when the resolver runs again', () => {
+    /* sanity 6.8.0 re-resolves `document.actions` per document. A resolver that
+     * appended unconditionally would grow the menu without bound. */
+    const resolve = overlayDocumentActionsResolver(OVERLAY_OWN)
+    const once = resolve(BUILT_INS)
+    const twice = resolve(once)
+    expect(twice.filter((entry) => entry.action === 'overlayRebase')).toHaveLength(1)
+    expect(twice).toHaveLength(once.length)
+  })
+
+  it('does not mutate the array Studio handed it', () => {
+    const prev = [...BUILT_INS]
+    overlayDocumentActionsResolver(OVERLAY_OWN)(prev)
+    expect(prev).toHaveLength(BUILT_INS.length)
+  })
+
+  it('appends nothing when the overlay contributes nothing, and still filters', () => {
+    const actions = overlayDocumentActionsResolver([])(BUILT_INS).map((e) => e.action)
+    expect(actions).toEqual(resolveOverlayDocumentActions(BUILT_INS).map((e) => e.action))
   })
 })

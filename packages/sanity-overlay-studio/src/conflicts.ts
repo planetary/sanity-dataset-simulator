@@ -114,6 +114,22 @@ export function summarizeConflictDocuments(conflicts: readonly OverlayConflict[]
   return summarizeConflicts(conflicts.filter((conflict) => conflict.resolution === undefined))
 }
 
+/**
+ * What the overlay said about one document, for the §28.2 columns.
+ *
+ * Every field is optional and every absence is reported rather than filled in —
+ * see {@link OverlayConflictReport.documents} and `conflictPanel.ts`.
+ */
+export interface ConflictDocumentFacts {
+  logicalId: string
+  schemaType?: string
+  title?: string
+  lastLocalRevision?: string
+  baseRevisionAtFirstTouch?: string
+  currentBaseRevision?: string
+  touchedSinceCheckpoint?: boolean
+}
+
 export interface OverlayConflictReport {
   /**
    * `false` means the overlay API did not report conflicts at all — NOT that
@@ -123,6 +139,8 @@ export interface OverlayConflictReport {
   available: boolean
   summary: {total: number; soft: number; hard: number}
   byDocument: Record<string, OverlayConflict[]>
+  /** Per-document metadata for the §28.2 list, keyed by logical ID. */
+  documents: Record<string, ConflictDocumentFacts>
   note?: string
 }
 
@@ -148,17 +166,61 @@ const NO_SUMMARY = {total: 0, soft: 0, hard: 0} as const
  * Tolerant by design: the overlay server is a moving target and a malformed
  * payload must degrade the panel, never crash the Studio around it.
  */
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * A human-readable title for the §28.2 "Document title" column.
+ *
+ * Read off the materialized body the overlay already sent, never fetched: the
+ * conflict list must render from one `/state` answer. When no candidate field is
+ * present the column stays `undefined` and the list falls back to the ID —
+ * inventing a title is the kind of plausible filler §5.5 rules out.
+ */
+function documentTitle(entry: Rec): string | undefined {
+  for (const body of [entry.draft, entry.published]) {
+    if (!isRec(body)) continue
+    for (const key of ['title', 'name', 'label']) {
+      const value = optionalString(body[key])
+      if (value !== undefined) return value
+    }
+  }
+  return undefined
+}
+
+function documentFacts(logicalId: string, entry: Rec): ConflictDocumentFacts {
+  const title = documentTitle(entry)
+  const schemaType = optionalString(entry.schemaType)
+  const lastLocalRevision = optionalString(entry.runtimeRevision)
+  const baseRevisionAtFirstTouch = optionalString(entry.baseRevisionAtFirstTouch)
+  const currentBaseRevision = optionalString(entry.currentBaseRevision)
+  return {
+    logicalId,
+    ...(schemaType === undefined ? {} : {schemaType}),
+    ...(title === undefined ? {} : {title}),
+    ...(lastLocalRevision === undefined ? {} : {lastLocalRevision}),
+    ...(baseRevisionAtFirstTouch === undefined ? {} : {baseRevisionAtFirstTouch}),
+    ...(currentBaseRevision === undefined ? {} : {currentBaseRevision}),
+    ...(typeof entry.touchedSinceCheckpoint === 'boolean'
+      ? {touchedSinceCheckpoint: entry.touchedSinceCheckpoint}
+      : {}),
+  }
+}
+
 export function readConflictReport(state: unknown): OverlayConflictReport {
   if (!isRec(state)) {
     return {
       available: false,
       summary: {...NO_SUMMARY},
       byDocument: {},
+      documents: {},
       note: 'the overlay API returned no state, so conflicts cannot be shown',
     }
   }
 
   const byDocument: Record<string, OverlayConflict[]> = {}
+  const facts: Record<string, ConflictDocumentFacts> = {}
   let sawConflictField = false
 
   const documents = Array.isArray(state.documents) ? state.documents : []
@@ -166,6 +228,7 @@ export function readConflictReport(state: unknown): OverlayConflictReport {
     if (!isRec(entry)) continue
     const logicalId = typeof entry.logicalId === 'string' ? entry.logicalId : undefined
     if (logicalId === undefined) continue
+    facts[logicalId] = documentFacts(logicalId, entry)
     if (!Array.isArray(entry.conflicts)) continue
     sawConflictField = true
     const conflicts = entry.conflicts.filter(isConflict)
@@ -177,7 +240,7 @@ export function readConflictReport(state: unknown): OverlayConflictReport {
     const total = typeof declared.total === 'number' ? declared.total : 0
     const soft = typeof declared.soft === 'number' ? declared.soft : 0
     const hard = typeof declared.hard === 'number' ? declared.hard : 0
-    return {available: true, summary: {total, soft, hard}, byDocument}
+    return {available: true, summary: {total, soft, hard}, byDocument, documents: facts}
   }
 
   if (!sawConflictField) {
@@ -185,6 +248,7 @@ export function readConflictReport(state: unknown): OverlayConflictReport {
       available: false,
       summary: {...NO_SUMMARY},
       byDocument: {},
+      documents: facts,
       note:
         'this overlay API does not report conflicts, so none can be shown here. That is not ' +
         'the same as there being none — check the overlay manifest directly before promoting.',
@@ -192,5 +256,10 @@ export function readConflictReport(state: unknown): OverlayConflictReport {
   }
 
   const all = Object.values(byDocument).flat()
-  return {available: true, summary: summarizeConflictDocuments(all), byDocument}
+  return {
+    available: true,
+    summary: summarizeConflictDocuments(all),
+    byDocument,
+    documents: facts,
+  }
 }

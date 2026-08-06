@@ -160,8 +160,20 @@ describe('defineOverlayConfig — multiple workspaces', () => {
 describe('defineOverlayConfig — the §11.3 startup guards still fire', () => {
   it('throws when a write token is present in the Studio environment', () => {
     expect(() => defineOverlayConfig(BASE, {env: {SANITY_STUDIO_WRITE_TOKEN: 'sk'}})).toThrow(
-      /write token/i,
+      /credential/i,
     )
+  })
+
+  it('and for the whole naming class, not just the WRITE_TOKEN spelling', () => {
+    /* The class is enumerated in `studio-options.test.ts`; this pins that the
+     * config wrapper — the surface a consumer actually calls — inherits it.
+     * `SANITY_API_TOKEN` is the name Sanity's own docs use most and was the one
+     * the previous `/WRITE_TOKEN$/` check could not see. */
+    for (const key of ['SANITY_API_TOKEN', 'SANITY_TOKEN', 'SANITY_DEPLOY_TOKEN']) {
+      expect(() => defineOverlayConfig(BASE, {env: {[key]: 'sk'}}), key).toThrow(
+        new RegExp(key),
+      )
+    }
   })
 
   it('throws on an unknown mode rather than silently defaulting', () => {

@@ -42,6 +42,16 @@ importers:
 
   packages/sanity-overlay-core: {}
 
+  packages/sanity-overlay-next:
+    dependencies:
+      groq-js:
+        specifier: 2.0.0
+        version: 2.0.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.20.1
+        version: 22.20.1
+
   packages/sanity-overlay-query:
     dependencies:
       groq-js:

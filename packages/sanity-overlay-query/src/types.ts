@@ -115,6 +115,79 @@ export type CandidatePlan =
       /** Exclusive end of the query's own `[0...K]` slice. */
       sliceEnd: number
     }
+  /**
+   * AGGREGATE PUSHDOWN — §22.3 Tier A "counts and aggregates over a proven
+   * finite candidate set".
+   *
+   * §22.6 step 14 hands the ORIGINAL query to `groq-js` over the candidate set,
+   * so an aggregate registered under a `types` plan must materialise everything
+   * it aggregates: the Spike C evidence measured 4.8 MiB transferred to return
+   * one scalar (`latency-2026-08-04.md` §4.1).
+   *
+   * The fix is a PARTITION, not an estimate. The virtual dataset is exactly
+   *
+   *     {base documents the branch did not touch} ∪ {resolved branch records}
+   *
+   * and both admitted aggregates are ADDITIVE over a partition. So the base
+   * aggregates the first half server-side and returns one number, the candidate
+   * set is the branch delta, and the two halves are added. Every document is
+   * aggregated in exactly one half, so the answer is exact.
+   *
+   * `aggregate` is deliberately a closed union of the additive ones. `avg`,
+   * `min` and `max` are NOT registrable: recombining them needs a second scalar
+   * this port does not carry, and returning a plausible number anyway is the
+   * silent approximation §5.5 forbids.
+   *
+   * Exact only while the aggregate's filter reads LOCAL fields — the base half
+   * decides membership from the base state, so a filter that traverses a
+   * reference can move documents between the halves when a TARGET is edited.
+   * `evaluate.ts` refuses such a query rather than pushing it down.
+   */
+  | {
+      type: 'aggregate'
+      aggregate: 'count' | 'sum'
+      types: readonly string[]
+      /**
+       * Path to the summed value, relative to the document. Numeric segments
+       * index arrays (`sections.1.count`). Absent for `count`.
+       */
+      path?: readonly string[]
+    }
+  /**
+   * §22.6 step 10 REVERSE-REFERENCE EXPANSION, for a filter that traverses a
+   * reference (`author->name == $name`).
+   *
+   * Membership depends on a field of the TARGET, so no predicate over the
+   * referrers alone is complete once a target is edited — which is why §22.7
+   * specifies this shape's base candidates as "all articles". The scan is
+   * avoidable because the incompleteness has exactly one source. Take any
+   * virtual document A in the answer:
+   *
+   *   - A is touched                  -> a branch record of `types`, admitted
+   *                                      by §22.6 step 6.
+   *   - A untouched, target untouched -> both resolve to their base rows, so
+   *                                      the base-state predicate selects it.
+   *   - A untouched, target touched   -> A references a touched ID, so the
+   *                                      reverse-reference half selects it.
+   *
+   * There is no fourth case, so nothing in the answer is missed. The cost is
+   * the referrer count of the touched documents: bounded by the branch's blast
+   * radius rather than by the type, and NOT constant — which is why a query on
+   * this plan is Tier B rather than Tier A.
+   *
+   * Exact for a SINGLE dereference hop only. With `a->b->name`, editing the
+   * grandchild changes a referrer's membership without that referrer
+   * referencing anything the base half can see; `evaluate.ts` refuses those.
+   */
+  | {
+      type: 'reverse-reference'
+      types: readonly string[]
+      /** The referrer attribute holding the reference (`author`). */
+      referencePath: readonly string[]
+      /** The field of the TARGET the filter compares (`name`). */
+      targetPath: readonly string[]
+      valueFromParam: string
+    }
   /** Whole type(s). Exact, and answer-proportional only when the answer IS the type. */
   | {type: 'types'; types: readonly string[]}
   /** No finite exact plan exists. Evaluating it MUST raise `UNSUPPORTED_GROQ`. */

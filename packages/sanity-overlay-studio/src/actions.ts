@@ -106,3 +106,31 @@ export function resolveOverlayDocumentActions<T extends {action?: string}>(
 ): T[] {
   return prev.filter((entry) => overlayActionDecision(entry.action).verdict !== 'remove')
 }
+
+/**
+ * The resolver `config.ts` installs once the overlay contributes actions of its
+ * own — rebase (§28.4), resolve conflict (§28.3) and checkpoint (§29).
+ *
+ * A FACTORY, because those three need the runtime — the transport to send on,
+ * the overlay's documents to compute loss from — which the availability filter
+ * above deliberately knows nothing about. The caller builds the action objects
+ * from {@link createOverlayActionController} and hands them in already bound.
+ *
+ * APPENDED, NEVER PREPENDED. The first entry of `document.actions` is the one
+ * sanity 6.8.0 renders as the primary button; putting a destructive rebase
+ * there would make it the default click in the editing surface.
+ *
+ * IDEMPOTENT. Studio re-resolves `document.actions` per document, and a resolver
+ * that appended unconditionally would grow the menu on every open. Matching is
+ * on `.action` — the same stable key the filter uses — so re-running over an
+ * already-resolved list is a no-op rather than a duplicate.
+ */
+export function overlayDocumentActionsResolver<T extends {action?: string}>(
+  appended: readonly T[],
+): (prev: readonly T[]) => T[] {
+  return (prev) => {
+    const kept = resolveOverlayDocumentActions(prev)
+    const present = new Set(kept.map((entry) => entry.action))
+    return [...kept, ...appended.filter((entry) => !present.has(entry.action))]
+  }
+}

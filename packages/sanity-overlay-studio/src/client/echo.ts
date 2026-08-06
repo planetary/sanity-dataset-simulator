@@ -180,6 +180,96 @@ function authStatusIn(candidate: unknown): number | undefined {
   return undefined
 }
 
+/* --------------------------------------------------------- own refusals */
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * A REFUSAL THIS SYSTEM ISSUED IS NOT A FAILURE OF THE USER'S SANITY SESSION.
+ *
+ * Observed live, 2026-08-06: Studio said *"Your Sanity session is no longer
+ * authenticated. Editing is read-only"* while the session was fine. The only
+ * 4xx responses in that session were the Track B write guard refusing
+ * `POST /descriptors/claim` (`uploadSchema`) and `POST /intake/batch`
+ * (telemetry) — both correctly, both 403, and both read here as Sanity revoking
+ * the editor's credential.
+ *
+ * THE DISCRIMINATOR IS ORIGIN, NOT STATUS. Dropping 403 wholesale would be the
+ * wrong fix: a genuine 403 from Sanity means *your token lacks this grant*, and
+ * the editor has to be told. So this system stamps its own refusals instead, in
+ * the two forms they can arrive in:
+ *
+ *   1. an `Error` this code constructed          → {@link markOverlayRefusal}
+ *   2. a JSON body one of our own guards sent    → an `OVERLAY_*` error `code`
+ *      (`proxy.mjs` `OVERLAY_WRITE_BLOCKED`, `origin.mjs` `OVERLAY_ORIGIN_*`)
+ *      or a code in {@link OVERLAY_REFUSAL_CODES}
+ *
+ * Sanity's own error bodies never carry either, so the exemption cannot widen
+ * to a real credential failure — the only direction in which a mistake here
+ * loses an editor's work.
+ *
+ * STRUCTURED FIELDS ONLY, NEVER PROSE. `authStatusOf` already refuses to match
+ * the digits "401" inside an unrelated message; the same standard applies to
+ * the marker, so an error whose *description* happens to quote
+ * `OVERLAY_WRITE_BLOCKED` is still a real auth failure.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+export const OVERLAY_REFUSAL_FLAG = 'sanityOverlayRefusal'
+
+/** Every refusal code this system emits that is not `OVERLAY_*`-prefixed. */
+export const OVERLAY_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  /** `sanity-overlay-client/src/stagingHost.ts` — the host-level write guard. */
+  'STAGING_WRITE_REFUSED',
+  /** `client/reads.ts` — `OverlayReadRefusedError`, strict mode. */
+  'UNSUPPORTED_GROQ',
+])
+
+const OVERLAY_REFUSAL_CODE_PREFIX = 'OVERLAY_'
+
+function isRefusalCode(value: unknown): boolean {
+  return (
+    typeof value === 'string' &&
+    (value.startsWith(OVERLAY_REFUSAL_CODE_PREFIX) || OVERLAY_REFUSAL_CODES.has(value))
+  )
+}
+
+/**
+ * Stamp an error as this system's own refusal.
+ *
+ * Non-enumerable, so it cannot leak into a `JSON.stringify` of an error a host
+ * logs, and cannot collide with a caller's own serialisation.
+ */
+export function markOverlayRefusal<E extends object>(error: E): E {
+  Object.defineProperty(error, OVERLAY_REFUSAL_FLAG, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  })
+  return error
+}
+
+/**
+ * Did this failure originate in one of this system's own guards?
+ *
+ * The carriers are every place `@sanity/client@7.26.0` puts a parsed error body
+ * (`extractErrorProps`: `details` is the body's `error` object, `response.body`
+ * is the whole body) plus the error itself, for a refusal we threw directly.
+ */
+export function isOverlayRefusal(error: unknown): boolean {
+  if (!isRec(error)) return false
+  if ((error as Rec)[OVERLAY_REFUSAL_FLAG] === true) return true
+
+  const carriers: unknown[] = [error, error.details, error.body]
+  if (isRec(error.response)) carriers.push(error.response.body)
+  for (const carrier of [...carriers]) {
+    if (isRec(carrier) && isRec(carrier.error)) carriers.push(carrier.error)
+  }
+  for (const carrier of carriers) {
+    if (!isRec(carrier)) continue
+    if (isRefusalCode(carrier.code)) return true
+  }
+  return false
+}
+
 /**
  * The 401/403 inside whatever the transport threw, or `undefined`.
  *
@@ -189,11 +279,13 @@ function authStatusIn(candidate: unknown): number | undefined {
  * `response.body`), and a bare `fetch` Response's `status`.
  *
  * Deliberately narrow. A false positive stops every subsequent write in the
- * session, so a 500, a `TypeError: fetch failed`, and the digits "401" inside a
- * message must all read as *not* an auth failure.
+ * session, so a 500, a `TypeError: fetch failed`, the digits "401" inside a
+ * message, and — see {@link isOverlayRefusal} — a refusal this system issued
+ * must all read as *not* an auth failure.
  */
 export function authStatusOf(error: unknown): number | undefined {
   if (!isRec(error)) return undefined
+  if (isOverlayRefusal(error)) return undefined
   const candidates: unknown[] = [error, error.response, error.details]
   if (isRec(error.response)) candidates.push(error.response.body)
   for (const candidate of candidates) {

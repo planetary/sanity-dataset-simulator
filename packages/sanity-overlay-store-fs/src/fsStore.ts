@@ -135,6 +135,7 @@ import {
 } from './intent'
 import {
   BROKEN_SUFFIX,
+  assertSafeComponent,
   assertWithinRoot,
   GITATTRIBUTES_CONTENT,
   GITATTRIBUTES_FILE,
@@ -234,6 +235,129 @@ export interface FsCheckpointImportResult {
   /** Paths whose stale checksum metadata was recomputed (PRD §14.3, §29.2). */
   repaired: string[]
   issues: OverlayCheckpointIssue[]
+}
+
+/* ------------------------------------------------------------------ *
+ * Local runtime history (PRD §13.10, §14.1 `.runtime/transactions/`,
+ * §37 Phase 2 "Local runtime history")
+ * ------------------------------------------------------------------ */
+
+export interface ReadHistoryOptions {
+  /** Only transactions that touched this logical document. `drafts.` normalizes away. */
+  documentId?: string
+  /** Only transactions that committed *after* this overlay revision. */
+  sinceRevision?: number
+  /** `'newest'` (default) or `'oldest'` first. */
+  order?: 'newest' | 'oldest'
+  /** Cap the result, applied after filtering and ordering. */
+  limit?: number
+}
+
+/** One immutable §13.3 revision a transaction produced. */
+export interface OverlayHistoryArtifact {
+  logicalId: string
+  /** The content address recorded in the transaction's `resultChecksums`. */
+  checksum: string
+  /**
+   * Adapter-relative path of the revision file, or `''` when the stored checksum
+   * is not a valid content address (a corrupt log entry, which
+   * {@link FsOverlayStore.verifyChecksums} is the place to diagnose).
+   */
+  ref: string
+  /** The immutable revision file is still on disk and can be read back. */
+  present: boolean
+  /** The manifest's current head still names this exact revision. */
+  current: boolean
+}
+
+/**
+ * One step of the branch's local history.
+ *
+ * This is the *overlay's own* log, not Sanity's. It answers "what did this branch
+ * do, in order, and can each step still be read back" — it is not a Content Lake
+ * mendoza stream, it carries no per-keystroke document timeline, and it does not
+ * survive a checkpoint (PRD §29.1, §29.2 deliberately exclude the transaction log
+ * from the Git-facing tree, and §14.1 keeps `.runtime/` out of version control).
+ */
+export interface OverlayHistoryEntry {
+  transaction: OverlayTransactionRecord
+  /** One per document the transaction WROTE, ordered by logical ID. */
+  artifacts: OverlayHistoryArtifact[]
+  /** Documents the transaction affected without writing a revision — a §29.8 removal. */
+  removedDocumentIds: string[]
+  /**
+   * Every revision this transaction produced is still readable.
+   *
+   * `false` for a transaction that only removed documents: a removal produced no
+   * artifact, so there is nothing to read back. This is a statement about the
+   * *content*, never about the log entry — the record of what happened survives
+   * either way.
+   */
+  recoverable: boolean
+}
+
+/* ------------------------------------------------------------------ *
+ * Local cleanup of `.runtime/` growth (PRD §15.7, §37 Phase 2 "Local cleanup")
+ * ------------------------------------------------------------------ */
+
+export interface PruneRuntimeHistoryOptions {
+  /**
+   * Retain the N most recent transactions and prune the rest.
+   *
+   * Omit to prune no transaction record at all — a dangling idempotency pointer
+   * is still removed, because it is broken state rather than retained state.
+   */
+  keepLast?: number
+  /** Retain every transaction whose `overlayRevisionAfter` is greater than this. */
+  keepAfterRevision?: number
+  /** Report without deleting. */
+  dryRun?: boolean
+}
+
+export interface PrunedTransactionRef {
+  transactionId: string
+  /** Adapter-relative path of the removed `.runtime/transactions/<id>.json`. */
+  ref: string
+  overlayRevisionAfter: number
+}
+
+export interface PrunedPointerRef {
+  /** Adapter-relative path of the removed `.runtime/indexes/idempotency/<key>.json`. */
+  ref: string
+  /** The transaction the pointer named, or `null` when the file could not be read. */
+  transactionId: string | null
+  /**
+   * `'dangling'` — the pointer already named no readable transaction, so
+   * {@link FsOverlayStore.getTransaction} answered `null` for it before this ran.
+   * `'pruned-transaction'` — removed together with the transaction it named.
+   */
+  reason: 'dangling' | 'pruned-transaction'
+}
+
+/**
+ * PRD §15.7 "Record cleanup results and failures", for the runtime log.
+ *
+ * Read the `pointers` list as a safety statement: every entry with reason
+ * `'pruned-transaction'` is a §34.6 idempotency key that will no longer replay.
+ * A retried request older than the prune horizon therefore APPLIES AGAIN rather
+ * than returning its original result. That is the price of pruning the log and
+ * it is why pruning is opt-in.
+ */
+export interface RuntimeHistoryPruneReport {
+  overlayId: string
+  dryRun: boolean
+  scannedTransactions: number
+  scannedPointers: number
+  /** Removed transaction records, oldest first. */
+  transactions: PrunedTransactionRef[]
+  pointers: PrunedPointerRef[]
+  /**
+   * The transaction the manifest still names as `transactionHead`, which is
+   * retained regardless of the retention window so the manifest never points at
+   * a record that is gone.
+   */
+  retainedHead: string | null
+  failures: Array<{ref: string; reason: string}>
 }
 
 /** Generated artifact written to `.runtime/materialized/<key>.json` (PRD §14.2, §14.4 step 6). */
@@ -624,6 +748,87 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       throw new OverlayIdentityMismatchError(overlayId, read.value.overlayId)
     }
     return read.value
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Local runtime history — PRD §13.10, §37 Phase 2
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Read the branch's own transaction log back (PRD §14.1
+   * `.runtime/transactions/`).
+   *
+   * `getTransaction` is a point lookup; this is the ordered log, which is what
+   * "local runtime history" in §37 Phase 2 asks for. Ordering is by
+   * `transactionId`, which §13.10 MUSTs to be lexicographically ordered by commit
+   * time — so the log order is the commit order without a separate index.
+   *
+   * Scope, stated plainly: this is not Sanity's History. It records overlay
+   * transactions, not a Content Lake revision stream, and it lives entirely under
+   * `.runtime/`, which §14.1 keeps out of Git and §29.2 keeps out of a
+   * checkpoint. A fresh clone, or an overlay restored from a checkpoint tree, has
+   * no history at all — and reports exactly that, rather than an empty-looking
+   * branch.
+   */
+  async readHistory(
+    overlayId: string,
+    options: ReadHistoryOptions = {},
+  ): Promise<OverlayHistoryEntry[]> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    /* Ascending, i.e. commit order (§13.10). */
+    const all = await this.#readAllTransactions()
+
+    const wanted = options.documentId === undefined ? null : toPublishedId(options.documentId)
+    const matching = all.filter((transaction) => {
+      if (
+        options.sinceRevision !== undefined &&
+        transaction.overlayRevisionAfter <= options.sinceRevision
+      ) {
+        return false
+      }
+      if (wanted === null) return true
+      /* Element-wise. A joined key would make `k` and `k+separator+k`
+       * indistinguishable, and a substring test would match a strict prefix. */
+      return transaction.affectedDocumentIds.some((id) => toPublishedId(id) === wanted)
+    })
+
+    const ordered = options.order === 'oldest' ? matching : [...matching].reverse()
+    const limited =
+      typeof options.limit === 'number' ? ordered.slice(0, Math.max(0, options.limit)) : ordered
+
+    const entries: OverlayHistoryEntry[] = []
+    for (const transaction of limited) {
+      const checksums = transaction.resultChecksums ?? {}
+      const artifacts: OverlayHistoryArtifact[] = []
+      for (const logicalId of Object.keys(checksums).sort()) {
+        const artifactChecksum = checksums[logicalId]!
+        let ref = ''
+        let present = false
+        if (isChecksum(artifactChecksum)) {
+          const path = this.layout.revisionPath(logicalId, artifactChecksum)
+          ref = this.layout.relative(path)
+          present = await exists(path)
+        }
+        artifacts.push({
+          logicalId,
+          checksum: artifactChecksum,
+          ref,
+          present,
+          current: ref !== '' && manifest.documentHeads[logicalId]?.storageRef === ref,
+        })
+      }
+
+      const written = new Set(artifacts.map((artifact) => artifact.logicalId))
+      entries.push({
+        transaction: clone(transaction),
+        artifacts,
+        removedDocumentIds: transaction.affectedDocumentIds.filter((id) => !written.has(id)),
+        recoverable: artifacts.length > 0 && artifacts.every((artifact) => artifact.present),
+      })
+    }
+    return entries
   }
 
   /* ---------------------------------------------------------------- *
@@ -1143,6 +1348,136 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       scanned,
       orphans,
       deleted,
+      failures,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Local cleanup of `.runtime/` growth — PRD §15.7, §37 Phase 2
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Prune the runtime transaction log and its idempotency ledger.
+   *
+   * Deliberately NOT part of {@link FsOverlayStore.collectOrphans}. An orphan is
+   * something nothing reaches; a transaction record is reachable forever by
+   * design, and an idempotency pointer is the §34.6 deduplication authority.
+   * Collecting either as garbage would silently trade an audit trail — and
+   * exactly-once replay — for disk space. So the caller states a retention window
+   * and is told, in the report, what that costs.
+   *
+   * The one removal that needs no window: a pointer naming a transaction file
+   * that does not exist. `getTransaction` already answers `null` for it, so the
+   * key already re-applies; deleting the file changes no behaviour and stops the
+   * directory growing with records of nothing.
+   *
+   * Order of deletion is pointer, then record. A pointer that outlives its record
+   * is the broken state; a record without a pointer is merely no longer
+   * addressable by key, which is what pruning means.
+   */
+  async pruneRuntimeHistory(
+    overlayId: string,
+    options: PruneRuntimeHistoryOptions = {},
+  ): Promise<RuntimeHistoryPruneReport> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const transactionEntries = (await readdirSafe(this.layout.transactionsDir)).filter(
+      (entry) => entry.isFile() && entry.name.endsWith('.json'),
+    )
+    /* Ascending by transaction ID, i.e. commit order (§13.10). */
+    const log = await this.#readAllTransactions()
+    const head = manifest.transactionHead ?? null
+
+    const prunable = new Set<string>()
+    if (options.keepLast !== undefined || options.keepAfterRevision !== undefined) {
+      const cutoffIndex =
+        options.keepLast === undefined
+          ? log.length
+          : Math.max(0, log.length - Math.max(0, options.keepLast))
+      for (const [index, transaction] of log.entries()) {
+        /* Both windows must agree before anything is removed: two retention
+         * rules narrow what is pruned, they never widen it. */
+        const byCount = options.keepLast === undefined || index < cutoffIndex
+        const byRevision =
+          options.keepAfterRevision === undefined ||
+          transaction.overlayRevisionAfter <= options.keepAfterRevision
+        if (byCount && byRevision) prunable.add(transaction.transactionId)
+      }
+    }
+    /* §13.1: the manifest's `transactionHead` must keep naming a readable
+     * record, so it survives any window. */
+    if (head !== null) prunable.delete(head)
+
+    const pointersDir = this.layout.idempotencyDir
+    const pointerEntries = (await readdirSafe(pointersDir)).filter(
+      (entry) => entry.isFile() && entry.name.endsWith('.json'),
+    )
+
+    const pointers: PrunedPointerRef[] = []
+    const doomedPointerPaths: string[] = []
+    for (const entry of pointerEntries) {
+      assertSafeComponent(entry.name, 'idempotency pointer')
+      const path = join(pointersDir, entry.name)
+      const ref = this.layout.relative(path)
+      const read = await this.#readJsonSoft<{transactionId?: unknown}>(path)
+      const transactionId =
+        read.ok && typeof read.value?.transactionId === 'string' ? read.value.transactionId : null
+
+      if (transactionId === null) {
+        pointers.push({ref, transactionId: null, reason: 'dangling'})
+        doomedPointerPaths.push(path)
+        continue
+      }
+      /* Existence, not parseability: a transaction file this store cannot parse
+       * is corruption for `validate` to report, not a pointer to nothing. */
+      if (!(await exists(this.layout.transactionPath(transactionId)))) {
+        pointers.push({ref, transactionId, reason: 'dangling'})
+        doomedPointerPaths.push(path)
+        continue
+      }
+      if (prunable.has(transactionId)) {
+        pointers.push({ref, transactionId, reason: 'pruned-transaction'})
+        doomedPointerPaths.push(path)
+      }
+    }
+
+    const transactions: PrunedTransactionRef[] = []
+    for (const transaction of log) {
+      if (!prunable.has(transaction.transactionId)) continue
+      transactions.push({
+        transactionId: transaction.transactionId,
+        ref: this.layout.relative(this.layout.transactionPath(transaction.transactionId)),
+        overlayRevisionAfter: transaction.overlayRevisionAfter,
+      })
+    }
+
+    const failures: Array<{ref: string; reason: string}> = []
+    if (options.dryRun !== true) {
+      for (const [index, path] of doomedPointerPaths.entries()) {
+        try {
+          await rm(path, {force: true})
+        } catch (error) {
+          failures.push({ref: pointers[index]!.ref, reason: (error as Error).message})
+        }
+      }
+      for (const entry of transactions) {
+        try {
+          await rm(this.layout.transactionPath(entry.transactionId), {force: true})
+        } catch (error) {
+          failures.push({ref: entry.ref, reason: (error as Error).message})
+        }
+      }
+    }
+
+    return {
+      overlayId,
+      dryRun: options.dryRun === true,
+      scannedTransactions: transactionEntries.length,
+      scannedPointers: pointerEntries.length,
+      transactions,
+      pointers,
+      retainedHead: head,
       failures,
     }
   }

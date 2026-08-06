@@ -43,29 +43,44 @@ export const REGISTRY: SpikeQueryDefinition[] = [
   },
   {id: 'pt-text', status: 'tier-a', query: `*[_id == $id][0]{"text": pt::text(body)}`, candidatePlan: {type: 'ids', idsFromParams: ['id']}},
 
-  // --- Tier B ---------------------------------------------------------------
-  // §22.3 "Large type-constrained result sets" / "queries that require bounded
-  // recursive reference expansion". Each of these materializes EVERY document
-  // of its type to answer a small question, so §22.6's "never fetch every
-  // document of a large type" is violated at scale. Reclassified 2026-08-04
-  // (evidence review F6) — see spike-c-groq-corpus/boundedness-2026-08-04.md.
+  // --- Aggregate pushdown (§22.6, promoted Tier B -> Tier A 2026-08-06) -----
+  // Both were TYPE-LINEAR: registered under a `types` plan they materialized
+  // every article to return one scalar (4.8 MiB on the wire, latency-2026-08-04
+  // §4.1). They now push the aggregate down to the base and materialize only the
+  // branch delta, which is Tier A's "counts and aggregates over a proven finite
+  // candidate set" — the finite set being the branch, not the type.
   {
-    id: 'article-count', status: 'tier-b',
+    id: 'article-count', status: 'tier-a',
     query: `count(*[_type == "article"])`,
-    candidatePlan: {type: 'types', types: ['article']},
-    notes: 'TYPE-LINEAR. §22.6 step 14 evaluates the original query over the candidate set, so an aggregate must materialize everything it aggregates: a one-number answer costs a full type scan. Needs an aggregate-pushdown planner (base count + overlay delta) to reach Tier A.',
+    candidatePlan: {
+      type: 'aggregate',
+      types: ['article'],
+      baseAggregate: `count(*[_type == "article" && !(_id in $__touched)])`,
+    },
+    notes: 'AGGREGATE PUSHDOWN. count() is additive over the partition {untouched base} u {resolved branch delta}, so the base counts the first half server-side and returns a number. Exact, not estimated: every document is counted in exactly one half.',
   },
   {
-    id: 'stats-aggregate', status: 'tier-b',
+    id: 'stats-aggregate', status: 'tier-a',
     query: `math::sum(*[_type == "article"].sections[1].count)`,
-    candidatePlan: {type: 'types', types: ['article']},
-    notes: 'TYPE-LINEAR, as article-count.',
+    candidatePlan: {
+      type: 'aggregate',
+      types: ['article'],
+      baseAggregate: `math::sum(*[_type == "article" && !(_id in $__touched)].sections[1].count)`,
+    },
+    notes: 'AGGREGATE PUSHDOWN, as article-count. math::sum is additive and math::sum([]) is 0; a non-numeric member makes the whole sum null, which the recombination preserves by refusing to add a null half.',
   },
+
+  // --- Tier B ---------------------------------------------------------------
+  // §22.3 "queries that require bounded recursive reference expansion".
   {
     id: 'articles-by-author-name', status: 'tier-b',
     query: `*[_type == "article" && author->name == $name]{_id} | order(_id asc)`,
-    candidatePlan: {type: 'types', types: ['article']},
-    notes: 'TYPE-LINEAR. The filter traverses a reference, so editing an author can add a referrer no base fetch selected; exactness without a scan needs §22.6 step 10 (reverse-reference expansion), which is unimplemented. Blast radius is the referrer count, so even that is not constant.',
+    candidatePlan: {
+      type: 'reverse-reference',
+      types: ['article'],
+      filter: `*[_type == "article" && (author->name == $name || references($__touched))]{_id}`,
+    },
+    notes: 'REFERRER-PROPORTIONAL (was TYPE-LINEAR). §22.6 step 10: the base returns the referrers that match in the base state plus the referrers of every touched document — the only base non-matches that a branch edit can turn into matches. Stays Tier B because the bound is the referrer fan-out of the branch, which is a property of the data and is NOT constant; §22.7 sanctions the full scan this replaces.',
   },
   {
     id: 'recent-by-created-at', status: 'tier-b',

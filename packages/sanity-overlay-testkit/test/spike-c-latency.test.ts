@@ -2,7 +2,7 @@ import {writeFileSync} from 'node:fs'
 import {beforeAll, describe, expect, it, vi} from 'vitest'
 import {type FixtureDocument, loadFixtureDataset, publishedPerspective} from '../src/fixtures'
 import {runGroq} from '../src/groq'
-import {OVERLAY_FIXTURES, type SpikeOverlay, applyOverlay} from '../spike-c/overlay'
+import {OVERLAY_FIXTURES, type SpikeOverlay, applyOverlay, emptyOverlay} from '../spike-c/overlay'
 import {
   REPRESENTATIVE_ARTICLE_COUNT,
   type WorkProfile,
@@ -170,13 +170,16 @@ const BUDGET_CLASS: Record<string, {klass: BudgetClass; why: string}> = {
 }
 
 /**
- * The three queries `boundedness-2026-08-04.md` records as honestly unbounded
- * (`type-linear`). They materialise their whole type to answer a small
- * question, so at representative scale they are EXPECTED to blow any work
- * budget. Pinned here as admissions: if a planner improvement fixes one, this
- * list goes red and forces the Tier and the evidence document to be updated.
+ * The queries whose candidate set legitimately IS their type, because the type
+ * is what they return. No planner can materialise fewer documents than it
+ * responds with, so these are the only two entries allowed to reach the type
+ * scale — everything else must be bounded by its answer or by the branch.
+ *
+ * `boundedness-2026-08-04.md` also listed `article-count`, `stats-aggregate`
+ * and `articles-by-author-name` as `type-linear` admissions. Those three were
+ * closed on 2026-08-06 and are deliberately NOT here.
  */
-const TYPE_LINEAR = ['article-count', 'articles-by-author-name', 'stats-aggregate']
+const RESULT_PROPORTIONAL = ['article-type-list', 'multi-type-list']
 
 // ---------------------------------------------------------------------------
 // Independent answer-size oracles. Each re-implements the registered query's
@@ -495,52 +498,265 @@ describe('§5.4 "Type-constrained list query, warm" (p95 under 3 s): work propor
   })
 })
 
-describe('§22.6 admissions: the three type-linear queries are over budget at representative scale', () => {
-  // Not a failure to hide. Recorded, pinned, and tied to its Tier so it cannot
-  // rot in either direction: if a planner improvement bounds one of these, the
-  // test goes red and the registry + evidence document must be updated.
-  it.each(TYPE_LINEAR.map((id) => [id] as const))(
-    '%s materialises its whole type and is registered Tier B',
-    (id) => {
-      const p = atScale.get(key(id, 'empty'))!
-      expect(byId(id).status, `${id} scans its type; Tier A would be dishonest`).toBe('tier-b')
+// ===========================================================================
+// 2b. §22.6 PUSHDOWN — the three Gate D latency misses, gated on WORK.
+//
+// `latency-2026-08-04.md` §7 recorded three queries outside the §5.4 budget,
+// each with a named §22.6 fix. This block is the budget those fixes must meet.
+// Every ceiling below is derived from the QUERY TEXT and the FIXTURE DATA
+// only: nothing reads `def.candidatePlan`, and no constant is copied from the
+// planner. That is the same discipline `boundedness-2026-08-04.md` §2 imposes,
+// and for the same reason — a ceiling computed from planner constants cannot
+// falsify the planner.
+// ===========================================================================
+
+/** Every id the branch touched: overlay records and tombstones alike. */
+const touchedIds = (overlay: SpikeOverlay): string[] => [
+  ...overlay.documents.keys(),
+  ...overlay.tombstones,
+]
+
+/**
+ * §22.6 step 10's blast radius, measured rather than assumed: BASE documents of
+ * `types` that reference any touched id. This is what a reverse-reference plan
+ * must fetch and — because a branch edit to a target can add or remove a
+ * referrer — no exact planner may fetch fewer.
+ */
+function referrersOfTouched(
+  dataset: FixtureDocument[],
+  overlay: SpikeOverlay,
+  types: string[],
+): number {
+  const touched = touchedIds(overlay)
+  return dataset.filter((d) => types.includes(d._type) && touched.some((id) => hasRefTo(d, id)))
+    .length
+}
+
+/**
+ * `*[_type == "article" && author->name == $name]` evaluated against BASE, by
+ * hand from the query text. This is the left half of the reverse-reference
+ * plan's optimum: every referrer that matches in the base state must be
+ * fetched, and a base that understands the predicate returns exactly these.
+ */
+function baseAuthorNameMatches(dataset: FixtureDocument[], name: unknown): number {
+  const byId = new Map(dataset.map((d) => [d._id, d]))
+  return dataset.filter((d) => {
+    if (d._type !== 'article') return false
+    const ref = (d.author as {_ref?: string} | undefined)?._ref
+    return ref !== undefined && byId.get(ref)?.name === name
+  }).length
+}
+
+/** The two aggregates §22.6 step 14 used to force a full type scan. */
+const AGGREGATES = ['article-count', 'stats-aggregate'] as const
+const AGGREGATE_CASES = AGGREGATES.flatMap((id) =>
+  overlayNames.map((ov) => [key(id, ov), id, ov] as const),
+)
+const AUTHOR_NAME_CASES = overlayNames.map(
+  (ov) => [key('articles-by-author-name', ov), ov] as const,
+)
+
+describe('§22.6 aggregate pushdown: an aggregate must not materialise what it aggregates', () => {
+  // The independent ceiling is the BRANCH DELTA and nothing else. Argument, from
+  // the query semantics: the virtual dataset partitions into (a) base documents
+  // the branch did not touch and (b) the resolved touched documents. `count()`
+  // and `math::sum()` are additive over that partition, so a base that can
+  // aggregate (a) server-side leaves only (b) to be transferred. Anything above
+  // the branch delta is a document fetched for nothing.
+  it.each(AGGREGATE_CASES)('%s materialises no more than the branch delta', (_l, id, ov) => {
+    const p = atScale.get(key(id, ov))!
+    const delta = branchDelta(representative, overlayFor(representative, ov), ['article'])
+    expect(
+      p.documentsMaterialized,
+      `${id} × ${ov}: materialised ${p.documentsMaterialized} documents to return one scalar; ` +
+        `the branch touched ${delta} article documents and the base can aggregate the rest`,
+    ).toBeLessThanOrEqual(delta)
+  })
+
+  it.each(AGGREGATES)('%s makes the base return a scalar, not documents', (id) => {
+    const p = atScale.get(key(id, 'empty'))!
+    expect(
+      p.baseFetchDocuments,
+      `${id}: the base fetch returned ${p.baseFetchDocuments} documents; an aggregate pushdown ` +
+        `transfers one number`,
+    ).toBe(0)
+    // latency-2026-08-04.md §4.1 measured 4,946.8 KiB here.
+    expect(p.candidateBytes, `${id}: ${p.candidateBytes} candidate bytes`).toBeLessThanOrEqual(
+      ID_SLUG_BYTE_CAP,
+    )
+  })
+
+  it.each(AGGREGATE_CASES)('%s does identical work at 30 and at 5,000 articles', (_l, id, ov) => {
+    const small = atFixture.get(key(id, ov))!
+    const big = atScale.get(key(id, ov))!
+    expect(
+      big.documentsMaterialized,
+      `${id} × ${ov}: 30 articles -> ${small.documentsMaterialized}, 5,000 -> ${big.documentsMaterialized}`,
+    ).toBe(small.documentsMaterialized)
+  })
+
+  it.each(AGGREGATE_CASES)(
+    '%s still returns the whole-dataset answer at representative scale',
+    async (_l, id, ov) => {
+      // Speed that is not exact is worthless (PRD §5.5). The oracle is the
+      // ORIGINAL query over the fully resolved dataset — it never sees a plan.
+      const overlay = overlayFor(representative, ov)
+      const def = byId(id)
+      const oracle = await runGroq(def.query, applyOverlay(representative, overlay), PARAMS[id] ?? {})
+      const {result} = await evaluateRegistered(def, representative, overlay, PARAMS[id] ?? {})
+      expect(result, `${id} × ${ov}`).toEqual(oracle)
+    },
+    120_000,
+  )
+})
+
+describe('§22.6 step 10 reverse-reference expansion: filter-through-reference must not scan its type', () => {
+  it.each(AUTHOR_NAME_CASES)('%s stays within the reverse-reference ceiling', (_l, ov) => {
+    const p = atScale.get(key('articles-by-author-name', ov))!
+    const overlay = overlayFor(representative, ov)
+    const name = PARAMS['articles-by-author-name'].name
+    // The three terms an exact reverse-reference plan needs, and no fourth:
+    //   base matches      — referrers that already match in the base state;
+    //   referrers-of-touched — the only base non-matches that can BECOME matches;
+    //   branch delta      — branch records of the referrer type (§22.6 step 6).
+    const ceiling =
+      baseAuthorNameMatches(representative, name) +
+      referrersOfTouched(representative, overlay, ['article']) +
+      branchDelta(representative, overlay, ['article'])
+    expect(
+      p.planSelected,
+      `articles-by-author-name × ${ov}: plan selected ${p.planSelected}, ceiling ${ceiling} ` +
+        `(base matches + referrers of touched targets + branch delta). §22.7 sanctions a full ` +
+        `scan of ${REPRESENTATIVE_ARTICLE_COUNT} articles; step 10 is what makes that unnecessary.`,
+    ).toBeLessThanOrEqual(ceiling)
+  })
+
+  it('the ceiling is not vacuous: it is orders of magnitude below the type scan', () => {
+    for (const ov of overlayNames) {
+      const overlay = overlayFor(representative, ov)
+      const ceiling =
+        baseAuthorNameMatches(representative, PARAMS['articles-by-author-name'].name) +
+        referrersOfTouched(representative, overlay, ['article']) +
+        branchDelta(representative, overlay, ['article'])
       expect(
-        p.planSelected,
-        `${id}: selected ${p.planSelected} of ${REPRESENTATIVE_ARTICLE_COUNT} articles`,
-      ).toBeGreaterThanOrEqual(REPRESENTATIVE_ARTICLE_COUNT)
+        ceiling,
+        `${ov}: a ceiling at or above the ${REPRESENTATIVE_ARTICLE_COUNT}-article scan would be satisfied by the scan`,
+      ).toBeLessThan(REPRESENTATIVE_ARTICLE_COUNT / 10)
+    }
+  })
+
+  it.each(AUTHOR_NAME_CASES)(
+    '%s still returns the whole-dataset answer at representative scale',
+    async (_l, ov) => {
+      const overlay = overlayFor(representative, ov)
+      const def = byId('articles-by-author-name')
+      const params = PARAMS['articles-by-author-name']
+      const oracle = await runGroq(def.query, applyOverlay(representative, overlay), params)
+      const {result} = await evaluateRegistered(def, representative, overlay, params)
+      expect(result, `articles-by-author-name × ${ov}`).toEqual(oracle)
+    },
+    180_000,
+  )
+})
+
+describe('§22.6 step 8 dereference-path analysis: a query that derefs nothing expands nothing', () => {
+  // latency-2026-08-04.md §4.3: `article-type-list` materialised 833 author
+  // documents it never dereferences — 14 % of its candidate set and ~0.7 MiB,
+  // on the query already thinnest against its budget.
+  const derefFree = supported.filter((d) => !d.query.includes('->'))
+  const derefs = supported.filter((d) => d.query.includes('->'))
+
+  it('the split is read off the query text and covers the registry', () => {
+    expect(derefFree.length + derefs.length).toBe(supported.length)
+    expect(derefs.map((d) => d.id).sort()).toEqual([
+      'article-with-author',
+      'articles-by-author-name',
+      'page-featured-refs',
+    ])
+  })
+
+  it.each(derefFree.flatMap((d) => overlayNames.map((ov) => [key(d.id, ov), d.id, ov] as const)))(
+    '%s contains no `->` and must expand no references',
+    (_l, id, ov) => {
+      const p = atScale.get(key(id, ov))!
+      expect(byId(id).query).not.toContain('->')
       expect(
-        p.documentsMaterialized,
-        `${id}: ${p.documentsMaterialized} docs vs the id/slug cap of ${ID_SLUG_DOC_CAP}`,
-      ).toBeGreaterThan(ID_SLUG_DOC_CAP * 100)
+        p.referenceExpansions,
+        `${id} × ${ov} dereferences nothing but expanded ${p.referenceExpansions} documents`,
+      ).toBe(0)
     },
   )
 
-  it('§22.6 step 8 ("analyze dereference paths") is not implemented: dereference-free queries still expand', () => {
-    // `article-type-list` is `*[_type == "article"]{_id, title}` — it does not
-    // dereference anything, yet the spike planner expands references
-    // unconditionally and materialises every author. At representative scale
-    // that is ~14 % of the candidate set and ~0.7 MiB transferred for nothing.
-    // Recorded as an admission so it cannot rot: implementing step 8 turns this
-    // red and the evidence document must be updated with the improvement.
-    const p = atScale.get(key('article-type-list', 'empty'))!
-    const authors = representative.filter((d) => d._type === 'author').length
-    expect(byId('article-type-list').query).not.toContain('->')
-    expect(
-      p.referenceExpansions,
-      `article-type-list dereferences nothing but expanded ${p.referenceExpansions} documents`,
-    ).toBe(authors)
-  })
-
-  it('their cost grows with the dataset, not with the answer', () => {
-    for (const id of TYPE_LINEAR) {
-      const small = atFixture.get(key(id, 'empty'))!
-      const big = atScale.get(key(id, 'empty'))!
-      expect(
-        big.planSelected / small.planSelected,
-        `${id}: ${small.planSelected} -> ${big.planSelected} while the answer stayed the same size`,
-      ).toBeGreaterThan(100)
+  it('the analysis is not "expand nothing": the queries that DO deref still expand', () => {
+    // Under-approximating would lose documents the answer depends on, so this
+    // half of the guard matters more than the half above.
+    for (const id of ['article-with-author', 'page-featured-refs']) {
+      const p = atScale.get(key(id, 'empty'))!
+      expect(p.referenceExpansions, `${id} dereferences and must expand`).toBeGreaterThan(0)
     }
   })
+})
+
+describe('§22.6: no query materialises its type to answer a small question', () => {
+  // This block REPLACES the three "type-linear admissions" of 2026-08-04. All
+  // three were closed on 2026-08-06 (aggregate pushdown; §22.6 step 10 reverse-
+  // reference expansion), so what is pinned here is the improvement: revert any
+  // of them to a `types` plan and these go red.
+  //
+  // `article-type-list` and `multi-type-list` remain — legitimately. Their
+  // answer IS the type, so no planner can materialise less than the response.
+
+  it('the only queries that materialise the whole article type are the ones that RETURN it', () => {
+    const scanners = supported
+      .map((d) => [d.id, atScale.get(key(d.id, 'empty'))!] as const)
+      .filter(([, p]) => p.planSelected >= REPRESENTATIVE_ARTICLE_COUNT)
+      .map(([id]) => id)
+      .sort()
+    expect(
+      scanners,
+      'a query that scans its type without returning it is the defect this block exists to catch',
+    ).toEqual(RESULT_PROPORTIONAL)
+  })
+
+  it('every other query stays two orders of magnitude below its type', () => {
+    for (const def of supported) {
+      if (RESULT_PROPORTIONAL.includes(def.id)) continue
+      const p = atScale.get(key(def.id, 'empty'))!
+      expect(
+        p.documentsMaterialized,
+        `${def.id} materialised ${p.documentsMaterialized} of ${REPRESENTATIVE_ARTICLE_COUNT} articles`,
+      ).toBeLessThan(REPRESENTATIVE_ARTICLE_COUNT / 100)
+    }
+  })
+
+  it('recent-by-created-at is Tier B for the §13.9 timestamp reason, not a boundedness one', () => {
+    const def = byId('recent-by-created-at')
+    expect(def.status).toBe('tier-b')
+    expect(def.systemTimestampPolicy).toBe('preview-diverges')
+  })
+
+  it('articles-by-author-name stays Tier B: its bound is the referrer fan-out, not a constant', async () => {
+    // The classification has to be earned, not asserted. Touching EVERY author
+    // makes every article a referrer of a touched target, so §22.6 step 10's
+    // candidate set becomes the type — which is exactly why this query is
+    // bounded rather than constant, and why Tier A would be dishonest.
+    expect(byId('articles-by-author-name').status).toBe('tier-b')
+    const worstCase = emptyOverlay()
+    for (const author of representative.filter((d) => d._type === 'author')) {
+      worstCase.documents.set(author._id, {...author, name: `${String(author.name)} (touched)`})
+    }
+    const p = await profileQuery(
+      byId('articles-by-author-name'),
+      representative,
+      worstCase,
+      PARAMS['articles-by-author-name'],
+    )
+    expect(
+      p.planSelected,
+      'if touching every target did NOT widen the candidate set, the bound would be constant ' +
+        'and the Tier B classification would be too pessimistic',
+    ).toBeGreaterThan(REPRESENTATIVE_ARTICLE_COUNT / 2)
+  }, 180_000)
 })
 
 // ===========================================================================

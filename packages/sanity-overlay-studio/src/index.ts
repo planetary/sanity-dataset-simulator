@@ -68,6 +68,12 @@ export type {
   OverlayStudioOptions,
   ResolvedOverlayOptions,
 } from './options'
+/* The §11.3 credential check, as data. Exported so a deployment check and a CI
+ * scan ask the same question the Studio asks at startup rather than three that
+ * drift — the previous check missed `SANITY_API_TOKEN`, the name Sanity's own
+ * documentation uses most. */
+export {classifyTokenEnvKey, isBrowserReachableEnvKey} from './options'
+export type {TokenEnvVerdict} from './options'
 
 export {
   DISABLED_HOSTED_INSPECTOR_NAMES,
@@ -87,6 +93,7 @@ export {
   OVERLAY_BLOCKED_ACTIONS,
   OVERLAY_ROUTED_ACTIONS,
   overlayActionDecision,
+  overlayDocumentActionsResolver,
   resolveOverlayDocumentActions,
 } from './actions'
 
@@ -96,16 +103,101 @@ export type {OverlayBannerState, OverlayStatus, OverlayStatusInput} from './stat
 export {conflictPanelModel, readConflictReport, summarizeConflictDocuments} from './conflicts'
 export type {ConflictPanelModel, OverlayConflictReport} from './conflicts'
 
+/* ── The conflict panel (PRD §28.2 the list and the per-document indication,
+ * §28.3 driving each resolution action). Pure: no rendering, no transport, so a
+ * host can build its own surface on the same decisions. */
+export {
+  OPTIONAL_CONFLICT_COLUMNS,
+  conflictListRows,
+  documentConflictIndicator,
+  filterConflictRows,
+  planConflictResolution,
+  resolvedPreviewValue,
+} from './conflictPanel'
+export type {
+  ConflictIndicator,
+  ConflictIndicatorState,
+  ConflictLoss,
+  ConflictLossEntry,
+  ConflictResolutionCommand,
+  ConflictResolutionInput,
+  ConflictResolutionPlan,
+  ConflictRow,
+  ConflictRowFilters,
+  OptionalConflictColumn,
+  ResolvedPreview,
+  ResolvedPreviewKind,
+} from './conflictPanel'
+
+/* ── The overlay operations (PRD §28.4 rebase modes, §28.5 preconditions, §29
+ * checkpoint). `planRebase` and `planCheckpoint` decide; they never send. */
+export {
+  OVERLAY_OPERATION_KINDS,
+  STUDIO_REBASE_MODES,
+  planCheckpoint,
+  planRebase,
+  readRebaseOutcome,
+} from './operations'
+export type {
+  CheckpointCommand,
+  CheckpointPlan,
+  CheckpointRequest,
+  OperationLoss,
+  OperationLossDocument,
+  OverlayOperationCommand,
+  OverlayOperationKind,
+  RebaseBlockage,
+  RebaseCommand,
+  RebaseOutcome,
+  RebasePlan,
+  RebaseRequest,
+  StudioRebaseMode,
+} from './operations'
+
+/* ── The document actions themselves: rebase, resolve conflict, checkpoint. */
+export {createOverlayActionController} from './documentActions'
+export type {
+  ConflictResolutionOutcome,
+  OverlayActionContext,
+  OverlayActionController,
+  OverlayActionControllerOptions,
+  OverlayActionDescription,
+  OverlayActionKind,
+  OverlayActionState,
+  OverlayActionTone,
+  OverlayConfirmDialog,
+  OverlayCustomDialog,
+} from './documentActions'
+
 export {
   clearOverlayRuntimes,
   createOverlayRuntime,
   getOverlayRuntime,
   registerOverlayRuntime,
 } from './runtime'
-export type {OverlayRuntime} from './runtime'
+export type {OverlayBranchView, OverlayRuntime} from './runtime'
+
+/* `window.__SANITY_OVERLAY__` — the read ledger, the branch view and the §21.3
+ * status, reachable from a browser console. See `devtools.ts`. */
+export {
+  OVERLAY_DEVTOOLS_GLOBAL,
+  createOverlayDevtools,
+  installOverlayDevtools,
+} from './devtools'
+export type {OverlayDevtools, OverlayDevtoolsSession} from './devtools'
 
 export {createOverlayEcho} from './client/echo'
 export type {OverlayEcho, OverlayMutationEvent} from './client/echo'
+/* A refusal this system issued is not a failure of the user's Sanity session.
+ * Exported so a host that funnels client errors through its own session
+ * observer can apply the same rule rather than re-deriving it. */
+export {
+  OVERLAY_REFUSAL_CODES,
+  OVERLAY_REFUSAL_FLAG,
+  authStatusOf,
+  isOverlayRefusal,
+  markOverlayRefusal,
+} from './client/echo'
 export {createOverlayTransport} from './client/transport'
 export type {OverlayTransport} from './client/transport'
 export {wrapWithOverlay} from './client/facade'
@@ -121,6 +213,21 @@ export type {
   StudioReadRouter,
   StudioReaderOptions,
 } from './client/reads'
+/* PRD §21.6 incoming references — a combined base-plus-overlay read, so a
+ * branch-created referring document is not invisible to the delete check. */
+export {
+  INCOMING_REFERENCE_MAX_CANDIDATES,
+  INCOMING_REFERENCE_TARGETS_PARAM,
+  branchReferringAddresses,
+  deriveIncomingReferenceTargets,
+  incomingReferenceCandidateQuery,
+  incomingReferenceReadPlan,
+} from './client/incomingReferences'
+export type {
+  IncomingReferenceDerivation,
+  IncomingReferencePlanRequest,
+} from './client/incomingReferences'
+
 export {deriveStudioReadPlan, evaluateStudioRead} from './client/readPlan'
 export type {StudioReadDerivation, StudioReadPlan} from './client/readPlan'
 export {createBranchCandidateSource, overlaySourceFromBranch} from './client/readSource'

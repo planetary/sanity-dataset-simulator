@@ -12,6 +12,12 @@
  * pane, an outage is transient, and shouting is more useful to the editor than
  * discarding their keystrokes. A 401 is not transient — that is the distinction.
  *
+ * ENDING THE SESSION IS A SEPARATE DECISION FROM `fatal`. This transport only
+ * ever talks to the overlay, so a 401/403 here is our own server's refusal and
+ * says nothing about the editor's Sanity credential. It is reported as an auth
+ * failure — which logs the editor out — only when the overlay explicitly
+ * declares the refusal came from upstream. See {@link declaresUpstreamAuthOrigin}.
+ *
  * `fetch` is injected, so nothing here needs a network or a browser to test.
  */
 
@@ -19,7 +25,7 @@ import {
   assertNoStagingWrite,
   createStagingSafeFetch,
 } from '../../../sanity-overlay-client/src/stagingHost'
-import type {OverlayCommit} from './echo'
+import {isOverlayRefusal, type OverlayCommit} from './echo'
 
 type Rec = Record<string, unknown>
 
@@ -37,6 +43,17 @@ export interface OverlayHydrationDocument {
   published?: Rec | null
   /** PRD §13.11 conflicts, when the overlay reports them per document. */
   conflicts?: unknown[]
+  /* ---- The §28.2 conflict-list columns, when the overlay reports them. ----
+   *
+   * Every one of these is OPTIONAL, and the panel says so rather than filling a
+   * blank with a plausible value: §5.5 forbids silent approximation, and a
+   * "current base revision" the overlay never stated is exactly that. */
+  /** §13.3 `base.firstTouchedAt` revision — the ancestor the branch forked from. */
+  baseRevisionAtFirstTouch?: string
+  /** The base revision as it stands now. Differs from the above ⇒ base moved. */
+  currentBaseRevision?: string
+  /** §28.2 "Touched since checkpoint". `undefined` means the overlay did not say. */
+  touchedSinceCheckpoint?: boolean
 }
 
 export interface OverlayTransportResult {
@@ -80,8 +97,27 @@ export interface OverlayQueryRequest {
   perspective?: string
 }
 
+/**
+ * One §21.7 overlay operation — a rebase, a conflict resolution, a checkpoint.
+ *
+ * A separate channel from {@link OverlayTransport.commit} on purpose: a commit
+ * carries a list of Studio-issued mutations the echo has already applied to the
+ * pane, an operation carries ONE instruction the overlay applies with core and
+ * that the Studio has no local echo for. Sharing the shape would let a caller
+ * pass an operation where an echo-backed commit was expected, which is the kind
+ * of confusion that ends with an unacknowledged write.
+ */
+export interface OverlayOperationRequest {
+  kind: string
+  /** The command object, as `operations.ts` built it. */
+  payload: unknown
+  idempotencyKey: string
+  actor?: unknown
+}
+
 export interface OverlayTransport {
   commit(commit: OverlayCommit, context: OverlayCommitContext): Promise<OverlayTransportResult>
+  operation(request: OverlayOperationRequest): Promise<OverlayTransportResult>
   resolve(request: OverlayResolveRequest): Promise<OverlayTransportResult>
   query(request: OverlayQueryRequest): Promise<OverlayTransportResult>
   state(): Promise<OverlayTransportResult>
@@ -91,8 +127,58 @@ export interface OverlayTransport {
 
 const AUTH_STATUSES = new Set([401, 403])
 
+/**
+ * Origins the overlay may declare for a 401/403 it is REPORTING rather than
+ * ISSUING. Structured values only — see {@link declaresUpstreamAuthOrigin}.
+ */
+const UPSTREAM_ORIGINS: ReadonlySet<string> = new Set(['sanity', 'content-lake', 'upstream'])
+
 function isRec(value: unknown): value is Rec {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Did the overlay say this 401/403 came from SANITY, not from itself?
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THIS EXISTS, AND WHY THE DEFAULT IS "NO".
+ *
+ * `onAuthFailure` drives `echo.noteAuthFailure`, which moves the session to
+ * `unauthenticated` — the "your Sanity credential is gone" state that stops
+ * further writes and tells the editor to log in again.
+ *
+ * This transport never talks to Sanity. `assertNoStagingWrite` refuses to
+ * construct one whose `apiUrl` points at the Content Lake, so *every* 401/403
+ * `call()` observes was issued by our own overlay server. Mapping that to a
+ * Sanity credential failure logged an editor out because our server said no —
+ * which is a different thing entirely, and the more expensive mistake, because
+ * it discards work over a refusal that was never about their token.
+ *
+ * So the default is inverted: an overlay-API 401/403 is the overlay's own "no"
+ * unless the overlay DECLARES otherwise. It is the only party that knows whether
+ * it proxied the call, so it is the only party that can say.
+ *
+ * The failure stays `fatal` either way — it provably cannot land, whoever
+ * refused — so nothing is silently retried and no write falls back to Sanity.
+ *
+ * STRUCTURED FIELDS ONLY, NEVER PROSE, matching `echo.ts` `authStatusOf`: an
+ * error whose *message* happens to mention Sanity is still the overlay's own.
+ * And an `OVERLAY_*` code outranks any declaration, because a body carrying one
+ * was written by one of our own guards.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+function declaresUpstreamAuthOrigin(body: Rec | undefined): boolean {
+  if (body === undefined) return false
+  /* Our own guard's refusal, wherever in the body it sits. Never an auth signal. */
+  if (isOverlayRefusal(body)) return false
+
+  const carriers: unknown[] = [body, body.error, body.details]
+  for (const carrier of carriers) {
+    if (!isRec(carrier)) continue
+    const origin = carrier.origin
+    if (typeof origin === 'string' && UPSTREAM_ORIGINS.has(origin.toLowerCase())) return true
+  }
+  return false
 }
 
 function messageOf(body: Rec | undefined, fallback: string): string {
@@ -194,7 +280,9 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
     if (AUTH_STATUSES.has(status)) {
       const message = `[sanity-overlay-studio] ${url} answered ${status}: ${messageOf(body, 'unauthorized')}`
       noteError(message)
-      options.onAuthFailure?.({status, source, message})
+      /* Fatal either way. Session-ending only when the overlay declared that the
+       * refusal came from Sanity rather than from itself. */
+      if (declaresUpstreamAuthOrigin(body)) options.onAuthFailure?.({status, source, message})
       return {outcome: 'fatal', status, body, message}
     }
 
@@ -236,6 +324,25 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
                 ? {}
                 : {baseDocuments: context.baseDocuments}),
               ...(context.actor === undefined ? {} : {actor: context.actor}),
+            },
+          },
+          'write',
+        ),
+      ),
+    /* Same queue as `commit`, so an operation cannot interleave with the edit
+     * whose revision chain it is about to rewrite. Same `'write'` source, so a
+     * 401 on a rebase ends the session exactly as a 401 on an edit does. */
+    operation: (request) =>
+      enqueue(() =>
+        call(
+          '/commit',
+          {
+            method: 'POST',
+            body: {
+              idempotencyKey: request.idempotencyKey,
+              kind: request.kind,
+              payload: request.payload,
+              ...(request.actor === undefined ? {} : {actor: request.actor}),
             },
           },
           'write',

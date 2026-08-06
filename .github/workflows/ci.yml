@@ -108,6 +108,21 @@ jobs:
   #                            outside the tsconfig `include` roots -- tsc never
   #                            opens it, so no @types/node is needed for this
   #                            project to be gated.
+  #   sanity-overlay-next      0 errors, MEASURED with @types/node reachable
+  #                            (verified 2026-08-06 by linking the installed
+  #                            copy into the package and re-running tsc: clean).
+  #                            src/server.ts is TypeScript inside `include` and
+  #                            imports node:http and node:path, so the project
+  #                            needs @types/node -- which it already DECLARES.
+  #                            It is gated rather than excluded because nothing
+  #                            has to be added to make it clean; the entry just
+  #                            has to be installed, which is the same repo-root
+  #                            `pnpm install` the cli exclusion below is waiting
+  #                            on. Until that install lands and pnpm-lock.yaml is
+  #                            committed, the `pnpm install --frozen-lockfile`
+  #                            step above fails first and this job never runs at
+  #                            all -- so gating it cannot make CI red in a way
+  #                            the install step is not already red for.
   #
   # WHAT IT DOES NOT COVER. Each exclusion is a measured error count, not a
   # guess, and each names the one thing that clears it:
@@ -209,3 +224,5 @@ jobs:
         run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-store-fs
       - name: typecheck sanity-overlay-query
         run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-query
+      - name: typecheck sanity-overlay-next
+        run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-next

@@ -23,8 +23,10 @@ import {
   OverlayQueryError,
   createQueryRegistry,
   defineOverlayQuery,
+  planCandidateRequests,
   queryTextChecksum,
 } from '../../sanity-overlay-query/src/index'
+import type {CandidatePlan} from '../../sanity-overlay-query/src/index'
 
 /** Independent oracle: Node's own SHA-256, never the package's implementation. */
 const sha256 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex')
@@ -59,16 +61,25 @@ describe('§37 Phase 2: the [M-LOCAL] reduced registry inventory is pinned', () 
   /**
    * The corpus this registry is being grown towards is the Spike C inventory
    * (`docs/plans/evidence/phase-1/spike-c-groq-corpus/report.md`). Three of its
-   * shapes are deliberately ABSENT rather than registered, and their absence is
-   * pinned so that adding one without its planner is a test failure:
+   * shapes are deliberately ABSENT rather than registered:
    *
-   *   - `article-count` / `stats-aggregate`: §22.6 step 14 evaluates the
-   *     ORIGINAL query over the candidate set, so an aggregate must materialise
-   *     everything it aggregates. Registering them would claim an exactness the
-   *     candidate plan does not deliver; they need aggregate pushdown.
-   *   - `articles-by-author-name`: the filter traverses a reference, so
-   *     membership depends on a field of the TARGET and no base-side predicate
-   *     over the referrers is complete. Needs §22.6 step 10.
+   *   - `article-count` / `stats-aggregate` — aggregate pushdown.
+   *   - `articles-by-author-name` — §22.6 step 10 reverse-reference expansion.
+   *
+   * UPDATED 2026-08-06. The original reason for the absence was that this
+   * package had no planner for any of the three, so registering one would have
+   * claimed an exactness the candidate plan could not deliver. That reason is
+   * GONE: both plans now exist (`planner.ts`, `evaluate.ts`), are served by the
+   * memory base source, and are proven exact against a full-dataset oracle
+   * across every parity overlay in `query-pushdown.test.ts`.
+   *
+   * What still keeps them out is §22.5, not §22.6: registering a query also
+   * pins a parity FIXTURE and a `maxCandidates`, and for the reverse-reference
+   * shape that limit is a branch blast-radius number nobody has ratified (see
+   * `latency-2026-08-04.md` §1.1, still open). So the absence is now a
+   * REGISTRATION decision rather than a capability gap, and the assertion below
+   * pins both halves — the queries stay out, and the planners stay in, so the
+   * two cannot drift apart silently.
    */
   it('the three known-hard Spike C shapes are absent, not registered', () => {
     const registered = new Set(M_LOCAL_QUERIES.map((d) => d.id))
@@ -82,6 +93,36 @@ describe('§37 Phase 2: the [M-LOCAL] reduced registry inventory is pinned', () 
         texts.filter((t) => t.includes(shape)),
         `no registered query may contain ${shape}`,
       ).toEqual([])
+    }
+  })
+
+  /**
+   * The other half of the pin above. If a future change deletes the pushdown
+   * planners, the absence assertion would keep passing while the stated reason
+   * for it silently reverted to "no planner exists". This makes the planners'
+   * existence executable, so the two facts move together.
+   */
+  it('the pushdown planners the absent shapes need DO exist and are exercised', () => {
+    const plans: CandidatePlan[] = [
+      {type: 'aggregate', aggregate: 'count', types: ['article']},
+      {
+        type: 'reverse-reference',
+        types: ['article'],
+        referencePath: ['author'],
+        targetPath: ['name'],
+        valueFromParam: 'name',
+      },
+    ]
+    for (const candidatePlan of plans) {
+      const def = {...M_LOCAL_QUERIES[0], id: `probe-${candidatePlan.type}`, candidatePlan}
+      const requests = planCandidateRequests(def, {name: 'Author 2'}, {affectedIds: ['author-2']})
+      // A real plan, not the unknown-plan refusal: it asks the base for
+      // something, and it admits the branch records of its type (§22.6 step 6).
+      expect(
+        requests.aggregateRequest !== undefined || requests.extendedRequests.length > 0,
+        candidatePlan.type,
+      ).toBe(true)
+      expect(requests.overlayTypes, candidatePlan.type).toEqual(['article'])
     }
   })
 

@@ -53,7 +53,11 @@ import {
   toPublishedId,
   unpublish,
 } from '../../../packages/sanity-overlay-core/src/index.ts'
-import {FsOverlayStore} from '../../../packages/sanity-overlay-store-fs/src/index.ts'
+import {
+  FsOverlayStore,
+  revalidationIsNotable,
+  watchOverlay,
+} from '../../../packages/sanity-overlay-store-fs/src/index.ts'
 import {translateDocumentActions, translateInterceptedWrite} from './overlayTranslate.ts'
 import {deriveReadQuery, evaluateReadQuery} from './readQueries.ts'
 
@@ -83,6 +87,15 @@ const DEFAULT_ACTOR = {
 const JSON_HEADERS = {'content-type': 'application/json; charset=utf-8'}
 /** Studio autosaves on every keystroke burst; a runaway body is a bug, not content. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024
+
+/**
+ * Direct-edit poll period for the `/events` bridge (ms).
+ *
+ * `0` turns the watcher off entirely, leaving `/events` a commit-only bridge.
+ * The interval is a latency knob and nothing else: every §14.4 behaviour lives
+ * in `FsOverlayStore.revalidate`, which the watcher only triggers.
+ */
+const DEFAULT_WATCH_INTERVAL_MS = 250
 
 /* ------------------------------------------------------------------ *
  * Small helpers
@@ -271,6 +284,164 @@ export async function startOverlayServer(options = {}) {
       () => undefined,
     )
     return run
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The event bridge — PRD §14.4 steps 8-10, §37 Phase 2
+   * ---------------------------------------------------------------- *
+   *
+   * §14.4 step 8 emits `document.changed` and step 9 has Studio and preview
+   * refetch. Both halves of the change surface already existed and neither said
+   * anything: commits landed durably, and `watchOverlay` ran the direct-edit
+   * workflow on a poll. This is the announcement.
+   *
+   * DURABILITY PRECEDES NOTIFICATION. Every `emit` below runs after the store has
+   * passed its commit point, never before. An event is an instruction to refetch,
+   * so an early one makes a subscriber read the PREVIOUS state and cache it as
+   * current — the same defect, with a longer fuse, as answering an HTTP request
+   * before the write finished.
+   *
+   * FRAMES ARE ENCODED, NOT INTERPOLATED. SSE terminates a field at a newline and
+   * a frame at a blank line, so a document title containing `\n\n` would forge a
+   * second event if the payload were pasted into the frame. `JSON.stringify`
+   * escapes every newline, which is the whole reason the payload goes through it.
+   */
+
+  /** Open `text/event-stream` responses. A Set, so a double `close` is harmless. */
+  const subscribers = new Set()
+  let eventSequence = 0
+
+  function writeFrame(response, id, event, data) {
+    response.write(`id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+  }
+
+  /** Broadcast one frame to every live subscriber. Returns its sequence number. */
+  function emit(event, data) {
+    eventSequence += 1
+    for (const subscriber of subscribers) {
+      try {
+        writeFrame(subscriber, eventSequence, event, data)
+      } catch (error) {
+        /* A subscriber that vanished between the close event and this write is
+         * not a server fault, and must not stop the other subscribers. */
+        subscribers.delete(subscriber)
+        log('error', `overlay events: dropped a subscriber mid-write: ${error?.message ?? error}`)
+      }
+    }
+    return eventSequence
+  }
+
+  /**
+   * Announce a committed transaction.
+   *
+   * `projection: 'current'` because a commit updates the in-memory projection in
+   * the same step that made it durable, so `/state` and `/resolve` are already
+   * consistent with the event by the time it is written.
+   */
+  function announceCommit(result) {
+    if (result?.committed !== true) return
+    const documentIds = Array.isArray(result.affectedDocumentIds)
+      ? [...result.affectedDocumentIds].sort()
+      : []
+    if (documentIds.length === 0) return
+    emit('document.changed', {
+      overlayId,
+      revision: result.revision,
+      /* A LIST, never a joined string: two documents must stay two elements, or
+       * the payload becomes indistinguishable from one document whose ID
+       * contained the separator. */
+      documentIds,
+      origin: 'commit',
+      projection: 'current',
+      transactionId: result.transactionId,
+    })
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Direct edits (PRD §14.3, §14.4 steps 2-4, 7, 10)
+   * ---------------------------------------------------------------- */
+
+  const watchIntervalMs = options.watchIntervalMs ?? DEFAULT_WATCH_INTERVAL_MS
+  /* `intervalMs: 0` deliberately disables the watcher's OWN timer. Its `poll()`
+   * calls `store.revalidate`, which repairs stale checksums by rewriting
+   * `intent.json` — a write, and therefore something that must not run beside a
+   * commit. The timer below puts every pass on the same `enqueue` mutex the
+   * commit path uses, so the two can never interleave their writes. */
+  const watcher = watchOverlay(store, overlayId, {intervalMs: 0})
+  let watchTimer = null
+
+  /**
+   * The fingerprint of the last announced `overlay.invalid` set.
+   *
+   * A broken file stays broken, so every pass re-reports it. Without this, one
+   * bad file becomes an unbounded event stream that buries every real change.
+   * The fingerprint is a JSON array of arrays — structurally unambiguous — and
+   * NOT a separator-joined string, which would let two different findings
+   * fingerprint identically.
+   */
+  let lastInvalidFingerprint = '[]'
+
+  function invalidFingerprint(invalid) {
+    return JSON.stringify(invalid.map((failure) => [failure.ref, failure.code, failure.message]))
+  }
+
+  async function runWatchPass() {
+    const report = await watcher.poll()
+    if (!revalidationIsNotable(report)) return
+
+    /* The manifest is the revision authority; the projection only mirrors it. */
+    if (report.manifestChanged) {
+      const manifest = await store.inspect()
+      state = {...state, revision: manifest.revision}
+    }
+
+    const changed = [...new Set([...report.changed, ...report.repairedChecksums])]
+    if (report.changed.length > 0) {
+      emit('document.changed', {
+        overlayId,
+        revision: state.revision,
+        documentIds: [...report.changed].sort(),
+        origin: 'direct-edit',
+        /**
+         * `/state` and `/resolve` are built from the IMMUTABLE record named by
+         * the manifest head. A direct edit rewrites `intent.json` and touches
+         * neither, and replaying intent + base snapshot back into a record needs
+         * core's three-way merge engine, which exports no such entry point today
+         * (see `hydrateState`). So the staleness is declared on the wire rather
+         * than hidden: a consumer reading the canonical files — the CLI, a
+         * preview build — is fully served, and a consumer reading `/state` is
+         * told not to trust it.
+         */
+        projection: 'stale',
+      })
+    } else if (changed.length > 0 && report.repairedChecksums.length > 0) {
+      /* A checksum repair changes bytes without changing meaning (§14.3), so it
+       * is reported as its own thing rather than as a content change. */
+      emit('overlay.repaired', {
+        overlayId,
+        revision: state.revision,
+        refs: [...report.repairedChecksums].sort(),
+      })
+    }
+
+    const fingerprint = invalidFingerprint(report.invalid)
+    if (report.invalid.length > 0 && fingerprint !== lastInvalidFingerprint) {
+      emit('overlay.invalid', {
+        overlayId,
+        revision: state.revision,
+        /* §14.4 step 10 — the store keeps serving the last valid state, so this
+         * is a report, not a state transition. `brokenCopyRef` is the route out
+         * that `sanity-overlay normalize` prints. */
+        invalid: report.invalid.map((failure) => ({
+          ref: failure.ref,
+          logicalId: failure.logicalId,
+          code: failure.code,
+          message: failure.message,
+          brokenCopyRef: failure.brokenCopyRef,
+        })),
+      })
+    }
+    lastInvalidFingerprint = fingerprint
   }
 
   async function commit(body) {
@@ -837,6 +1008,41 @@ export async function startOverlayServer(options = {}) {
       return
     }
 
+    if (request.method === 'GET' && route === '/events') {
+      response.writeHead(200, {
+        ...corsHeaders(request),
+        'content-type': 'text/event-stream; charset=utf-8',
+        /* `no-transform` as well as `no-cache`: a compressing proxy would buffer
+         * the stream and turn a live bridge into a stalled one. */
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        /* nginx's own buffering opt-out; harmless everywhere else. */
+        'x-accel-buffering': 'no',
+      })
+      /* Without this, Nagle holds a small frame back until the next one arrives —
+       * so the last edit before a pause is the one that never gets announced. */
+      request.socket?.setNoDelay?.(true)
+
+      subscribers.add(response)
+      const drop = () => subscribers.delete(response)
+      request.on('close', drop)
+      request.on('error', drop)
+      response.on('close', drop)
+      response.on('error', drop)
+
+      /* The opening frame carries the revision the subscriber is joining at, so a
+       * client that reconnects can tell whether it missed a window. */
+      eventSequence += 1
+      writeFrame(response, eventSequence, 'hello', {
+        ok: true,
+        overlayId,
+        root,
+        revision: state.revision,
+        watching: watchTimer !== null,
+      })
+      return
+    }
+
     if (request.method === 'GET' && route === '/state') {
       send(request, response, 200, {
         ok: true,
@@ -919,7 +1125,13 @@ export async function startOverlayServer(options = {}) {
       if (body === undefined) return
 
       try {
-        send(request, response, 200, await enqueue(() => commit(body)))
+        const result = await enqueue(() => commit(body))
+        /* Announced BEFORE the response is sent, and only after `enqueue`
+         * resolved — i.e. only after the store passed its commit point. Emitting
+         * first also means a subscriber can never observe the acknowledgement
+         * without the event that explains it. */
+        announceCommit(result)
+        send(request, response, 200, result)
       } catch (error) {
         const status = error instanceof HttpError ? error.status : error?.code ? 400 : 500
         const code = error?.code ?? 'INTERNAL'
@@ -948,6 +1160,19 @@ export async function startOverlayServer(options = {}) {
     })
   })
 
+  /* Started only once the socket is bound, so a failed listen leaves no timer
+   * behind polling a store nobody can reach. */
+  if (watchIntervalMs > 0) {
+    watchTimer = setInterval(() => {
+      if (watcher.closed) return
+      void enqueue(runWatchPass).catch((error) => {
+        log('error', `overlay watch pass failed: ${error?.message ?? error}`)
+      })
+    }, watchIntervalMs)
+    /* Never hold the process (or the test runner) open. */
+    watchTimer.unref?.()
+  }
+
   const boundPort = server.address().port
 
   return {
@@ -961,6 +1186,28 @@ export async function startOverlayServer(options = {}) {
       return state.revision
     },
     async close() {
+      /* Stop scheduling before anything else, so no pass is queued behind the
+       * drain below and nothing polls a root the caller is about to delete. */
+      if (watchTimer !== null) {
+        clearInterval(watchTimer)
+        watchTimer = null
+      }
+      watcher.close()
+
+      /* End every event stream explicitly. An SSE response is a socket the
+       * server itself is holding open, so `server.close()` — which waits for
+       * connections to finish — would otherwise never resolve. Ending is also
+       * kinder than `closeAllConnections()`: the subscriber sees a clean end of
+       * stream instead of a truncated read it has to distinguish from a crash. */
+      for (const subscriber of subscribers) {
+        try {
+          subscriber.end()
+        } catch {
+          /* Already gone; the Set is cleared below regardless. */
+        }
+      }
+      subscribers.clear()
+
       await new Promise((resolveClose) => {
         server.closeAllConnections?.()
         server.close(() => resolveClose())

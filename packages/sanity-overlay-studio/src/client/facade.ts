@@ -33,6 +33,7 @@
 
 import {
   authStatusOf,
+  markOverlayRefusal,
   type OverlayEcho,
   type OverlayEchoPlan,
   type PlannedEvent,
@@ -274,6 +275,16 @@ const READ_TAP_METHODS = new Set(['getDocument', 'getDocuments'])
  */
 const AUTHORITATIVE_READ_METHODS = new Set(['getDocuments'])
 const MUTATING_DATA_ENDPOINTS = new Set(['mutate', 'actions'])
+/**
+ * Methods that are DECLARED to hand back a client. Kept as a named set because
+ * `withConfig` is on the critical path (Studio reaches the Actions API through
+ * `client.withConfig({apiVersion}).observable.action(...)`), but it is no longer
+ * the only thing standing between a caller and a bare client — see
+ * {@link isSanityClientInstance}'s use in the default branch of `wrap`.
+ *
+ * `withUrlSourceMapping` does not exist in `@sanity/client@7.26.0`; it is kept
+ * so a reintroduction is covered on arrival rather than on discovery.
+ */
 const CLONING_METHODS = new Set(['withConfig', 'clone', 'withUrlSourceMapping'])
 
 const UNECHOABLE_REASON: Readonly<Record<WritePlane, string>> = Object.freeze({
@@ -550,11 +561,17 @@ function createFacade(options: OverlayFacadeOptions): {
   ): unknown {
     const ack = echo.acknowledgeWrite()
     if (!ack.ok) {
-      const error = Object.assign(
-        new Error(
-          `[sanity-overlay-studio] refusing to acknowledge ${method}: ${ack.error?.message ?? 'the session cannot persist writes'}`,
+      /* Marked as our own refusal: it carries the DEAD session's 401/403 so a
+       * host reads it the way it reads a real `ClientError`, and re-observing
+       * that status as fresh evidence would let a refused write re-arm the very
+       * state a token refresh had just cleared. */
+      const error = markOverlayRefusal(
+        Object.assign(
+          new Error(
+            `[sanity-overlay-studio] refusing to acknowledge ${method}: ${ack.error?.message ?? 'the session cannot persist writes'}`,
+          ),
+          ack.error?.status === undefined ? {} : {statusCode: ack.error.status},
         ),
-        ack.error?.status === undefined ? {} : {statusCode: ack.error.status},
       )
       noteError(error.message)
       recordWrite({
@@ -592,9 +609,13 @@ function createFacade(options: OverlayFacadeOptions): {
   }
 
   function refuseUnechoable(kind: Kind, label: string, reason: string): unknown {
-    const error = new Error(
-      `[sanity-overlay-studio] blocked ${label}: ${reason}. Letting it through would put the ` +
-        `editor and the overlay out of sync, and could write to the shared dataset.`,
+    /* Marked, because a host that funnels this back through the session
+     * observer must not read our own "no" as Sanity revoking the credential. */
+    const error = markOverlayRefusal(
+      new Error(
+        `[sanity-overlay-studio] blocked ${label}: ${reason}. Letting it through would put the ` +
+          `editor and the overlay out of sync, and could write to the shared dataset.`,
+      ),
     )
     noteError(error.message)
     return kind === 'observable' ? observableThrowing(error) : Promise.reject(error)
@@ -799,6 +820,39 @@ function createFacade(options: OverlayFacadeOptions): {
     })
   }
 
+  /**
+   * ─────────────────────────────────────────────────────────────────────────
+   * **A CLIENT HANDED BACK BY A WRAPPED CLIENT IS STILL A WRAPPED CLIENT.**
+   *
+   * THE DEFECT THIS CLOSES. `SanityClient.config(newConfig)` *mutates in place
+   * and returns `this`* (`@sanity/client@7.26.0` `SanityClient.ts:1220-1236`).
+   * It was not in `CLONING_METHODS` — nothing new is constructed, so it did not
+   * look like a clone — and so it fell to the default branch and handed the
+   * caller the RAW client. One line defeated the entire facade:
+   *
+   *     wrapped.config({apiHost: 'https://api.sanity.io'}).mutate([…])
+   *
+   * and the same call re-pointed the client at the Content Lake on its way past.
+   * `ObservableSanityClient.config` is the identical hole one level down. Spike
+   * F recorded the request shape as attack 17 (`writeGuardContract.ts`), where
+   * the PROXY stops it; in a deployed preview there is no proxy, so it was live.
+   *
+   * THE CLASS, not the instance. The fix is not "add `config` to the list": the
+   * list is an inventory, and Spike F's standing lesson is that an inventory is
+   * never complete. Any method — present or future, ours to know about or not —
+   * whose return value IS a `@sanity/client` is re-wrapped here, so the next
+   * `this`-returning method @sanity/client ships is covered on arrival.
+   *
+   * `isSanityClientInstance` is prototype-based, so this cannot capture a plain
+   * object: `config()` with NO argument returns `{...clientConfig}` and must
+   * keep being a plain configuration object, not a proxy.
+   * ─────────────────────────────────────────────────────────────────────────
+   */
+  function wrapIfClient(result: unknown, kind: Kind): unknown {
+    if (isSanityClientInstance(result)) return wrap(result as object, kind)
+    return tapReadErrors(result)
+  }
+
   function tapReadErrors(result: unknown): unknown {
     if (isPromiseLike(result)) {
       return result.then(
@@ -923,6 +977,10 @@ function createFacade(options: OverlayFacadeOptions): {
         } else {
           wrapped = (...args: unknown[]): unknown => {
             const result = fn.apply(target, args)
+            /* A builder holds its client in a private field, so it cannot hand
+             * one back today — but `wrapIfClient` costs one prototype walk and
+             * removes the need for that to stay true. */
+            if (isSanityClientInstance(result)) return wrapIfClient(result, kind)
             /* Builders are fluent: `set()` returns the builder. Re-wrap so the
              * chain cannot hand back an unguarded `commit`. */
             return result === target || (isRec(result) && typeof result.commit === 'function')
@@ -994,7 +1052,10 @@ function createFacade(options: OverlayFacadeOptions): {
           wrapped = (...args: unknown[]): unknown =>
             args[0] === 'me' ? tapIdentityProbe(fn.apply(t, args), label) : fn.apply(t, args)
         } else {
-          wrapped = (...args: unknown[]): unknown => tapReadErrors(fn.apply(t, args))
+          /* Same rule as the main proxy: a namespace method that hands back a
+           * client hands back a wrapped one. None does today; the rule is the
+           * point, not the current inventory. */
+          wrapped = (...args: unknown[]): unknown => wrapIfClient(fn.apply(t, args), kind)
         }
 
         perTarget.set(prop, wrapped)
@@ -1171,7 +1232,7 @@ function createFacade(options: OverlayFacadeOptions): {
           wrapped = (...args: unknown[]): unknown =>
             tapRead(fn.apply(t, args), requestedIdsFrom(args), authoritative)
         } else {
-          wrapped = (...args: unknown[]): unknown => tapReadErrors(fn.apply(t, args))
+          wrapped = (...args: unknown[]): unknown => wrapIfClient(fn.apply(t, args), kind)
         }
 
         perTarget.set(prop, wrapped)

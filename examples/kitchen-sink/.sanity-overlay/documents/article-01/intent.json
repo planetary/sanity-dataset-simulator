@@ -1,0 +1,31 @@
+{
+  "base": {
+    "publishedRevision": "V2rkHT6iCw5OR37gl8ZtfG",
+    "snapshotRef": "1d9bb293b1d4fa563677dbda88217fa00d460db463f77db5f8623961df9e8653"
+  },
+  "checksum": "4f2d9ab7e03730d7141cc3872ed085e81251f24cc98ede6bbcfea9dfd69cc142",
+  "conflicts": [],
+  "draft": {
+    "mode": "patch",
+    "overrides": [
+      {
+        "path": [
+          "title"
+        ],
+        "value": "Article 1 — OVERLAY EDIT ✅ 日本語"
+      }
+    ]
+  },
+  "formatVersion": 1,
+  "logicalId": "article-01",
+  "tombstones": {
+    "draft": false,
+    "published": false
+  },
+  "touchedPaths": [
+    [
+      "title"
+    ]
+  ],
+  "type": "article"
+}

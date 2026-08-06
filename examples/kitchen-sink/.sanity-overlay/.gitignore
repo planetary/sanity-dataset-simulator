@@ -1,0 +1,5 @@
+.runtime/
+.locks/
+.history/
+*.broken
+.tmp-*

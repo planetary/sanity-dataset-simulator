@@ -39,6 +39,7 @@ export {M_LOCAL_QUERIES} from './mLocalRegistry'
 
 export {createMemoryBaseSource} from './baseSource'
 export type {
+  AggregateRequest,
   BaseCandidateRequest,
   ExtendedCandidateRequest,
   PlannedCandidateRequest,
@@ -51,7 +52,7 @@ export type {OverlaySource} from './overlaySource'
 export {planCandidateRequests} from './planner'
 export type {CandidatePlanContext, CandidatePlanRequests} from './planner'
 
-export {analyzeDerefPaths, collectReferenceTargets} from './derefPaths'
+export {analyzeDerefPaths, collectReferenceTargets, derefChainDepth} from './derefPaths'
 export type {DerefPaths} from './derefPaths'
 
 export {evaluateOverlayQuery} from './evaluate'

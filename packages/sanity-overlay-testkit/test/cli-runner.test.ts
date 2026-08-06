@@ -11,7 +11,14 @@
 import {mkdir, readFile, writeFile} from 'node:fs/promises'
 import {join} from 'node:path'
 import {afterEach, describe, expect, it} from 'vitest'
-import {CLI_COMMANDS, EXIT, plural} from '../../sanity-overlay-cli/src/index'
+import {
+  CLI_COMMANDS,
+  COMMANDS_BEYOND_PRD,
+  EXIT,
+  PHASE_2_CLI_COMMANDS,
+  PRD_14_5_COMMANDS,
+  plural,
+} from '../../sanity-overlay-cli/src/index'
 import {
   cleanupOverlayFixtures,
   createOverlayFixture,
@@ -56,9 +63,42 @@ describe('counted labels', () => {
   })
 })
 
+/**
+ * ## Why the dispatched command set is not the §37 Phase 2 checklist
+ *
+ * This block used to pin `CLI_COMMANDS` at "exactly the ten PRD §37 Phase 2
+ * commands". That conflated two different lists in the PRD, and the conflation
+ * is what these tests now separate.
+ *
+ * - **§14.5 "Filesystem commands"** is the SPECIFIED command surface. It is a
+ *   fenced block naming fourteen commands, and `normalize --repair-checksums`
+ *   is one of them — spelled exactly that way, and used again verbatim in the
+ *   §29.4 checkpoint-commit recipe (`export` → `normalize --repair-checksums` →
+ *   `git add` → `git commit`).
+ * - **§37 Phase 2 "CLI"** is a PHASE TASK CHECKLIST. It selects ten of those
+ *   fourteen as the work of that phase. It is a schedule, not an inventory, and
+ *   it never claims to bound the CLI.
+ *
+ * So `normalize` is not an eleventh command anyone invented. Pinning the
+ * dispatcher to the §37 selection would have made the PRD's own §29.4 workflow
+ * un-runnable, which is the test failing the product rather than the reverse.
+ *
+ * Two §14.5 commands are still deliberately absent, and the test says so, so
+ * that "not built" stays distinguishable from "not noticed":
+ * `materialize` (§14.4 step 6 runs on every revalidation, so there is nothing
+ * for an operator to trigger yet) and `promotion-plan` (§37 Phase 8, superseded
+ * in full by §0.0 — the system never writes to Sanity).
+ *
+ * Anything the dispatcher exposes that §14.5 does NOT name has to be declared in
+ * `COMMANDS_BEYOND_PRD` with the §37 task it serves. That is the actual guard:
+ * not a count, but the requirement that a new verb be justified in a named list
+ * before it can be dispatched.
+ */
 describe('dispatch', () => {
-  it('exposes exactly the ten PRD §37 Phase 2 commands', () => {
-    expect([...CLI_COMMANDS].sort()).toEqual(
+  it('pins the §37 Phase 2 CLI checklist at exactly its ten commands', () => {
+    /* Unchanged, and deliberately so: this is the PRD's phase scope. Widening it
+     * would be a claim about the schedule, not about the CLI. */
+    expect([...PHASE_2_CLI_COMMANDS].sort()).toEqual(
       [
         'conflicts',
         'diff',
@@ -72,6 +112,51 @@ describe('dispatch', () => {
         'validate',
       ].sort(),
     )
+  })
+
+  it('dispatches every §37 Phase 2 command', () => {
+    for (const command of PHASE_2_CLI_COMMANDS) expect(CLI_COMMANDS).toContain(command)
+  })
+
+  it('treats §14.5 as the specified surface, and §37 Phase 2 as a selection from it', () => {
+    /* The relationship that makes `normalize` legitimate: the phase checklist is
+     * a strict subset of the specified surface. */
+    for (const command of PHASE_2_CLI_COMMANDS) expect(PRD_14_5_COMMANDS).toContain(command)
+    expect(PRD_14_5_COMMANDS.length).toBeGreaterThan(PHASE_2_CLI_COMMANDS.length)
+  })
+
+  it('dispatches `normalize` because PRD §14.5 and §29.4 name it, not as a new verb', () => {
+    expect(PRD_14_5_COMMANDS).toContain('normalize')
+    expect(CLI_COMMANDS).toContain('normalize')
+    /* And it is NOT one of the phase-checklist ten — that is the whole point. */
+    expect(PHASE_2_CLI_COMMANDS as readonly string[]).not.toContain('normalize')
+  })
+
+  it('names the §14.5 commands it does not dispatch instead of silently omitting them', () => {
+    const undispatched = PRD_14_5_COMMANDS.filter(
+      (command) => !(CLI_COMMANDS as readonly string[]).includes(command),
+    )
+    expect([...undispatched].sort()).toEqual(['materialize', 'promotion-plan'])
+  })
+
+  it('requires every command outside §14.5 to be declared with the task it serves', () => {
+    const undeclared = CLI_COMMANDS.filter(
+      (command) =>
+        !(PRD_14_5_COMMANDS as readonly string[]).includes(command) &&
+        COMMANDS_BEYOND_PRD[command as keyof typeof COMMANDS_BEYOND_PRD] === undefined,
+    )
+    expect(undeclared).toEqual([])
+  })
+
+  it('declares exactly the two §37 Phase 2 store tasks the PRD gives no command name for', () => {
+    /* "Local runtime history" and "Local cleanup" are Phase 2 Filesystem store
+     * tasks. The PRD mandates the capability and never names a verb for it, so
+     * these two ARE our deviation — a small one, and recorded here rather than
+     * discovered later in a diff. */
+    expect(Object.keys(COMMANDS_BEYOND_PRD).sort()).toEqual(['cleanup', 'history'])
+    for (const rationale of Object.values(COMMANDS_BEYOND_PRD)) {
+      expect(rationale).toMatch(/§37 Phase 2/)
+    }
   })
 
   it('--help lists every command and the exit-code table', async () => {

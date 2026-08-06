@@ -151,9 +151,55 @@ describe('commit — the three outcomes', () => {
     expect(result.outcome).toBe('degraded')
   })
 
-  it.each([401, 403])('treats HTTP %s as fatal and reports it as an auth failure', async (status) => {
+  /* ────────────────────────────────────────────────────────────────────────
+   * 401/403 — WHOSE "no" WAS IT?
+   *
+   * `onAuthFailure` drives `echo.noteAuthFailure`, which puts the session into
+   * `unauthenticated` — the "your Sanity credential is gone, stop writing" state.
+   *
+   * This transport, by construction, never talks to Sanity: `assertNoStagingWrite`
+   * refuses to build one whose `apiUrl` points at the Content Lake. So every
+   * 401/403 it sees came from OUR OWN overlay server, and treating that as a
+   * Sanity credential failure logged an editor out because our server said no.
+   *
+   * The discriminator is STRUCTURED ORIGIN, not status. An overlay-API 401/403 is
+   * a real Sanity auth signal only when the overlay explicitly says the failure
+   * came from upstream — it is the only party that knows.
+   * ──────────────────────────────────────────────────────────────────────── */
+
+  it.each([401, 403])(
+    'treats HTTP %s as fatal — it provably cannot land, whoever refused',
+    async (status) => {
+      const {fetch} = stubFetch(() => ({status, body: {ok: false, error: {message: 'nope'}}}))
+      const transport = createOverlayTransport({apiUrl: 'http://localhost:3998', fetch})
+      const result = await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
+      expect(result.outcome).toBe('fatal')
+    },
+  )
+
+  it.each([401, 403])(
+    'does NOT mark the session unauthenticated for an undeclared overlay-API %s',
+    async (status) => {
+      const auth: unknown[] = []
+      const {fetch} = stubFetch(() => ({status, body: {ok: false, error: {message: 'nope'}}}))
+      const transport = createOverlayTransport({
+        apiUrl: 'http://localhost:3998',
+        fetch,
+        onAuthFailure: (failure) => auth.push(failure),
+      })
+      await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
+      expect(auth).toEqual([])
+    },
+  )
+
+  it.each([
+    'OVERLAY_WRITE_BLOCKED',
+    'OVERLAY_ORIGIN_UNIMPLEMENTED',
+    'STAGING_WRITE_REFUSED',
+    'UNSUPPORTED_GROQ',
+  ])('never reports %s as an auth failure — it is this system’s own refusal', async (code) => {
     const auth: unknown[] = []
-    const {fetch} = stubFetch(() => ({status, body: {ok: false, error: {message: 'nope'}}}))
+    const {fetch} = stubFetch(() => ({status: 403, body: {ok: false, error: {code, message: 'no'}}}))
     const transport = createOverlayTransport({
       apiUrl: 'http://localhost:3998',
       fetch,
@@ -161,7 +207,96 @@ describe('commit — the three outcomes', () => {
     })
     const result = await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
     expect(result.outcome).toBe('fatal')
-    expect(auth).toEqual([{status, source: 'write', message: expect.stringContaining('nope')}])
+    expect(auth).toEqual([])
+  })
+
+  /**
+   * The other direction, which matters just as much: a REAL credential failure
+   * must still end the session. The overlay declares it, because only the
+   * overlay knows it proxied the call.
+   */
+  it.each([401, 403])(
+    'DOES mark the session unauthenticated when the overlay declares a Sanity-origin %s',
+    async (status) => {
+      const auth: unknown[] = []
+      const {fetch} = stubFetch(() => ({
+        status,
+        body: {ok: false, error: {origin: 'sanity', message: 'nope'}},
+      }))
+      const transport = createOverlayTransport({
+        apiUrl: 'http://localhost:3998',
+        fetch,
+        onAuthFailure: (failure) => auth.push(failure),
+      })
+      const result = await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
+      expect(result.outcome).toBe('fatal')
+      expect(auth).toEqual([{status, source: 'write', message: expect.stringContaining('nope')}])
+    },
+  )
+
+  it('accepts the origin declaration at the top level of the body too', async () => {
+    const auth: unknown[] = []
+    const {fetch} = stubFetch(() => ({
+      status: 401,
+      body: {ok: false, origin: 'sanity', error: {message: 'nope'}},
+    }))
+    const transport = createOverlayTransport({
+      apiUrl: 'http://localhost:3998',
+      fetch,
+      onAuthFailure: (failure) => auth.push(failure),
+    })
+    await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
+    expect(auth).toHaveLength(1)
+  })
+
+  /**
+   * STRUCTURED FIELDS ONLY, NEVER PROSE — the same standard `authStatusOf`
+   * already holds. An overlay error whose *message* mentions Sanity is still the
+   * overlay's own refusal.
+   */
+  it('does not read a Sanity origin out of prose', async () => {
+    const auth: unknown[] = []
+    const {fetch} = stubFetch(() => ({
+      status: 403,
+      body: {ok: false, error: {message: 'could not reach sanity origin upstream'}},
+    }))
+    const transport = createOverlayTransport({
+      apiUrl: 'http://localhost:3998',
+      fetch,
+      onAuthFailure: (failure) => auth.push(failure),
+    })
+    await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
+    expect(auth).toEqual([])
+  })
+
+  it('an OVERLAY_* code outranks a declared Sanity origin', async () => {
+    const auth: unknown[] = []
+    const {fetch} = stubFetch(() => ({
+      status: 403,
+      body: {ok: false, error: {code: 'OVERLAY_WRITE_BLOCKED', origin: 'sanity', message: 'no'}},
+    }))
+    const transport = createOverlayTransport({
+      apiUrl: 'http://localhost:3998',
+      fetch,
+      onAuthFailure: (failure) => auth.push(failure),
+    })
+    await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
+    expect(auth).toEqual([])
+  })
+
+  it('reports a declared Sanity-origin read failure with source "read"', async () => {
+    const auth: {source?: string}[] = []
+    const {fetch} = stubFetch(() => ({
+      status: 401,
+      body: {ok: false, error: {origin: 'sanity', message: 'nope'}},
+    }))
+    const transport = createOverlayTransport({
+      apiUrl: 'http://localhost:3998',
+      fetch,
+      onAuthFailure: (failure) => auth.push(failure),
+    })
+    await transport.state()
+    expect(auth[0]?.source).toBe('read')
   })
 
   it('surfaces the overlay’s own "unsupported" list instead of swallowing it', async () => {

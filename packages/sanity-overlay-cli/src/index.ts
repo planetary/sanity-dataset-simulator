@@ -2,7 +2,7 @@
  * `sanity-overlay-cli` — the local developer and agent CLI (roadmap Phase 3
  * "the CLI", PRD §37 Phase 2, §14.5, §29.4).
  *
- * Ten commands over the domain packages, and no domain of its own: every answer
+ * Commands over the domain packages, and no domain of its own: every answer
  * comes from `sanity-overlay-core` (invariants, merge, rebase, conflicts,
  * checkpoint), `sanity-overlay-store-fs` (the `.sanity-overlay/` layout) or
  * `sanity-overlay-query` (the registry and the pinned `groq-js` evaluator). The
@@ -17,7 +17,15 @@
  * Milestone note (PRD §1.4): `[M-LOCAL]` tooling. No milestone acceptance is
  * claimed by this package.
  */
-export {CLI_COMMANDS, CLI_NAME, CLI_VERSION, runCli} from './cli'
+export {
+  CLI_COMMANDS,
+  CLI_NAME,
+  CLI_VERSION,
+  COMMANDS_BEYOND_PRD,
+  PHASE_2_CLI_COMMANDS,
+  PRD_14_5_COMMANDS,
+  runCli,
+} from './cli'
 export type {CliCommand} from './cli'
 
 export {EXIT, EXIT_CODE_TABLE} from './exit'

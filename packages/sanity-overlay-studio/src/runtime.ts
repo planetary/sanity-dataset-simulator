@@ -56,9 +56,31 @@ export interface OverlayRuntime {
    * way an editor can know that is if something keeps the list.
    */
   reads(): readonly StudioReadRecord[]
+  /**
+   * What the READ path believes the branch holds, right now.
+   *
+   * "Is the branch even loaded?" is the first question in every diagnosis of a
+   * pane showing base content, and until this existed the only way to answer it
+   * was to re-derive `overlaySourceFromBranch` by hand from a `/state` response
+   * fetched separately. Addresses, not bodies: the question is membership.
+   */
+  branch(): OverlayBranchView
   subscribe(listener: () => void): () => void
   /** Poll the overlay API once, updating connection, revision and conflicts. */
   refresh(): Promise<void>
+}
+
+/** The branch as the read path sees it — {@link OverlayRuntime.branch}. */
+export interface OverlayBranchView {
+  /** Raw addresses (`drafts.x`, `x`) the branch owns a body for, sorted. */
+  documents: string[]
+  /** Raw addresses the branch has suppressed, sorted. */
+  tombstones: string[]
+  /** Raw addresses the overlay API reported a conflict on, sorted. */
+  conflicts: string[]
+  /** The overlay revision `/state` last reported, or `undefined` if never read. */
+  revision: number | undefined
+  connection: 'ok' | 'unreachable'
 }
 
 const MAX_MESSAGES = 50
@@ -237,6 +259,16 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
     conflicts: () => conflictReport,
     messages: () => messages.slice(),
     reads: () => readRecords.slice(),
+    branch: () => {
+      const view = overlaySource()
+      return {
+        documents: [...view.documents.keys()].sort(),
+        tombstones: [...view.tombstones].sort(),
+        conflicts: [...(view.conflicts ?? [])].sort(),
+        revision,
+        connection,
+      }
+    },
     subscribe: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)

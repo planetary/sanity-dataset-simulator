@@ -12,10 +12,13 @@
  * applied to both streams.
  */
 import {parseArgs} from 'node:util'
+import {runCleanup} from './commands/cleanup'
 import {runConflicts} from './commands/conflicts'
 import {runDiff} from './commands/diff'
 import {runExport, runImport} from './commands/checkpoint'
+import {runHistory} from './commands/history'
 import {runInspect} from './commands/inspect'
+import {runNormalize} from './commands/normalize'
 import {runQuery} from './commands/query'
 import {runRebase} from './commands/rebase'
 import {runReset} from './commands/reset'
@@ -31,8 +34,45 @@ import type {CommandContext, RunCliOptions} from './types'
 export const CLI_NAME = 'sanity-overlay'
 export const CLI_VERSION = '0.1.0'
 
-/** The PRD §37 Phase 2 command list, in the order the PRD gives them. */
-export const CLI_COMMANDS = Object.freeze([
+/**
+ * PRD §14.5 "Filesystem commands" — the SPECIFIED command surface, verbatim and
+ * in the order the fenced block gives it.
+ *
+ * This is the inventory. {@link PHASE_2_CLI_COMMANDS} below is a schedule that
+ * selects from it, and the two must not be confused: `normalize
+ * --repair-checksums` is named here and used again verbatim in the §29.4
+ * checkpoint-commit recipe, so a dispatcher pinned to the phase checklist would
+ * make the PRD's own documented workflow un-runnable.
+ *
+ * `materialize` and `promotion-plan` are named here and deliberately not
+ * dispatched — see {@link CLI_COMMANDS}.
+ */
+export const PRD_14_5_COMMANDS = Object.freeze([
+  'inspect',
+  'status',
+  'validate',
+  'materialize',
+  'normalize',
+  'diff',
+  'reset',
+  'rebase',
+  'conflicts',
+  'export',
+  'import',
+  'query',
+  'promotion-plan',
+] as const)
+
+/**
+ * The PRD §37 Phase 2 "CLI" checklist, verbatim and in the order the PRD gives
+ * it. These ten are what that checklist names — a strict subset of
+ * {@link PRD_14_5_COMMANDS}.
+ *
+ * A phase checklist bounds the WORK of a phase, not the CLI. Nothing may be
+ * removed from this list to make a schedule look met; nothing may be added to it
+ * to justify a new verb.
+ */
+export const PHASE_2_CLI_COMMANDS = Object.freeze([
   'inspect',
   'status',
   'validate',
@@ -43,6 +83,47 @@ export const CLI_COMMANDS = Object.freeze([
   'query',
   'export',
   'import',
+] as const)
+
+/**
+ * Commands this CLI dispatches that PRD §14.5 does NOT name, each mapped to the
+ * §37 Phase 2 task it exists to serve.
+ *
+ * These two are the real deviation, and they are small: the PRD mandates the
+ * capability as a Phase 2 "Filesystem store task" and simply never spells a verb
+ * for it. Recording the rationale beside the name means the next command cannot
+ * be added without writing down why — the guard is the justification, not a
+ * count.
+ */
+export const COMMANDS_BEYOND_PRD = Object.freeze({
+  history:
+    'PRD §37 Phase 2 Filesystem store tasks → "Local runtime history". The task is mandated; §14.5 names no verb for reading the local transaction log.',
+  cleanup:
+    'PRD §37 Phase 2 Filesystem store tasks → "Local cleanup", carrying §15.7 retention to fs mode. The task is mandated; §14.5 names no verb for it.',
+} as const)
+
+/**
+ * Every command the CLI dispatches.
+ *
+ * = the ten §37 Phase 2 commands
+ * + `normalize`, which §14.5 and §29.4 name directly and which is the §37 Phase 2
+ *   "Local UX" surface for "File parse error UI" and "Reset actions"
+ * + the {@link COMMANDS_BEYOND_PRD} pair.
+ *
+ * Two §14.5 commands are absent on purpose:
+ *
+ * - `materialize` — §14.4 step 6 materializes into `.runtime/materialized/` on
+ *   every revalidation, so there is no operator-triggered work left to expose.
+ *   A command that only re-ran an automatic step would imply the step is
+ *   optional.
+ * - `promotion-plan` — §37 Phase 8, superseded in full by §0.0. This system
+ *   never writes to a Sanity dataset, so there is no promotion to plan.
+ */
+export const CLI_COMMANDS = Object.freeze([
+  ...PHASE_2_CLI_COMMANDS,
+  'normalize',
+  'history',
+  'cleanup',
 ] as const)
 
 export type CliCommand = (typeof CLI_COMMANDS)[number]
@@ -103,6 +184,23 @@ const COMMAND_OPTIONS: Record<CliCommand, Record<string, unknown>> = {
     strict: {type: 'boolean'},
     'no-verify-checksum': {type: 'boolean'},
   },
+  normalize: {
+    'repair-checksums': {type: 'boolean'},
+    document: {type: 'string'},
+  },
+  history: {
+    document: {type: 'string'},
+    limit: {type: 'string'},
+    since: {type: 'string'},
+    order: {type: 'string'},
+    mutations: {type: 'boolean'},
+  },
+  cleanup: {
+    confirm: {type: 'boolean'},
+    'dry-run': {type: 'boolean'},
+    'keep-last': {type: 'string'},
+    'keep-after-revision': {type: 'string'},
+  },
 }
 
 const USAGE_SUMMARY: Record<CliCommand, string> = {
@@ -116,6 +214,10 @@ const USAGE_SUMMARY: Record<CliCommand, string> = {
   query: 'evaluate a REGISTERED query against the branch',
   export: 'write a checkpoint tree (--output) or a portable bundle (--bundle)',
   import: 'load a checkpoint tree (--input) or a portable bundle (--bundle)',
+  normalize:
+    're-run the §14.4 direct-edit checks; --repair-checksums recomputes stale ones',
+  history: 'the local overlay transaction log — what this branch did, in order',
+  cleanup: 'reclaim orphan artifacts and prune runtime growth (destructive — needs --confirm)',
 }
 
 function helpText(): string {
@@ -144,12 +246,15 @@ function helpText(): string {
   lines.push(
     '',
     'Notes',
-    '  reset and rebase never write without --confirm; both support --dry-run.',
+    '  reset, rebase and cleanup never write without --confirm; all support --dry-run.',
     '  query takes a registered query ID, not GROQ text (PRD §22.5, §5.5).',
     '  rebase and query need --base <file.json>: fs mode has no live base connection.',
+    '  validate measures and never writes; normalize is the repair half (PRD §14.5).',
     '  validate --checkpoint <dir> REJECTS repairable checksum divergence;',
     '  import repairs it by default (PRD §14.3, §29.7) unless given --strict.',
     '  export/import --bundle is lossless; --output/--input is the §29.1 review tree.',
+    '  history is the OVERLAY log, not Sanity History, and lives in gitignored',
+    '  .runtime/ — a fresh clone or a checkpoint import has none (PRD §14.1, §29.2).',
   )
   return lines.join('\n')
 }
@@ -240,6 +345,28 @@ async function dispatch(
         confirm: values.confirm === true,
         strict: values.strict === true,
         noVerifyChecksum: values['no-verify-checksum'] === true,
+      })
+    case 'normalize':
+      return runNormalize(ctx, {
+        repairChecksums: values['repair-checksums'] === true,
+        ...(typeof values.document === 'string' ? {document: values.document} : {}),
+      })
+    case 'history':
+      return runHistory(ctx, {
+        ...(typeof values.document === 'string' ? {document: values.document} : {}),
+        ...(typeof values.limit === 'string' ? {limit: values.limit} : {}),
+        ...(typeof values.since === 'string' ? {since: values.since} : {}),
+        ...(typeof values.order === 'string' ? {order: values.order} : {}),
+        mutations: values.mutations === true,
+      })
+    case 'cleanup':
+      return runCleanup(ctx, {
+        confirm: values.confirm === true,
+        dryRun: values['dry-run'] === true,
+        ...(typeof values['keep-last'] === 'string' ? {keepLast: values['keep-last']} : {}),
+        ...(typeof values['keep-after-revision'] === 'string'
+          ? {keepAfterRevision: values['keep-after-revision']}
+          : {}),
       })
     default: {
       const exhaustive: never = command

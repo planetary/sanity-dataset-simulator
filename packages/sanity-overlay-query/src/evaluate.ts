@@ -20,7 +20,7 @@
  */
 import {evaluate as evaluateGroq, parse as parseGroq} from 'groq-js'
 import type {QueryBaseSource} from './baseSource'
-import {analyzeDerefPaths, collectReferenceTargets} from './derefPaths'
+import {analyzeDerefPaths, collectReferenceTargets, derefChainDepth} from './derefPaths'
 import {OverlayQueryError} from './errors'
 import type {OverlaySource} from './overlaySource'
 import {resolveVirtualDocument} from './overlaySource'
@@ -51,6 +51,19 @@ export interface EvaluateOverlayQueryOptions {
   readonly perspective: QueryPerspective
   /** Serialise the candidate set to report its size. Off by default. */
   readonly measureBytes?: boolean
+}
+
+/**
+ * Recombine the two halves of an additive aggregate.
+ *
+ * `math::sum` is `null` over a sequence holding a non-numeric value, and that
+ * is a property of the WHOLE sequence — so a null in either half makes the
+ * whole null. Coercing it to a number here would invent a value GROQ itself
+ * would not return, which is the silent approximation §5.5 forbids.
+ */
+function combineAdditive(baseHalf: unknown, branchHalf: unknown): number | null {
+  if (typeof baseHalf !== 'number' || typeof branchHalf !== 'number') return null
+  return baseHalf + branchHalf
 }
 
 const now = (): number =>
@@ -102,6 +115,41 @@ export async function evaluateOverlayQuery<T = unknown>(
   const plan = planCandidateRequests(def, params, {affectedIds})
   const derefPaths = analyzeDerefPaths(tree)
 
+  /* 4b. The exactness PRECONDITIONS of the two pushdown plans.
+   *
+   * Both are checked against the parsed query rather than the registration,
+   * because the registration is a claim and the query text is the fact. Both
+   * refuse structurally; neither degrades into a wider fetch. */
+  if (plan.aggregateRequest && derefPaths.dereferences) {
+    // The base half decides membership from the BASE state while the branch is
+    // invisible to it. That is exact only while the filter reads LOCAL fields:
+    // a filter that traverses a reference gains and loses members when a TARGET
+    // is edited, so the two halves stop partitioning the virtual dataset and
+    // the sum is no longer the answer.
+    throw new OverlayQueryError(
+      'UNSUPPORTED_GROQ',
+      `Query ${def.id} is registered for aggregate pushdown but its filter dereferences. The ` +
+        `base half of the partition decides membership from the base state, so editing a ` +
+        `reference TARGET would move documents between the halves without the base knowing. ` +
+        `Refused rather than returning a recombined number that is not the answer (PRD §5.5).`,
+      {queryId: def.id, plan: 'aggregate', reason: 'filter-traverses-reference'},
+    )
+  }
+  if (def.candidatePlan.type === 'reverse-reference') {
+    const depth = derefChainDepth(tree)
+    if (depth > 1) {
+      throw new OverlayQueryError(
+        'UNSUPPORTED_GROQ',
+        `Query ${def.id} chains ${depth} dereference hops, but reverse-reference expansion ` +
+          `(§22.6 step 10) bounds the candidate set by the referrers of the touched documents, ` +
+          `which is complete for a SINGLE hop. A document whose ancestor at depth ${depth} was ` +
+          `edited references nothing the base half can see and would be missed. Refused rather ` +
+          `than returning an incomplete candidate set (PRD §5.5).`,
+        {queryId: def.id, plan: 'reverse-reference', reason: 'multi-hop-deref', derefDepth: depth},
+      )
+    }
+  }
+
   /* 5. Fetch base candidates.
    *
    * Core requests every adapter serves; extended requests only an adapter that
@@ -124,6 +172,28 @@ export async function evaluateOverlayQuery<T = unknown>(
     baseRequestCount++
     absorb(await base.fetchCandidates(request))
   }
+  /* 5a. The base half of an aggregate pushdown: ONE scalar, no documents.
+   *
+   * Refused when the adapter cannot serve it. The tempting fallback — fetch the
+   * type and aggregate locally — returns the RIGHT ANSWER while transferring
+   * everything, so no parity test could ever detect it, and that is exactly the
+   * silent degradation §22.2 forbids. */
+  let baseAggregate: number | null = null
+  if (plan.aggregateRequest) {
+    if (typeof base.fetchAggregate !== 'function') {
+      throw new OverlayQueryError(
+        'UNSUPPORTED_GROQ',
+        `Query ${def.id} plans an aggregate pushdown, which this base source does not implement ` +
+          `(QueryBaseSource.fetchAggregate is absent). Fetching the aggregated type and summing ` +
+          `it locally would return the right answer by transferring everything, which PRD §22.2 ` +
+          `forbids.`,
+        {queryId: def.id, aggregate: plan.aggregateRequest.aggregate},
+      )
+    }
+    baseRequestCount++
+    baseAggregate = await base.fetchAggregate(plan.aggregateRequest)
+  }
+
   for (const request of plan.extendedRequests) {
     if (typeof base.fetchExtendedCandidates !== 'function') {
       throw new OverlayQueryError(
@@ -211,11 +281,20 @@ export async function evaluateOverlayQuery<T = unknown>(
     ? dataset.reduce((total, doc) => total + JSON.stringify(doc).length, 0)
     : 0
 
-  /* 14. Evaluate the ORIGINAL query over the resolved candidate set. */
+  /* 14. Evaluate the ORIGINAL query over the resolved candidate set.
+   *
+   * Under an aggregate plan that candidate set is the BRANCH HALF of an exact
+   * partition, so the answer is the two halves ADDED. That is not
+   * post-processing a filtered result — which §22.2 forbids outright — because
+   * every document is aggregated in exactly one half and neither half is an
+   * approximation of the other. */
   let result: T
   try {
     const value = await evaluateGroq(tree, {dataset, params})
-    result = (await value.get()) as T
+    const branchHalf = (await value.get()) as T
+    result = plan.aggregateRequest
+      ? (combineAdditive(baseAggregate, branchHalf) as T)
+      : branchHalf
   } catch (cause) {
     throw new OverlayQueryError(
       'GROQ_EVALUATION_FAILED',

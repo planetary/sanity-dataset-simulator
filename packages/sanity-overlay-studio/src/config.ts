@@ -32,6 +32,7 @@
  */
 
 import {resolveOverlayDocumentActions} from './actions'
+import {installOverlayDevtools} from './devtools'
 import {filterHostedInspectors, filterHostedTools, overlayWorkspaceFeatureFlags} from './features'
 import {
   resolveOverlayOptions,
@@ -53,6 +54,12 @@ export interface DefineOverlayConfigOptions extends OverlayStudioOptions {
   fetch?: typeof fetch
   /** `studio.components.layout` — the status banner. Injected by the entry point. */
   layout?: unknown
+  /**
+   * Where `__SANITY_OVERLAY__` is installed. Defaults to `globalThis`, which is
+   * `window` in the Studio bundle. Injected so this module stays testable in
+   * Node and so a host can opt out by passing `null`.
+   */
+  devtoolsTarget?: unknown
 }
 
 function defaultEnv(): OverlayEnv {
@@ -98,7 +105,14 @@ export function overlayWorkspacePatch(
   workspace: Rec,
   options: DefineOverlayConfigOptions = {},
 ): OverlayWorkspacePatch {
-  const {env, createClient, fetch: fetchImpl, layout, ...studioOptions} = options
+  const {
+    env,
+    createClient,
+    fetch: fetchImpl,
+    layout,
+    devtoolsTarget,
+    ...studioOptions
+  } = options
   const resolved = resolveOverlayOptions(studioOptions, env ?? defaultEnv())
 
   if (!resolved.enabled) return {workspace, resolved, runtime: null}
@@ -124,6 +138,11 @@ export function overlayWorkspacePatch(
    * deliberately last-writer-wins so a multi-workspace config still resolves by
    * exact name first. */
   registerOverlayRuntime('*', runtime)
+
+  /* The instrument (`devtools.ts`). Installed only when the overlay is on — in
+   * `off` mode this function has already returned, so native Sanity is restored
+   * exactly, global included. */
+  installOverlayDevtools(runtime, devtoolsTarget === undefined ? globalThis : devtoolsTarget)
 
   const existingDocument = (
     typeof workspace.document === 'object' && workspace.document !== null

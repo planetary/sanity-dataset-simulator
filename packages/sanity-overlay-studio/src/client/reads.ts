@@ -57,7 +57,19 @@ import type {
 } from '../../../sanity-overlay-query/src/baseSource'
 import type {OverlaySource} from '../../../sanity-overlay-query/src/overlaySource'
 import type {QueryDocument} from '../../../sanity-overlay-query/src/types'
-import {deriveStudioReadPlan, evaluateStudioRead} from './readPlan'
+import {markOverlayRefusal} from './echo'
+import type {OverlayApproximation} from './findability'
+import {
+  deriveIncomingReferenceTargets,
+  incomingReferenceReadPlan,
+} from './incomingReferences'
+import {
+  perspectiveBaseSource,
+  perspectiveOverlaySource,
+  perspectivePlanRefusal,
+  readPerspective,
+} from './perspective'
+import {deriveStudioReadPlan, evaluateStudioRead, type StudioReadPlan} from './readPlan'
 import {createBranchCandidateSource} from './readSource'
 
 type Rec = Record<string, unknown>
@@ -77,6 +89,17 @@ export interface StudioReadRecord {
   readonly reason?: string
   /** Candidates the answer was evaluated over. Absent unless `overlay`. */
   readonly candidateCount?: number
+  /**
+   * The GROQ that was actually EVALUATED, when it is not {@link query}.
+   *
+   * A list pane's own query is rewritten before it can be planned at all — see
+   * `findability.ts`. §5.5 forbids silent approximation, and evaluating a
+   * different string from the one the caller wrote is exactly the kind of thing
+   * an operator must be able to see rather than deduce.
+   */
+  readonly rewrittenQuery?: string
+  /** Declared departures from the hosted answer. Absent when the answer is exact. */
+  readonly approximations?: readonly OverlayApproximation[]
   readonly at: number
 }
 
@@ -96,6 +119,10 @@ export class OverlayReadRefusedError extends Error {
     )
     this.name = 'OverlayReadRefusedError'
     this.query = query
+    /* This refusal travels back through `client.fetch`, and the facade observes
+     * every read error for a 401/403. It is OUR "no", not Sanity's — see
+     * `echo.ts` {@link isOverlayRefusal}. */
+    markOverlayRefusal(this)
   }
 }
 
@@ -265,14 +292,11 @@ function optionsRefusal(options: unknown): string | null {
   if (options === undefined || options === null) return null
   if (!isRec(options)) return null
 
-  const perspective = options.perspective
-  if (perspective !== undefined && perspective !== 'raw') {
-    return (
-      `the read asks for the ${JSON.stringify(perspective)} perspective. The overlay resolves ` +
-      `documents at their RAW addresses (\`drafts.x\` and \`x\` are two rows, PRD §13.9), so a ` +
-      `perspective the hosted API collapses server-side cannot be reproduced exactly here`
-    )
-  }
+  /* `perspective` is NOT here any more. It used to refuse outright, and because
+   * sanity 6.8.0 attaches one to every content read the structure tool makes
+   * (`PaneContainer-Bp8RN3ON.js:883`, `datastores-DqFH7RLd.js:910-913`) that
+   * refusal made the whole Studio branch-blind. `perspective.ts` answers the
+   * two collapsible perspectives exactly and refuses the rest. */
   if (options.resultSourceMap !== undefined && options.resultSourceMap !== false) {
     return (
       'the read asks for a Content Source Map, which the hosted API derives while it evaluates ' +
@@ -343,25 +367,64 @@ export function createStudioReader(options: StudioReaderOptions): StudioReadRout
     const optionsReason = optionsRefusal(request.options)
     if (optionsReason !== null) return degrade(query, optionsReason, overlay)
 
-    const derivation = deriveStudioReadPlan(request.query, params)
-    if (!derivation.supported) return degrade(query, derivation.reason, overlay)
+    const reading = readPerspective(isRec(request.options) ? request.options.perspective : undefined)
+    if ('refusal' in reading) return degrade(query, reading.refusal, overlay)
+    const {perspective} = reading
 
+    /* PRD §21.6 "Incoming references: Custom combined base plus overlay query".
+     * Tried FIRST, because the generic planner refuses this shape by design and
+     * would send it to staging — where a branch-created referring document does
+     * not exist. `incomingReferences.ts` states the boundary: it claims a query
+     * only when every `*[…]` in it is reference-filtered and nothing else in it
+     * is locally unanswerable, so nothing the generic planner handles better is
+     * taken away from it. */
     const startedAt = clock()
+    const incoming = deriveIncomingReferenceTargets(request.query, params)
+    let plan: StudioReadPlan
+    if (incoming.supported) {
+      try {
+        plan = await incomingReferenceReadPlan({
+          query,
+          targetIds: incoming.targetIds,
+          overlay,
+          baseFetch: request.baseFetch,
+        })
+      } catch (error) {
+        return degrade(query, (error as Error).message, overlay)
+      }
+    } else {
+      const derivation = deriveStudioReadPlan(request.query, params)
+      if (!derivation.supported) return degrade(query, derivation.reason, overlay)
+      plan = derivation.plan
+    }
+
+    const planReason = perspectivePlanRefusal(plan.definition.candidatePlan.type, perspective)
+    if (planReason !== null) return degrade(query, planReason, overlay)
+
+    /* Both halves collapse, or neither does. `resolveVirtualDocument` (§22.6
+     * steps 7, 13) reads the branch view and the candidate pool in the SAME
+     * address space, so a perspective applied to one and not the other would
+     * make a tombstone stop matching the row it suppresses. */
+    const readOverlay = perspectiveOverlaySource(overlay, perspective)
+
     try {
       const {result, diagnostics} = await evaluateStudioRead({
-        plan: derivation.plan,
+        plan,
         params,
-        overlay,
-        base: stagingBackedSource(
+        overlay: readOverlay,
+        perspective,
+        base: perspectiveBaseSource(
+          stagingBackedSource(overlay, plan.definition.maxCandidates, request.baseFetch),
           overlay,
-          derivation.plan.definition.maxCandidates,
-          request.baseFetch,
+          perspective,
         ),
       })
       record({
         query,
         outcome: 'overlay',
         candidateCount: diagnostics.candidateCount,
+        ...(plan.sourceQuery === undefined ? {} : {rewrittenQuery: plan.definition.query}),
+        ...(plan.approximations === undefined ? {} : {approximations: plan.approximations}),
         at: clock(),
       })
       return {

@@ -344,9 +344,26 @@ describe('§3 an unplannable read is passed through AND recorded', () => {
     expect(rigged.errors.filter((message) => message.includes(UNPLANNABLE))).toHaveLength(1)
   })
 
-  it('passes through a perspective the raw overlay cannot answer, and says so', async () => {
+  it('ANSWERS a `published` perspective exactly, rather than passing it through', async () => {
+    /* This assertion used to read the other way, and the behaviour it pinned is
+     * the defect reported on 2026-08-06: refusing every perspective made the
+     * whole Studio branch-blind, because sanity 6.8.0 attaches one to every
+     * content read the structure tool makes. `client/perspective.ts` collapses
+     * the candidate pool instead. The full case matrix is
+     * `studio-perspective-reads.test.ts`. */
     const rigged = rig()
     const rows = await fetchOf(rigged)(LIST_QUERY, {}, {perspective: 'published'})
+    /* Under `published`, drafts are not documents at all — so the two staging
+     * drafts that used to leak into this answer are correctly absent. */
+    expect(rows).toEqual([{_id: 'article-1', title: 'published one'}])
+    expect(rigged.records[0]?.outcome).toBe('overlay')
+  })
+
+  it('still passes through a perspective it cannot collapse, and says so', async () => {
+    const rigged = rig()
+    /* A release stack. PRD §32 degrades Releases in overlay mode, so the branch
+     * holds no release version and none can be enumerated. */
+    const rows = await fetchOf(rigged)(LIST_QUERY, {}, {perspective: ['rSummer', 'drafts']})
     expect(rows).toEqual([
       {_id: 'article-1', title: 'published one'},
       {_id: 'drafts.article-1', title: 'staging one'},

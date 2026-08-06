@@ -57,6 +57,7 @@ import type {
   QueryDocument,
   QueryPerspective,
 } from '../../../sanity-overlay-query/src/types'
+import {prepareFindabilityQuery, type OverlayApproximation} from './findability'
 import {createBranchCandidateSource} from './readSource'
 
 type Rec = Record<string, unknown>
@@ -130,6 +131,17 @@ export interface StudioReadPlan {
   planParams: Record<string, unknown>
   /** What the credential holder must fetch from staging (§22.6 step 5). */
   baseRequests: readonly BaseCandidateRequest[]
+  /**
+   * The caller's GROQ, when `definition.query` is NOT it.
+   *
+   * `findability.ts` rewrites two constructs the hosted API accepts and the
+   * pinned `groq-js` does not. Neither rewrite may be silent: an operator
+   * reading the ledger has to be able to see that the string that was evaluated
+   * is not the string they wrote (§5.5).
+   */
+  sourceQuery?: string
+  /** Declared departures from the hosted answer. Empty when the answer is exact. */
+  approximations?: readonly OverlayApproximation[]
 }
 
 export type StudioReadDerivation =
@@ -602,9 +614,22 @@ export function deriveStudioReadPlan(query: unknown, params?: unknown): StudioRe
   const callParams: Rec =
     typeof params === 'object' && params !== null && !Array.isArray(params) ? (params as Rec) : {}
 
+  /*
+   * Make the query answerable BEFORE planning, or refuse with a reason.
+   *
+   * A structure list pane's own GROQ ends in `[0...$__limit]` and calls
+   * `text::query`, neither of which the pinned `groq-js@2.0.0` accepts — so the
+   * query used to die here at `parse` and the pane fell through to staging,
+   * where a branch-created document does not exist. `findability.ts` rewrites
+   * only what it can prove sound, and refuses the rest by name.
+   */
+  const prepared = prepareFindabilityQuery(query, callParams)
+  if (!prepared.supported) return refuse(prepared.reason)
+  const planned = prepared.rewrite.query
+
   let tree: unknown
   try {
-    tree = parseGroq(query)
+    tree = parseGroq(planned)
   } catch (cause) {
     return refuse(`the query does not parse as GROQ: ${(cause as Error).message}`)
   }
@@ -687,13 +712,13 @@ export function deriveStudioReadPlan(query: unknown, params?: unknown): StudioRe
     planParams[SLUG_PLAN_PARAM] = only.value
   }
 
-  const checksum = queryTextChecksum(query)
+  const checksum = queryTextChecksum(planned)
   let definition: OverlayQueryDefinition
   try {
     definition = defineOverlayQuery({
       id: `studio:${checksum.slice(0, 16)}`,
       description: 'Studio-issued read, planned at call time by sanity-overlay-studio.',
-      query,
+      query: planned,
       queryChecksum: checksum,
       /* Studio is the only caller that reaches this path; `test` is here so the
        * suite can exercise the same registration without a second definition. */
@@ -722,7 +747,20 @@ export function deriveStudioReadPlan(query: unknown, params?: unknown): StudioRe
     return refuse(`the candidate plan could not be resolved: ${(error as Error).message}`)
   }
 
-  return {supported: true, plan: {definition, planParams, baseRequests}}
+  return {
+    supported: true,
+    plan: {
+      definition,
+      planParams,
+      baseRequests,
+      /* Declared only when it is actually true, so a ledger entry that carries
+       * `sourceQuery` always means the evaluated GROQ differs from the caller's. */
+      ...(planned === query ? {} : {sourceQuery: query}),
+      ...(prepared.rewrite.approximations.length > 0
+        ? {approximations: prepared.rewrite.approximations}
+        : {}),
+    },
+  }
 }
 
 /* ------------------------------------------------------------------ *

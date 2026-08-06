@@ -41,6 +41,49 @@ export {
 } from './stagingHost'
 export type {StagingWriteTarget} from './stagingHost'
 
+/**
+ * The preview write-impossibility controls, labelled by the layer that enforces
+ * them (see `docs/plans/evidence/phase-1/preview-write-impossibility.md`):
+ *
+ *   SERVER-ENFORCED   `previewWriteGuard` — the default-deny classifier, as a
+ *                     package export rather than an example-only `.mjs`, so a
+ *                     deployment's own origin can run the identical policy.
+ *   BROWSER-ENFORCED  `previewCsp` — the `connect-src` policy that confines the
+ *                     page to our origin, plus the validator that says whether
+ *                     a given policy actually closes the bypass.
+ *   BEST-EFFORT       `browserWriteBarrier` — patches the browser globals the
+ *                     Studio's own out-of-client egress uses. Defeatable in two
+ *                     lines; useful against accidents, not attackers.
+ */
+export {
+  ALLOWED_REALTIME_RPC_METHODS,
+  classifyPreviewRequest,
+  classifyRealtimeRpcMethod,
+  isPreviewWriteRequest,
+  normalizePreviewPath,
+} from './previewWriteGuard'
+export type {PreviewGuardRequest, PreviewGuardVerdict} from './previewWriteGuard'
+
+export {
+  SANITY_BROWSER_ORIGINS,
+  cspConnectSources,
+  cspPermitsSanityConnection,
+  parseCspDirectives,
+  previewCspDirectives,
+  previewCspHeaderValue,
+  previewSecurityHeaders,
+  serializeCspDirectives,
+} from './previewCsp'
+export type {CspDirectives, PreviewCspOptions} from './previewCsp'
+
+export {createBrowserWriteBarrier, installBrowserWriteBarrier} from './browserWriteBarrier'
+export type {
+  BrowserWriteBarrier,
+  BrowserWriteBarrierHandle,
+  BrowserWriteBarrierRequest,
+  BrowserWriteRefusal,
+} from './browserWriteBarrier'
+
 /* Branch-local asset delivery — the §24.7 route, transport-neutral (PRD §24.3 step 7). */
 export {createOverlayAssetDelivery} from './assets'
 export type {

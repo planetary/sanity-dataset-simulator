@@ -61,6 +61,7 @@ export {
   GITIGNORE_CONTENT,
   GITIGNORE_FILE,
   HISTORY_DIR,
+  IDEMPOTENCY_DIR,
   INDEXES_DIR,
   INTENT_FILE,
   LOCKS_DIR,
@@ -91,6 +92,13 @@ export type {
   FsOverlayStoreOptions,
   ImportCheckpointToStoreOptions,
   MaterializedDocumentFile,
+  OverlayHistoryArtifact,
+  OverlayHistoryEntry,
+  PrunedPointerRef,
+  PrunedTransactionRef,
+  PruneRuntimeHistoryOptions,
+  ReadHistoryOptions,
+  RuntimeHistoryPruneReport,
 } from './fsStore'
 
 /* Checkpoint directory I/O over core's checkpoint format (PRD §14.1, §29.1). */

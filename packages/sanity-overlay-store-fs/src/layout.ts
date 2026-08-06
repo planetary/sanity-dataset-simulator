@@ -40,6 +40,8 @@ export const MATERIALIZED_DIR = 'materialized'
 export const TRANSACTIONS_DIR = 'transactions'
 export const REVISIONS_DIR = 'revisions'
 export const INDEXES_DIR = 'indexes'
+/** `.runtime/indexes/idempotency/` — the §34.6 deduplication ledger. */
+export const IDEMPOTENCY_DIR = 'idempotency'
 export const LOCKS_DIR = '.locks'
 export const HISTORY_DIR = '.history'
 export const GITATTRIBUTES_FILE = '.gitattributes'
@@ -276,7 +278,11 @@ export class OverlayLayout {
   idempotencyPath(idempotencyKey: string): string {
     const key = encodeLogicalId(idempotencyKey)
     assertSafeComponent(key, 'idempotency key')
-    return this.resolve(RUNTIME_DIR, INDEXES_DIR, 'idempotency', `${key}.json`)
+    return this.resolve(RUNTIME_DIR, INDEXES_DIR, IDEMPOTENCY_DIR, `${key}.json`)
+  }
+
+  get idempotencyDir(): string {
+    return this.resolve(RUNTIME_DIR, INDEXES_DIR, IDEMPOTENCY_DIR)
   }
 
   /** Path relative to `.sanity-overlay/`, for stable refs in reports and errors. */

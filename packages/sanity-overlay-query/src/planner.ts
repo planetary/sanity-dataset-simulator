@@ -11,7 +11,7 @@
  * without a dataset.
  */
 import {OverlayQueryError} from './errors'
-import type {BaseCandidateRequest, ExtendedCandidateRequest} from './baseSource'
+import type {AggregateRequest, BaseCandidateRequest, ExtendedCandidateRequest} from './baseSource'
 import type {OverlayQueryDefinition} from './types'
 
 /**
@@ -46,6 +46,16 @@ export interface CandidatePlanRequests {
    * these — so the split cannot turn into a silent approximation.
    */
   readonly extendedRequests: readonly ExtendedCandidateRequest[]
+  /**
+   * The base half of an aggregate pushdown, answered with ONE NUMBER.
+   *
+   * Present only for the `aggregate` plan, and it replaces the document fetch
+   * rather than accompanying it: the whole point is that the base aggregates
+   * the untouched documents server-side so none of them crosses the wire. The
+   * candidate set that goes on to §22.6 step 14 is then the branch delta alone,
+   * and the two halves are added.
+   */
+  readonly aggregateRequest?: AggregateRequest
   /**
    * IDs that must be resolved virtually even when base returns nothing for
    * them — a branch-created document at a requested ID (§22.6 step 6).
@@ -224,6 +234,76 @@ export function planCandidateRequests(
             order: plan.order,
             limit: plan.sliceEnd,
             excludeIds: context.affectedIds,
+          },
+        ],
+        explicitIds: [],
+        overlayTypes: plan.types,
+      }
+    }
+
+    case 'aggregate': {
+      // The base half is "every document of these types the branch did NOT
+      // touch", so the touched set is not an optimisation here — it is what
+      // makes the two halves a PARTITION rather than two overlapping views.
+      // Defaulting it to empty would double-count every edited document.
+      if (!context) {
+        throw new OverlayQueryError(
+          'UNSUPPORTED_GROQ',
+          `Query ${def.id} uses the aggregate pushdown, whose base half must exclude every ` +
+            `document the branch touched (§22.6). It cannot be planned without that set: ` +
+            `assuming an empty branch would double-count every edited document.`,
+          {queryId: def.id},
+        )
+      }
+      if (plan.aggregate === 'sum' && (!plan.path || plan.path.length === 0)) {
+        throw new OverlayQueryError(
+          'UNSUPPORTED_GROQ',
+          `Query ${def.id} registers a sum aggregate without the path to the summed value.`,
+          {queryId: def.id},
+        )
+      }
+      return {
+        baseRequests: [],
+        extendedRequests: [],
+        aggregateRequest: {
+          aggregate: plan.aggregate,
+          types: plan.types,
+          path: plan.path,
+          excludeIds: context.affectedIds,
+        },
+        explicitIds: [],
+        // Step 6: the branch records of the type ARE the branch half.
+        overlayTypes: plan.types,
+      }
+    }
+
+    case 'reverse-reference': {
+      // §22.6 step 10. Same dependency as top-K and the aggregate: the second
+      // disjunct is "referrers of the touched documents", so without the
+      // touched set this plan would silently return only the base-state
+      // matches — an under-fetch, which is the one direction that loses
+      // documents from the answer.
+      if (!context) {
+        throw new OverlayQueryError(
+          'UNSUPPORTED_GROQ',
+          `Query ${def.id} uses reverse-reference expansion (§22.6 step 10), whose base fetch ` +
+            `asks for the referrers of the touched documents. It cannot be planned without the ` +
+            `set of touched document IDs: assuming an empty branch would miss every article ` +
+            `whose author the branch edited.`,
+          {queryId: def.id},
+        )
+      }
+      const value = requiredParam(def, params, plan.valueFromParam)
+      return {
+        baseRequests: [],
+        extendedRequests: [
+          {
+            kind: 'reverse-reference',
+            types: plan.types,
+            referencePath: plan.referencePath,
+            targetPath: plan.targetPath,
+            value,
+            touchedIds: context.affectedIds,
           },
         ],
         explicitIds: [],

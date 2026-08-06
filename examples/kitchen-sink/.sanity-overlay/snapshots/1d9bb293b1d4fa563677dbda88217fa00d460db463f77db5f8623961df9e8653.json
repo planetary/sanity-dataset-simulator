@@ -1,0 +1,84 @@
+{
+  "baseStatus": "present",
+  "draft": null,
+  "firstTouchedAt": "2026-08-04T22:42:12.806Z",
+  "formatVersion": 1,
+  "lastObservedPublishedRevision": "V2rkHT6iCw5OR37gl8ZtfG",
+  "published": {
+    "capturedAt": "2026-08-04T22:42:12.806Z",
+    "checksum": "094ed97a7331155a2eff6d83d753b9b56893d39ae4c0d18644d8219eaea39734",
+    "revision": "V2rkHT6iCw5OR37gl8ZtfG",
+    "snapshot": {
+      "_createdAt": "2026-01-01T12:00:00Z",
+      "_id": "article-01",
+      "_rev": "V2rkHT6iCw5OR37gl8ZtfG",
+      "_type": "article",
+      "_updatedAt": "2026-08-04T13:11:55Z",
+      "author": {
+        "_ref": "author-2",
+        "_type": "reference"
+      },
+      "body": [
+        {
+          "_key": "b-1-1",
+          "_type": "block",
+          "children": [
+            {
+              "_key": "s-1-1",
+              "_type": "span",
+              "marks": [],
+              "text": "Body of article 1 with a "
+            },
+            {
+              "_key": "s-1-2",
+              "_type": "span",
+              "marks": [
+                "m-1-1"
+              ],
+              "text": "link"
+            },
+            {
+              "_key": "s-1-3",
+              "_type": "inlineStat",
+              "label": "reads",
+              "value": 100
+            }
+          ],
+          "markDefs": [
+            {
+              "_key": "m-1-1",
+              "_type": "link",
+              "href": "https://example.com/1"
+            }
+          ],
+          "style": "normal"
+        }
+      ],
+      "publishedAt": "2026-02-02T12:00:00Z",
+      "related": [],
+      "sections": [
+        {
+          "_key": "sec-1-q",
+          "_type": "quoteSection",
+          "attribution": "Author 2",
+          "quote": "Quote in article 1"
+        },
+        {
+          "_key": "sec-1-s",
+          "_type": "statsSection",
+          "count": 1,
+          "heading": "Stats"
+        }
+      ],
+      "slug": {
+        "_type": "slug",
+        "current": "article-1"
+      },
+      "tags": [
+        "news",
+        "odd"
+      ],
+      "title": "Article 1"
+    }
+  }
+}

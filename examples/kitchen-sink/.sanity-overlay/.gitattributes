@@ -1,0 +1,2 @@
+.sanity-overlay/snapshots/** linguist-generated=true
+.sanity-overlay/.runtime/** export-ignore
