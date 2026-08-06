@@ -3,7 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "exports": {".": "./src/index.ts"},
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "test": "vitest run"
   },
@@ -11,6 +13,7 @@
     "groq-js": "2.0.0"
   },
   "devDependencies": {
+    "@types/node": "^22.20.1",
     "typescript": "5.9.3",
     "vitest": "4.1.10"
   }

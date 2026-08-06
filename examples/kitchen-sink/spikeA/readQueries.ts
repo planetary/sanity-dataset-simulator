@@ -113,8 +113,21 @@ const SLUG_PLAN_PARAM = '__spikeAFieldValue'
 
 /** The shapes a refusal message can point at as the alternative. */
 export const SUPPORTED_READ_SHAPES =
-  'a filter naming `_id` (== / in), or a `_type` constraint, optionally with a local ' +
-  'field equality — projections, slices, array wrappers and dereferences are then free'
+  'a filter naming `_id` (== / in), a `sanity::versionOf(<id>)` version set, or a `_type` ' +
+  'constraint optionally with a local field equality — projections, slices, array wrappers ' +
+  'and dereferences are then free'
+
+/**
+ * The note a version-set plan carries into `/query/plan` (PRD §22.5 wants the
+ * caller able to record what it is trusting). See {@link releaseNamespaceReason}
+ * for why the boundary sits where it does.
+ */
+export const VERSION_SET_NOTE =
+  'sanity::versionOf is resolved exactly for the draft/published version set — `<id>` and ' +
+  '`drafts.<id>`, both of which the overlay knows authoritatively, branch-created drafts ' +
+  'and tombstones included. Release versions (`versions.<release>.<id>`) are outside it: ' +
+  'PRD §32 degrades Releases in overlay mode, so the overlay holds none, and a query that ' +
+  'names that namespace is refused rather than half-answered.'
 
 /* ------------------------------------------------------------------ *
  * Result types
@@ -231,11 +244,62 @@ function refuse(reason: string): ReadQueryDerivation {
 }
 
 /**
+ * An ID — or an ID pattern — inside the hosted Releases namespace.
+ *
+ * THE ONE PRODUCT BOUNDARY THIS MODULE DRAWS, stated once so it is auditable.
+ * `groq-js@2.0.0` matches `sanity::versionOf(X)` against exactly three ID shapes:
+ * `X`, `drafts.X` and `versions.<release>.X`. The first two are a two-element ID
+ * set a `{kind: 'ids'}` base request selects in full, so a version set over them
+ * is *provably* complete. The third is not enumerable by any request shape in
+ * `baseSource.ts` — it needs an ID-PATTERN selection, which is exactly the
+ * request kind `path()` is refused for.
+ *
+ * Excluding it is nonetheless sound rather than an approximation, because PRD
+ * §32 degrades Releases in overlay mode (the Studio plugin disables the tool),
+ * so the overlay holds no release-version document and none can be created
+ * through it. What would NOT be sound is answering a query that actually names
+ * the namespace: the result would be a silent subset of the hosted one, which
+ * §5.5 forbids. So the boundary is one-sided — excluded when unmentioned,
+ * refused when mentioned.
+ */
+const RELEASE_VERSION_ID = /^versions\./
+
+function releaseNamespaceReason(what: string): string {
+  return (
+    `${what} names the release-version namespace \`versions.<release>.<id>\`. Releases are ` +
+    'degraded in overlay mode (PRD §32), so the overlay holds no release-version document, ' +
+    'and no base request shape can enumerate that namespace — selecting it needs an ' +
+    'ID-pattern request. Answering the rest would hand back a silent subset of the hosted ' +
+    'result (PRD §5.5), so the query is refused instead'
+  )
+}
+
+/**
+ * `sanity::versionOf(…)`, wherever it sits in the tree.
+ *
+ * Deliberately NOT a type predicate: callers pass an already-`Node` conjunct,
+ * and `node is Node` would narrow the negative branch to `never` and hide every
+ * subsequent field access behind a type error.
+ */
+function isVersionOfCall(node: unknown): boolean {
+  return (
+    isNode(node) &&
+    node.type === 'FuncCall' &&
+    node.namespace === 'sanity' &&
+    node.name === 'versionOf'
+  )
+}
+
+/**
  * Functions whose evaluation or whose selection this layer cannot honour.
  *
  * These are refusals of *completeness*, not of syntax — each one names a set of
  * documents no `BaseCandidateRequest` can enumerate, so a locally evaluated
  * answer would be missing rows without saying so.
+ *
+ * `sanity::versionOf` is deliberately absent: its draft/published version set IS
+ * enumerable, so it is planned by {@link versionSetOf} instead. A `versionOf`
+ * the planner cannot read is caught in `deriveReadQuery`, not here.
  */
 function deniedFunction(node: Node): string | null {
   const namespace = typeof node.namespace === 'string' ? node.namespace : 'global'
@@ -255,14 +319,12 @@ function deniedFunction(node: Node): string | null {
       'the index would have found'
     )
   }
+  if (namespace === 'releases') {
+    return releaseNamespaceReason(`releases::${name}, which enumerates release documents,`)
+  }
   if (namespace === 'sanity') {
-    if (name === 'versionOf') {
-      return (
-        'sanity::versionOf selects the release-version namespace (`versions.<release>.<id>`), ' +
-        'whose members cannot be enumerated by an ID or type request, so no base fetch can ' +
-        'prove the candidate set complete'
-      )
-    }
+    if (name === 'versionOf') return null
+    if (name === 'partOfRelease') return releaseNamespaceReason(`sanity::${name}`)
     return `sanity::${name} is a hosted dataset function with no local candidate plan`
   }
   return null
@@ -306,6 +368,79 @@ function operandLabel(node: unknown): string {
 }
 
 /**
+ * The version set of one `sanity::versionOf(X)` conjunct: `X` and `drafts.X`.
+ *
+ * PROVABLY COMPLETE, and this is the whole argument. The predicate's matching
+ * IDs are `X`, `drafts.X` and `versions.<release>.X` (see
+ * {@link RELEASE_VERSION_ID}). The pair returned here is selected in full by one
+ * `{kind: 'ids'}` base request, and — decisively — the OVERLAY knows both
+ * addresses authoritatively rather than inferring them: `evaluate.ts` admits
+ * them through `explicitIds`, so a branch-created `drafts.X` staging has never
+ * held is a candidate, and `resolveVirtualDocument` drops a tombstoned one. The
+ * release third is the documented boundary above.
+ *
+ * The pair is a candidate SET, not an answer: `groq-js` re-evaluates the real
+ * `versionOf` predicate over it at step 14, so a query naming two logical
+ * documents does not leak one's versions into the other's row.
+ */
+function versionSetOf(node: Node, params: Rec): string[] {
+  const args = node.args
+  const resolved = operandValue(Array.isArray(args) ? args[0] : undefined, params)
+
+  if (resolved === null) {
+    fail(
+      'sanity::versionOf(…) needs a document ID resolvable *before* the base fetch — a ' +
+        'literal or a query parameter. An argument read off the row being filtered ' +
+        '(`_id`, `^._id`) is only known during evaluation, so the version set cannot be ' +
+        'planned and the candidate request would have to be the whole dataset',
+    )
+  }
+  if ('missing' in resolved) {
+    fail(
+      `parameter $${resolved.missing} was not supplied, so the sanity::versionOf version set ` +
+        'cannot be resolved — guessing one would be a silent approximation',
+    )
+  }
+
+  const logicalId = resolved.value
+  if (typeof logicalId !== 'string' || logicalId.length === 0) {
+    fail(
+      `sanity::versionOf was given ${JSON.stringify(logicalId ?? null)}, which is not a ` +
+        'document ID, so its version set cannot be resolved exactly',
+    )
+  }
+  if (RELEASE_VERSION_ID.test(logicalId)) {
+    fail(releaseNamespaceReason('the sanity::versionOf argument'))
+  }
+  if (SYSTEM_ID.test(logicalId)) {
+    fail(`document ID ${JSON.stringify(logicalId)} is in a system namespace no base fetch returns`)
+  }
+
+  return [logicalId, `drafts.${logicalId}`]
+}
+
+/**
+ * `_id match "versions.*"` and friends.
+ *
+ * A `match` only ever NARROWS, so the planner is otherwise free to ignore it —
+ * but a pattern aimed at the release-version namespace is a query asking for
+ * documents the overlay has decided not to hold. Answering it would be the
+ * silent subset {@link releaseNamespaceReason} exists to prevent.
+ */
+function guardIdPattern(node: Node, params: Rec): void {
+  const path = attributePath(node.left)
+  if (path === null || path.length !== 1 || path[0] !== '_id') return
+  const resolved = operandValue(node.right, params)
+  if (resolved === null || 'missing' in resolved) return
+  const patterns = stringsOf(resolved.value)
+  if (patterns === null) return
+  const release = patterns.find((pattern) => RELEASE_VERSION_ID.test(pattern))
+  if (release !== undefined) {
+    fail(releaseNamespaceReason(`the \`_id match ${JSON.stringify(release)}\` pattern`))
+  }
+}
+
+/**
  * Read one `*[…]` filter as a candidate constraint.
  *
  * Only top-level conjuncts are read, and only to *narrow*: an unread conjunct
@@ -322,8 +457,20 @@ function constraintOf(expr: unknown, params: Rec): Constraint | null {
   let field: {path: string[]; value: unknown} | null = null
 
   for (const conjunct of conjuncts) {
+    /* §22.6 step 4 for the version set. Read as an ID constraint, so it composes
+     * with a plain `_id` set in the same query and needs no second plan type. */
+    if (isVersionOfCall(conjunct)) {
+      const versions = versionSetOf(conjunct, params)
+      ids = ids === null ? versions : [...ids, ...versions]
+      continue
+    }
+
     if (conjunct.type !== 'OpCall') continue
     const op = conjunct.op
+    if (op === 'match') {
+      guardIdPattern(conjunct, params)
+      continue
+    }
     if (op !== '==' && op !== 'in') continue
 
     const path = attributePath(conjunct.left)
@@ -344,6 +491,10 @@ function constraintOf(expr: unknown, params: Rec): Constraint | null {
           `${operandLabel(conjunct.right)} is not a document ID (or list of them), so the ` +
             '`_id` candidate set cannot be resolved exactly',
         )
+      }
+      const release = values.find((id) => RELEASE_VERSION_ID.test(id))
+      if (release !== undefined) {
+        fail(releaseNamespaceReason(`document ID ${JSON.stringify(release)}`))
       }
       const system = values.find((id) => SYSTEM_ID.test(id))
       if (system !== undefined) {
@@ -478,15 +629,37 @@ export function deriveReadQuery(query: unknown, params?: unknown): ReadQueryDeri
    * query call anything whose selection cannot be enumerated locally. */
   const filtered = new Set<unknown>()
   const filters: unknown[] = []
+  /* Every `sanity::versionOf` the planner will actually READ. `constraintOf`
+   * reads top-level conjuncts of a `*[…]` filter and nothing else, so a
+   * versionOf anywhere else contributes no candidates — and planning around it
+   * would answer a strict subset of the hosted result without saying so. */
+  const plannableVersionOf = new Set<unknown>()
   let denied: string | null = null
   walk(tree, (node) => {
     if (node.type === 'Filter' && isNode(node.base) && node.base.type === 'Everything') {
       filtered.add(node.base)
       filters.push(node.expr)
+      for (const conjunct of conjunctsOf(node.expr)) {
+        if (isVersionOfCall(conjunct)) plannableVersionOf.add(conjunct)
+      }
     }
     if (node.type === 'FuncCall' && denied === null) denied = deniedFunction(node)
   })
   if (denied !== null) return refuse(denied)
+
+  let strayVersionOf = false
+  walk(tree, (node) => {
+    if (isVersionOfCall(node) && !plannableVersionOf.has(node)) strayVersionOf = true
+  })
+  if (strayVersionOf) {
+    return refuse(
+      'this query calls `sanity::versionOf` somewhere the candidate planner does not read it ' +
+        '— under a `||`, or nested so it is not a top-level conjunct of its `*[…]` filter. ' +
+        'The version set would then contribute no candidates and the answer would be a ' +
+        'silent subset of the hosted one. Answerable instead: ' +
+        SUPPORTED_READ_SHAPES,
+    )
+  }
 
   /* Pass 2: an `Everything` that is not filtered is the whole dataset. */
   let unconstrained = false
@@ -550,6 +723,9 @@ export function deriveReadQuery(query: unknown, params?: unknown): ReadQueryDeri
       maxCandidates: ceilingFor(plan),
       maxReferenceDepth: SPIKE_A_MAX_REFERENCE_DEPTH,
       status: 'tier-a',
+      /* Only a plan that actually resolved a version set makes the release
+       * claim. A note stamped on every plan is a note nobody reads. */
+      ...(plannableVersionOf.size > 0 ? {notes: VERSION_SET_NOTE} : {}),
     })
   } catch (error) {
     return refuse(`the query could not be registered: ${(error as Error).message}`)

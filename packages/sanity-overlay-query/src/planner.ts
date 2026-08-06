@@ -14,6 +14,21 @@ import {OverlayQueryError} from './errors'
 import type {BaseCandidateRequest} from './baseSource'
 import type {OverlayQueryDefinition} from './types'
 
+/**
+ * What the planner needs to know about the BRANCH, and nothing more.
+ *
+ * §22.6's bounded top-K rule is stated as `baseFetchCount = requestedEnd +
+ * affectedCount`, so a top-K plan is not a function of the registration and the
+ * parameters alone — it also depends on how many documents the branch touched.
+ * That dependency is made explicit here rather than by handing the planner an
+ * overlay it could read anything out of: the only fact it receives is the set
+ * of touched IDs.
+ */
+export interface CandidatePlanContext {
+  /** Every ID the branch touched: overlay records and tombstones alike. */
+  readonly affectedIds: readonly string[]
+}
+
 export interface CandidatePlanRequests {
   /** Base fetches to issue (§22.6 step 5). */
   readonly baseRequests: readonly BaseCandidateRequest[]
@@ -33,24 +48,65 @@ export interface CandidatePlanRequests {
   readonly overlayTypes: readonly string[]
 }
 
-/** Read a parameter as a document ID, rejecting values that cannot be one. */
-function idParam(def: OverlayQueryDefinition, params: Record<string, unknown>, name: string): string {
+/**
+ * Read a parameter as document IDs, rejecting values that cannot be any.
+ *
+ * A parameter may carry ONE ID (`*[_id == $id]`) or a LIST of them
+ * (`*[_id in $ids]`, the single most common Studio shape). Both are equally
+ * enumerable — the base request transfers exactly the IDs named, whether they
+ * arrived through one parameter or several — so restricting the parameter to a
+ * scalar bought no boundedness and cost the `in` shape its template plan.
+ * Boundedness is still decided where it belongs: `maxCandidates` caps the
+ * resolved set in `evaluate.ts` (§22.9), so a caller who passes a thousand IDs
+ * to a query registered for one gets `CANDIDATE_LIMIT_EXCEEDED`, not a scan.
+ *
+ * What stays refused is the dangerous shape: an ABSENT or malformed parameter.
+ * "No ID supplied, so fetch everything" is the failure mode §5.5 forbids.
+ */
+function idsParam(
+  def: OverlayQueryDefinition,
+  params: Record<string, unknown>,
+  name: string,
+): string[] {
   const value = params[name]
-  if (typeof value !== 'string' || value.length === 0) {
+  const isId = (candidate: unknown): candidate is string =>
+    typeof candidate === 'string' && candidate.length > 0
+
+  if (isId(value)) return [value]
+  if (Array.isArray(value) && value.every(isId)) return [...value]
+
+  throw new OverlayQueryError(
+    'UNSUPPORTED_GROQ',
+    `Query ${def.id} plans candidates from parameter ${JSON.stringify(name)}, which must be a ` +
+      `non-empty string document ID or an array of them; received ` +
+      `${JSON.stringify(value ?? null)}. Guessing a candidate set from an absent parameter ` +
+      `would be a silent approximation (PRD §5.5).`,
+    {queryId: def.id, parameter: name, received: value ?? null},
+  )
+}
+
+/** Read a parameter that must be present, rejecting an absent one loudly. */
+function requiredParam(
+  def: OverlayQueryDefinition,
+  params: Record<string, unknown>,
+  name: string,
+): unknown {
+  if (params[name] === undefined) {
     throw new OverlayQueryError(
       'UNSUPPORTED_GROQ',
-      `Query ${def.id} plans candidates from parameter ${JSON.stringify(name)}, which must be a ` +
-        `non-empty string document ID; received ${JSON.stringify(value ?? null)}. Guessing a ` +
-        `candidate set from an absent parameter would be a silent approximation (PRD §5.5).`,
-      {queryId: def.id, parameter: name, received: value ?? null},
+      `Query ${def.id} plans candidates from parameter ${JSON.stringify(name)}, which was not ` +
+        `supplied. Widening the candidate set to cover a missing parameter would be a silent ` +
+        `approximation (PRD §5.5).`,
+      {queryId: def.id, parameter: name},
     )
   }
-  return value
+  return params[name]
 }
 
 export function planCandidateRequests(
   def: OverlayQueryDefinition,
   params: Record<string, unknown>,
+  context?: CandidatePlanContext,
 ): CandidatePlanRequests {
   const plan = def.candidatePlan
   switch (plan.type) {
@@ -62,7 +118,7 @@ export function planCandidateRequests(
       )
 
     case 'ids': {
-      const ids = plan.idsFromParams.map((name) => idParam(def, params, name))
+      const ids = plan.idsFromParams.flatMap((name) => idsParam(def, params, name))
       return {baseRequests: [{kind: 'ids', ids}], explicitIds: ids, overlayTypes: []}
     }
 
@@ -74,21 +130,77 @@ export function planCandidateRequests(
       }
 
     case 'slug': {
-      const value = params[plan.valueFromParam]
-      if (value === undefined) {
-        throw new OverlayQueryError(
-          'UNSUPPORTED_GROQ',
-          `Query ${def.id} plans candidates from parameter ` +
-            `${JSON.stringify(plan.valueFromParam)}, which was not supplied.`,
-          {queryId: def.id, parameter: plan.valueFromParam},
-        )
-      }
+      const value = requiredParam(def, params, plan.valueFromParam)
       // PRD §22.7: "exact slug-filtered pages plus all overlaid page documents".
       // The predicate reads a LOCAL field, so the base can answer it exactly;
       // the branch delta covers everything the base could not have known about.
       return {
         baseRequests: [
           {kind: 'field-equality', types: plan.types, path: plan.path, value},
+        ],
+        explicitIds: [],
+        overlayTypes: plan.types,
+      }
+    }
+
+    case 'field-contains': {
+      const value = requiredParam(def, params, plan.valueFromParam)
+      // Array membership over a LOCAL array: same exactness argument as `slug`.
+      return {
+        baseRequests: [{kind: 'field-contains', types: plan.types, path: plan.path, value}],
+        explicitIds: [],
+        overlayTypes: plan.types,
+      }
+    }
+
+    case 'references': {
+      const value = requiredParam(def, params, plan.idFromParam)
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new OverlayQueryError(
+          'UNSUPPORTED_GROQ',
+          `Query ${def.id} plans candidates from parameter ` +
+            `${JSON.stringify(plan.idFromParam)}, which must be a non-empty document ID; ` +
+            `received ${JSON.stringify(value ?? null)}. §22.3 admits references() for FINITE ` +
+            `ids only.`,
+          {queryId: def.id, parameter: plan.idFromParam, received: value ?? null},
+        )
+      }
+      return {
+        baseRequests: [{kind: 'references', types: plan.types, id: value}],
+        explicitIds: [],
+        overlayTypes: plan.types,
+      }
+    }
+
+    case 'top-k': {
+      if (!context) {
+        // §22.6's own formula depends on `affectedCount`. Defaulting it to zero
+        // would silently under-fetch the moment a branch existed, which is the
+        // one failure mode candidate planning must never have, so this refuses
+        // rather than guesses.
+        throw new OverlayQueryError(
+          'UNSUPPORTED_GROQ',
+          `Query ${def.id} uses the bounded top-K plan, whose base fetch depends on the branch ` +
+            `delta (§22.6). It cannot be planned without the set of touched document IDs.`,
+          {queryId: def.id},
+        )
+      }
+      if (!(plan.sliceEnd > 0) || plan.order.length === 0) {
+        throw new OverlayQueryError(
+          'UNSUPPORTED_GROQ',
+          `Query ${def.id} registers a top-K plan without a positive slice end and an order.`,
+          {queryId: def.id},
+        )
+      }
+      return {
+        baseRequests: [
+          {
+            kind: 'order-slice',
+            types: plan.types,
+            order: plan.order,
+            limit: plan.sliceEnd,
+            excludeIds: context.affectedIds,
+          },
         ],
         explicitIds: [],
         overlayTypes: plan.types,

@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM"],
+    "baseUrl": ".",
+    "paths": {
+      "react": [
+        "../../node_modules/.pnpm/@types+react@19.2.18/node_modules/@types/react",
+        "../../examples/kitchen-sink/node_modules/react"
+      ],
+      "react/*": ["../../examples/kitchen-sink/node_modules/react/*"],
+      "sanity": ["../../examples/kitchen-sink/node_modules/sanity"],
+      "sanity/*": ["../../examples/kitchen-sink/node_modules/sanity/*"],
+      "@sanity/client": ["../../examples/kitchen-sink/node_modules/@sanity/client"]
+    }
+  },
+  "include": ["src"]
+}

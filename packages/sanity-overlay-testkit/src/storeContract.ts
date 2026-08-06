@@ -14,14 +14,25 @@
  */
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {
+  CHECKPOINT_CHECKSUMS_FILE,
+  CHECKPOINT_MANIFEST_FILE,
   OVERLAY_FORMAT_VERSION,
+  checkpointFilesToRecord,
+  checkpointIntentPath,
+  checkpointStateFromBundle,
   checksum,
+  exportCheckpoint,
+  importCheckpoint,
   isOverlayStoreError,
+  parse,
+  sha256Hex,
   syntheticRev,
+  verifyCheckpoint,
 } from '../../sanity-overlay-core/src/index'
 import type {
   OverlayActor,
   OverlayCanonicalBundle,
+  OverlayCheckpointChecksums,
   OverlayConflict,
   OverlayDocumentRecord,
   OverlayStore,
@@ -766,6 +777,33 @@ export function runStoreContractSuite(name: string, makeStore: StoreContractFact
         exportedAt: '',
         checksum: '',
       })
+
+      /* The same state renders to the Git-facing checkpoint tree (PRD §29.1).
+       * Rendering is core's, so this holds for every adapter — and it is the
+       * *whole-checkpoint* granularity §34.17 asks for, not just per file. */
+      const checkpoint = exportCheckpoint(checkpointStateFromBundle(bundle))
+      expect([...checkpoint.keys()]).toEqual(
+        [
+          CHECKPOINT_CHECKSUMS_FILE,
+          CHECKPOINT_MANIFEST_FILE,
+          checkpointIntentPath('article-1'),
+          checkpointIntentPath('article-2'),
+          ...Object.keys(bundle.snapshots).map((address) => `snapshots/${address}.json`),
+        ].sort(),
+      )
+      expect(checkpointFilesToRecord(exportCheckpoint(checkpointStateFromBundle(again)))).toEqual(
+        checkpointFilesToRecord(checkpoint),
+      )
+
+      /* The checksum manifest hashes the exact bytes of every other file. */
+      const checksums = parse(
+        checkpoint.get(CHECKPOINT_CHECKSUMS_FILE)!,
+      ) as OverlayCheckpointChecksums
+      for (const [path, text] of checkpoint) {
+        if (path === CHECKPOINT_CHECKSUMS_FILE) continue
+        expect(checksums.files[path], path).toBe(sha256Hex(text))
+      }
+      expect(verifyCheckpoint(checkpoint).ok).toBe(true)
     })
 
     /* ---------------------------------------------------------- 11 */
@@ -830,6 +868,40 @@ export function runStoreContractSuite(name: string, makeStore: StoreContractFact
       }
       const peerTwo = await makePeer()
       await expectStoreError(() => peerTwo.store.importCanonical(tampered), 'CHECKSUM_MISMATCH')
+
+      /* The checkpoint tree round-trips the same logical state and re-renders
+       * byte-identically, for every adapter (PRD §29.7, §34.17). */
+      const checkpoint = exportCheckpoint(checkpointStateFromBundle(bundle))
+      const reimported = importCheckpoint(checkpoint)
+      expect(reimported.repaired).toEqual([])
+      expect(reimported.state.manifest).toEqual(bundle.manifest)
+      expect(reimported.state.documents).toEqual(
+        bundle.documents.map((entry) => entry.intent),
+      )
+      expect(reimported.state.snapshots).toEqual(bundle.snapshots)
+      expect(checkpointFilesToRecord(reimported.files)).toEqual(
+        checkpointFilesToRecord(checkpoint),
+      )
+
+      /* A hand edit that leaves the file valid is repairable metadata, never a
+       * rejection (PRD §14.3); a violated content address is not. */
+      const edited = new Map(checkpoint)
+      const intentRefPath = checkpointIntentPath('article-1')
+      edited.set(intentRefPath, edited.get(intentRefPath)!.replace('"One"', '"Hand edited"'))
+      const editedReport = verifyCheckpoint(edited)
+      expect(editedReport.corrupt).toEqual([])
+      expect(editedReport.repairable.map((issue) => issue.ref)).toContain(intentRefPath)
+      expect(importCheckpoint(edited).repaired).toContain(intentRefPath)
+
+      const snapshotAddress = Object.keys(bundle.snapshots)[0]!
+      const damaged = new Map(checkpoint)
+      damaged.set(
+        `snapshots/${snapshotAddress}.json`,
+        damaged.get(`snapshots/${snapshotAddress}.json`)!.replace('base body', 'tampered body'),
+      )
+      expect(verifyCheckpoint(damaged).corrupt.map((issue) => issue.kind)).toContain(
+        'content-address-mismatch',
+      )
     })
 
     /* ---------------------------------------------------------- 12 */

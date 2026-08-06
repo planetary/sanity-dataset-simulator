@@ -145,3 +145,9 @@ export * from './store/index'
 
 /* W5 — executable PRD §34 invariants (plan §8.3), for tests and debug tooling. */
 export * from './invariants/index'
+
+/* Phase 3/7 — canonical checkpoint export and import (PRD §14.1, §14.3, §29). */
+export * from './checkpoint/index'
+
+/* Phase 8 — promotion planning only (PRD §30). Apply is deliberately absent. */
+export * from './promotion/index'

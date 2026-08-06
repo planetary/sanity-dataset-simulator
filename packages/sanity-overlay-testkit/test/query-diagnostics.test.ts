@@ -137,6 +137,99 @@ describe('§22.2/§5.5: an unsupported query fails structurally', () => {
       expect.objectContaining({code: 'UNSUPPORTED_GROQ'}),
     )
   })
+
+  it('every parameterised plan refuses an absent parameter — the whole family, not one member', () => {
+    // Stated as a sweep because the failure mode ("nothing supplied, so fetch
+    // everything") belongs to the plan KIND, not to any one registration.
+    const missing: Array<[string, Record<string, unknown>]> = [
+      ['article-by-id', {}],
+      ['article-object-spread', {}],
+      ['article-body-text', {}],
+      ['article-with-author', {}],
+      ['page-by-slug', {}],
+      ['article-by-slug', {}],
+      ['article-by-slug-with-author', {}],
+      ['articles-by-tag', {}],
+      ['articles-referencing-author', {}],
+    ]
+    for (const [id, params] of missing) {
+      expect(() =>
+        planCandidateRequests(registry.get(id), params, {affectedIds: []}),
+        `${id} must refuse an absent parameter`,
+      ).toThrowError(expect.objectContaining({code: 'UNSUPPORTED_GROQ'}))
+    }
+  })
+
+  it('references() planning refuses anything that is not a finite document ID', () => {
+    // §22.3 admits `references()` for FINITE ids. A null, a number or an array
+    // has no finite base request, and guessing one would be an approximation.
+    for (const authorId of [null, 42, [], {}, '']) {
+      expect(() =>
+        planCandidateRequests(registry.get('articles-referencing-author'), {authorId}),
+        `authorId=${JSON.stringify(authorId)}`,
+      ).toThrowError(expect.objectContaining({code: 'UNSUPPORTED_GROQ'}))
+    }
+  })
+
+  it('a top-K plan refuses to be planned without the branch delta', () => {
+    // §22.6's base fetch is defined in terms of the affected count. Defaulting
+    // it to "nothing was touched" would silently under-fetch on every branch.
+    expect(() => planCandidateRequests(registry.get('articles-ordered-sliced'), {})).toThrowError(
+      expect.objectContaining({code: 'UNSUPPORTED_GROQ'}),
+    )
+  })
+
+  it('a base adapter that cannot serve a planned fetch refuses, and does not degrade to a scan', async () => {
+    // The predicate and ordered-slice plans need base capabilities beyond the
+    // three original request shapes. An adapter that lacks them must fail with
+    // the §22.9 code, because the tempting fallback — "ask for the type and
+    // filter locally" — is exactly the over-fetch §22.6 exists to prevent, and
+    // it would be invisible in every parity test.
+    const coreOnly: QueryBaseSource = {
+      async fetchCandidates(request) {
+        if (request.kind === 'types' || request.kind === 'ids' || request.kind === 'field-equality') {
+          return []
+        }
+        throw new Error('this adapter serves only the core request shapes')
+      },
+    }
+    for (const [queryId, params] of [
+      ['articles-by-tag', {tag: 'odd'}],
+      ['articles-referencing-author', {authorId: 'author-2'}],
+      ['articles-ordered-sliced', {}],
+    ] as const) {
+      const error = await rejectsWith(
+        'UNSUPPORTED_GROQ',
+        422,
+        run({queryId, params, base: coreOnly}),
+      )
+      expect(error.message, queryId).toMatch(/base/i)
+    }
+    // The same queries succeed against an adapter that DOES serve them, so the
+    // refusal above is about the adapter and not about the registration.
+    const {result} = await run<Array<{_id: string}>>({
+      queryId: 'articles-by-tag',
+      params: {tag: 'odd'},
+    })
+    expect(result.length).toBeGreaterThan(0)
+  })
+
+  it('a top-K base request asks for K documents and excludes every touched ID', () => {
+    const plan = planCandidateRequests(
+      registry.get('articles-ordered-sliced'),
+      {},
+      {affectedIds: ['article-01', 'article-02']},
+    )
+    expect(plan.baseRequests).toHaveLength(1)
+    const request = plan.baseRequests[0]
+    if (request.kind !== 'order-slice') throw new Error(`expected order-slice, got ${request.kind}`)
+    expect(request.limit).toBe(20)
+    expect(request.order).toEqual([{field: 'publishedAt', direction: 'desc'}])
+    expect([...request.excludeIds].sort()).toEqual(['article-01', 'article-02'])
+    // The branch records themselves still have to join the candidate set, or
+    // excluding them from the base fetch would LOSE them (§22.6 step 6).
+    expect(plan.overlayTypes).toEqual(['article'])
+  })
 })
 
 /* ------------------------------------------------------------------ *

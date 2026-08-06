@@ -1353,6 +1353,7 @@ interface PlanResponse {
   supported?: boolean
   reason?: string
   queryId?: string
+  notes?: string
   baseRequests?: Array<Record<string, unknown>>
   error?: {code: string; message: string}
 }
@@ -1412,6 +1413,55 @@ describe('spikeA overlay server — POST /query/plan', () => {
       params: {id: 'article-1'},
     })
     expect(json.baseRequests).toEqual([{kind: 'ids', ids: ['article-1']}])
+  })
+
+  it('plans the draft-discovery probe as both addresses of the logical ID', async () => {
+    /* The shape the live Article list pane issues before it fetches anything:
+     * "which of these documents has a version?". While it fell through to
+     * staging, staging answered "no draft for article-1" — the draft is only in
+     * the branch — and the pane rendered the published title. */
+    const server = await boot(await makeRoot())
+    const {status, json} = await postJson<PlanResponse>(server, '/query/plan', {
+      query: '[*[sanity::versionOf("article-1")]._id, *[sanity::versionOf("article-9")]._id]',
+    })
+
+    expect(status).toBe(200)
+    expect(json.supported).toBe(true)
+    expect(json.baseRequests).toEqual([
+      {
+        kind: 'ids',
+        ids: ['article-1', 'drafts.article-1', 'article-9', 'drafts.article-9'],
+      },
+    ])
+  })
+
+  it('hands the release-version boundary to the caller alongside the plan', async () => {
+    /* §22.5 wants the caller able to record what it is trusting. The version set
+     * is exact for draft/published and deliberately excludes release versions
+     * (PRD §32), so the plan says so rather than leaving the caller to assume
+     * the answer is the whole hosted one. */
+    const server = await boot(await makeRoot())
+    const {json} = await postJson<PlanResponse>(server, '/query/plan', {
+      query: '*[sanity::versionOf($id)]._id',
+      params: {id: 'article-1'},
+    })
+
+    expect(json.supported).toBe(true)
+    expect(json.notes).toMatch(/versions\.<release>\.<id>/)
+  })
+
+  it('refuses a query that actually names the release-version namespace', async () => {
+    /* The other half of the boundary: excluding releases is honest only while
+     * the query never asks for one. A query that does gets a refusal, not a
+     * silent subset (§5.5). */
+    const server = await boot(await makeRoot())
+    const {status, json} = await postJson<PlanResponse>(server, '/query/plan', {
+      query: '*[sanity::versionOf("versions.summer.article-1")]._id',
+    })
+
+    expect(status).toBe(200)
+    expect(json.supported).toBe(false)
+    expect(json.reason).toMatch(/release-version/)
   })
 
   it('reports an unsupported query as data, with a reason — not as an HTTP error', async () => {

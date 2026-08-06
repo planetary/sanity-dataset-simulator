@@ -54,6 +54,8 @@
  * lazy (`localEcho.ts:374-378`), so building a request observable and dropping
  * it makes no network call.
  */
+import http from 'node:http'
+import https from 'node:https'
 import {types} from 'node:util'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createClient, type ClientConfig, type SanityClient} from '../../../examples/kitchen-sink/node_modules/@sanity/client'
@@ -229,6 +231,71 @@ function distinct<T>(read: () => T, times: number): Set<T> {
   const seen = new Set<T>()
   for (let i = 0; i < times; i++) seen.add(read())
   return seen
+}
+
+/* ─────────────────────────────────────────── the outbound-request recorder */
+
+/**
+ * Every outbound request `run()` ATTEMPTS, as `METHOD url` strings.
+ *
+ * A unit suite must not talk to a live Sanity dataset. This file exercises a
+ * REAL `@sanity/client`, and most of what it calls is safe because
+ * `@sanity/client`'s observable API is lazy — an observable that is built and
+ * dropped opens no socket. `client.assets.upload(...)` is not in that family: it
+ * returns a promise and issues `POST /assets/images/<dataset>` immediately. That
+ * made this suite perform a real write against a real project on every run, and
+ * it was harmless only by the accident of the ambient token's permissions (it
+ * 403s). CI has no such luck, and a token that happened to be allowed to write
+ * would have uploaded an asset from a unit test.
+ *
+ * `@sanity/client` reaches the network through `https.request` in Node (probed,
+ * not assumed — see the identity notes above), and `globalThis.fetch` is
+ * recorded too so a future transport change cannot make this guard silently
+ * vacuous.
+ */
+function recordOutboundRequests(run: () => void): string[] {
+  const attempted: string[] = []
+
+  const describeArgs = (scheme: string, args: unknown[]): string => {
+    const [first, second] = args as [unknown, {method?: string} | undefined]
+    if (typeof first === 'string' || first instanceof URL) {
+      return `${second?.method ?? 'GET'} ${String(first)}`
+    }
+    const options = (first ?? {}) as {method?: string; hostname?: string; host?: string; path?: string}
+    return `${options.method ?? 'GET'} ${scheme}://${options.hostname ?? options.host ?? ''}${
+      options.path ?? ''
+    }`
+  }
+
+  const realHttps = https.request
+  const realHttp = http.request
+  const realFetch = globalThis.fetch
+  const blocked = (): never => {
+    throw new Error('outbound request blocked by recordOutboundRequests')
+  }
+
+  https.request = ((...args: unknown[]) => {
+    attempted.push(describeArgs('https', args))
+    return blocked()
+  }) as typeof https.request
+  http.request = ((...args: unknown[]) => {
+    attempted.push(describeArgs('http', args))
+    return blocked()
+  }) as typeof http.request
+  globalThis.fetch = ((input: unknown, init?: {method?: string}) => {
+    attempted.push(describeArgs('fetch', [input, init]))
+    return blocked()
+  }) as typeof globalThis.fetch
+
+  try {
+    run()
+  } finally {
+    https.request = realHttps
+    http.request = realHttp
+    globalThis.fetch = realFetch
+  }
+
+  return attempted
 }
 
 /* ══════════════════════════════════════════════════════════════════════════ */
@@ -411,19 +478,48 @@ describe('spike A · spikeClientFactory is identity-stable (Track A / echo topol
     expect((video.getPlaybackInfo as {name: string}).name).toBe('wrapped')
   })
 
+  /**
+   * The point of descending: the §36.1 inventory can now SEE an asset upload.
+   *
+   * WHAT IS STUBBED, AND WHY IT IS NOT THE THING UNDER TEST
+   * ──────────────────────────────────────────────────────
+   * `instrument` is under test; `AssetsClient.upload` is the boundary behind it.
+   * This test used to call the real `upload`, which is one of the few
+   * `@sanity/client` methods that is NOT lazy — it fires
+   * `POST /assets/images/<dataset>` on call — so the unit suite performed a real
+   * write against a real dataset on every run. Shadowing the delegate with a
+   * recorder keeps every claim this test ever made and adds a stronger one: the
+   * exact arguments are shown to reach the delegate, which is what "instrument
+   * observes, it does not block" actually means. `recordOutboundRequests`
+   * enforces the rest.
+   */
   it('logs a namespace call into the §36.1 inventory it was invisible to before', () => {
-    /* The point of descending: the inventory can now SEE an asset upload. The
-     * call still delegates — `instrument` observes, it does not block. */
     const before = win.__SPIKE_A__?.calls.length ?? 0
     const assets = (client as unknown as Record<string, Record<string, unknown>>).assets
-    try {
-      ;(assets.upload as (...a: unknown[]) => unknown)('image', 'not-a-real-body')
-    } catch {
-      /* the real client may reject the body; the log entry is what matters */
-    }
+
+    /* Shadowing an own property on the AssetsClient instance. `instrument`'s
+     * proxy reads the delegate through `Reflect.get` at first access and wraps
+     * whatever it finds, so the wrapper under test is exercised unchanged. */
+    const delegate = vi.fn(() => 'delegated')
+    assets.upload = delegate
+
+    const attempted = recordOutboundRequests(() => {
+      expect((assets.upload as (...a: unknown[]) => unknown)('image', 'not-a-real-body')).toBe(
+        'delegated',
+      )
+    })
+
+    /* It is still the instrumented wrapper, not the raw delegate. */
+    expect((assets.upload as {name: string}).name).toBe('wrapped')
+    /* It observes rather than blocks: the real arguments reached the delegate. */
+    expect(delegate).toHaveBeenCalledTimes(1)
+    expect(delegate).toHaveBeenCalledWith('image', 'not-a-real-body')
+    /* And the call is in the inventory it used to be invisible to. */
     const calls = win.__SPIKE_A__?.calls as Array<{path: string; method: string}> | undefined
     expect(calls?.length).toBeGreaterThan(before)
     expect(calls?.some((c) => c.path.endsWith('.assets') && c.method === 'upload')).toBe(true)
+    /* Nothing left the process. */
+    expect(attempted).toEqual([])
   })
 
   it('is stable through the withConfig chain Studio uses for the Actions API', () => {

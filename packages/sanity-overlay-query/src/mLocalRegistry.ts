@@ -1,33 +1,34 @@
 /**
- * The `[M-LOCAL]` reduced query registry.
+ * The `[M-LOCAL]` query registry, grown towards the audited Spike C corpus
+ * (`docs/plans/evidence/phase-1/spike-c-groq-corpus/report.md`).
  *
- * PRD §37 Phase 2, "Minimal Studio and query slice `[M-LOCAL]`":
+ * PRD §37 Phase 2 asks for "a reduced query registry containing the ID and slug
+ * lookup entries with parity fixtures"; this is that, plus the corpus shapes
+ * whose candidate plan can be PROVEN bounded from the query's own semantics:
+ * array membership, `references()` over a finite ID, and the §22.6 bounded
+ * top-K ordered slice.
  *
- *   - Reduced query registry containing the ID and slug lookup entries with
- *     parity fixtures. The full registry, codemod and lint enforcement remain
- *     Phase 5.
- *   - ID and slug candidate planners evaluated through pinned `groq-js`. The
- *     remaining planners remain Phase 5.
+ * DELIBERATELY ABSENT rather than registered — all three are measured, accepted
+ * Tier B in the Spike C evidence, and none has a planner here:
  *
- * and PRD §38.1 "Registered ID and slug queries work" / "Basic reference
- * dereference works".
- *
- * DELIBERATELY OUT OF SCOPE, and therefore absent rather than registered:
- *
- *   - Ordered slices (`| order(...)[0...K]`). Exactness needs the §22.6 bounded
- *     top-K proof and a `top-k` planner — Phase 5.
- *   - Aggregates (`count()`, `math::sum`). Spike C evidence
- *     (`boundedness-2026-08-04.md` §4) shows §22.6 step 14 forces an aggregate
- *     to materialise its whole type, so they are honestly Tier B and need
- *     aggregate pushdown.
+ *   - Aggregates (`count()`, `math::sum`). §22.6 step 14 evaluates the ORIGINAL
+ *     query over the candidate set, so an aggregate must materialise everything
+ *     it aggregates: `boundedness-2026-08-04.md` §4 measures a one-number
+ *     answer costing a full type scan, and `latency-2026-08-04.md` §4.1 records
+ *     4.8 MiB transferred to return a scalar. The fix is aggregate pushdown
+ *     (base count plus overlay delta), which §22.6 does not describe.
  *   - Filters that traverse a reference (`author->name == $name`). Membership
  *     depends on a field of the TARGET, so no base-side predicate over the
- *     referrers is complete; that needs §22.6 step 10.
+ *     referrers is complete once an author is edited. The fix is §22.6 step 10,
+ *     reverse-reference expansion. Measured at p50 2.2 s against a 3 s budget.
+ *   - `custom` planners (§22.4). A named external planner cannot be shown
+ *     bounded from the registration, so it cannot be admitted here.
  *
  * Registering a shape without its planner would let a query claim exact support
- * it does not have, which PRD §5.5 forbids.
+ * it does not have, which PRD §5.5 forbids. Absent is better than falsely
+ * exact, so those three shapes stay out and the refusal stays loud.
  *
- * Two type-constrained list entries ARE included: their candidate plan is the
+ * The type-constrained list entries ARE included: their candidate plan is the
  * type itself, which is exact and — because the answer IS the type — cannot be
  * smaller than the response. They are classified `result-proportional`, not
  * `constant`, by the boundedness suite.
@@ -55,6 +56,15 @@ const PUBLISHED_AND_DRAFTS = ['published', 'drafts'] as const
  */
 const LOOKUP_MAX_CANDIDATES = 64
 const LIST_MAX_CANDIDATES = 4096
+/**
+ * An ordered slice resolves `K` untouched base documents plus the branch
+ * records of its type that can enter, leave or reorder the slice. `K` is at
+ * most 20 in this registry, so the headroom here is the branch delta: a preview
+ * branch that has touched more than ~230 documents of a single type is outside
+ * the authoring workflow §5.4 budgets, and hitting the limit raises
+ * `CANDIDATE_LIMIT_EXCEEDED` rather than degrading into a type scan.
+ */
+const SLICE_MAX_CANDIDATES = 256
 
 export const M_LOCAL_QUERIES: readonly OverlayQueryDefinition[] = [
   /* --- ID lookups (§22.3 Tier A "Document lookup by `_id`") ------------- */
@@ -99,6 +109,42 @@ export const M_LOCAL_QUERIES: readonly OverlayQueryDefinition[] = [
     maxReferenceDepth: 3,
     status: 'tier-a',
     parityFixture: 'm-local-overlays',
+  }),
+
+  defineOverlayQuery({
+    id: 'article-object-spread',
+    description: 'Article lookup by ID projecting the whole document (§22.3 Tier A projections).',
+    query: `*[_id == $id][0]{...}`,
+    queryChecksum: '110c828d3bd528e3256504c5613c7c55cb81b908008d52aa67f078229e28b330',
+    allowedCallers: [...FRONTEND],
+    perspectives: [...PUBLISHED_AND_DRAFTS],
+    candidatePlan: {type: 'ids', idsFromParams: ['id']},
+    systemTimestampPolicy: 'preserve-base',
+    maxCandidates: LOOKUP_MAX_CANDIDATES,
+    maxReferenceDepth: 3,
+    status: 'tier-a',
+    parityFixture: 'm-local-overlays',
+    notes:
+      'The spread widens the PROJECTION, not the candidate set: the plan is still one ID. ' +
+      'Registered because it is the shape that carries system fields into the response, which ' +
+      'is where a synthetic overlay timestamp would become visible (§13.9).',
+  }),
+  defineOverlayQuery({
+    id: 'article-body-text',
+    description: 'Article lookup by ID projecting Portable Text through `pt::text` (§22.3 Tier A).',
+    query: `*[_id == $id][0]{title, "text": pt::text(body)}`,
+    queryChecksum: 'abfb11d352beeb50573bd1d15c5187e979ff3e6ceb00ad57ca65ba06b714e586',
+    allowedCallers: [...FRONTEND],
+    perspectives: [...PUBLISHED_AND_DRAFTS],
+    candidatePlan: {type: 'ids', idsFromParams: ['id']},
+    systemTimestampPolicy: 'preserve-base',
+    maxCandidates: LOOKUP_MAX_CANDIDATES,
+    maxReferenceDepth: 3,
+    status: 'tier-a',
+    parityFixture: 'm-local-overlays',
+    notes:
+      '§22.3 Tier A admits the Portable Text functions PINNED groq-js supports. The function ' +
+      'reads a field of the one candidate document, so it changes nothing about the plan.',
   }),
 
   /* --- Slug lookups (§22.3 Tier A "Slug filters"; §22.7 example) -------- */
@@ -185,6 +231,99 @@ export const M_LOCAL_QUERIES: readonly OverlayQueryDefinition[] = [
     status: 'tier-a',
     parityFixture: 'm-local-overlays',
     notes: 'As article-type-list, across two types.',
+  }),
+
+  /* --- Local predicates pushed down to the base (§22.3 Tier A) ---------- */
+  defineOverlayQuery({
+    id: 'articles-by-tag',
+    description: 'Articles carrying a tag — §22.3 Tier A "Basic array membership".',
+    query: `*[_type == "article" && $tag in tags]{_id, title} | order(_id asc)`,
+    queryChecksum: '03434473de15f542290d2385608f7a7c985f45315beecf865fbc64d0fbc1bcf5',
+    allowedCallers: [...FRONTEND],
+    perspectives: [...PUBLISHED_AND_DRAFTS],
+    candidatePlan: {
+      type: 'field-contains',
+      types: ['article'],
+      path: ['tags'],
+      valueFromParam: 'tag',
+    },
+    systemTimestampPolicy: 'preserve-base',
+    maxCandidates: LIST_MAX_CANDIDATES,
+    maxReferenceDepth: 3,
+    status: 'tier-a',
+    parityFixture: 'm-local-overlays',
+    notes:
+      'Membership reads the candidate document\'s OWN array, so the base answers the predicate ' +
+      'exactly and the branch delta covers every document that newly matches. Bounded by the ' +
+      'answer, not by the type: the candidate set is the matching articles plus the branch ' +
+      'records of the type.',
+  }),
+  defineOverlayQuery({
+    id: 'articles-referencing-author',
+    description: 'Articles that reference a given author — §22.3 Tier A "references() for finite IDs".',
+    query: `*[_type == "article" && references($authorId)]{_id, title} | order(_id asc)`,
+    queryChecksum: 'ef6c8de7424146bbae45d09952e9adf8038ba17cc613427b3461e68369a1d62c',
+    allowedCallers: [...FRONTEND],
+    perspectives: [...PUBLISHED_AND_DRAFTS],
+    candidatePlan: {type: 'references', types: ['article'], idFromParam: 'authorId'},
+    systemTimestampPolicy: 'preserve-base',
+    maxCandidates: LIST_MAX_CANDIDATES,
+    maxReferenceDepth: 3,
+    status: 'tier-a',
+    parityFixture: 'm-local-overlays',
+    notes:
+      'The CONVERSE of the unregistered `author->name == $name`: `references($id)` reads the ' +
+      'referrer\'s own fields, so editing the target cannot change membership and no reverse ' +
+      'expansion (§22.6 step 10) is needed. That difference is the whole reason one is here ' +
+      'and the other is absent.',
+  }),
+
+  /* --- Bounded top-K ordered slices (§22.6) ----------------------------- */
+  defineOverlayQuery({
+    id: 'articles-ordered-sliced',
+    description: 'The newest 20 articles — the §22.6 bounded top-K shape.',
+    query: `*[_type == "article"] | order(publishedAt desc)[0...20]{title, "slug": slug.current}`,
+    queryChecksum: '3641cadebfc34c1b8ad4e6cdd326a6c7f622549afb7f6a9954ee3fefd70e2e57',
+    allowedCallers: [...FRONTEND],
+    perspectives: [...PUBLISHED_AND_DRAFTS],
+    candidatePlan: {
+      type: 'top-k',
+      types: ['article'],
+      order: [{field: 'publishedAt', direction: 'desc'}],
+      sliceEnd: 20,
+    },
+    systemTimestampPolicy: 'preserve-base',
+    maxCandidates: SLICE_MAX_CANDIDATES,
+    maxReferenceDepth: 3,
+    status: 'tier-a',
+    parityFixture: 'm-local-overlays',
+    notes:
+      'Orders on an explicit USER field, which is what §22.3 Tier A requires ("ordering on ' +
+      'explicit user fields with a bounded candidate plan"); ordering on a synthetic ' +
+      '`_createdAt` would be Tier B under §13.9 and is not registered.',
+  }),
+  defineOverlayQuery({
+    id: 'articles-recent-headlines',
+    description: 'The five newest headlines, ordered through a projection alias.',
+    query: `*[_type == "article"]{"headline": title, "when": publishedAt} | order(when desc)[0...5]`,
+    queryChecksum: '973c74d0aaf0401a3c2b06e1ff4bfe66c177a2314acf6d230466d7074db4cb4f',
+    allowedCallers: [...FRONTEND],
+    perspectives: [...PUBLISHED_AND_DRAFTS],
+    candidatePlan: {
+      type: 'top-k',
+      types: ['article'],
+      order: [{field: 'publishedAt', direction: 'desc'}],
+      sliceEnd: 5,
+    },
+    systemTimestampPolicy: 'preserve-base',
+    maxCandidates: SLICE_MAX_CANDIDATES,
+    maxReferenceDepth: 3,
+    status: 'tier-a',
+    parityFixture: 'm-local-overlays',
+    notes:
+      'The query orders by the alias `when`, which the projection defines as `publishedAt`; the ' +
+      'plan therefore orders the base by `publishedAt`. That mapping is a claim of the ' +
+      'registration and is proven by the parity fixtures, not by the projection syntax.',
   }),
 
   /* --- Tier C, registered so the refusal is executable ------------------ */

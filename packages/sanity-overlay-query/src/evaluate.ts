@@ -92,8 +92,14 @@ export async function evaluateOverlayQuery<T = unknown>(
     )
   }
 
-  /* 4. Select the registered candidate strategy. */
-  const plan = planCandidateRequests(def, params)
+  /* 4. Select the registered candidate strategy.
+   *
+   * The branch delta is handed to the planner, not the overlay itself: §22.6's
+   * bounded top-K base fetch is defined in terms of the affected count, and a
+   * plan that could read the overlay directly could also read a document out of
+   * it and call that a candidate. */
+  const affectedIds = [...overlay.documents.keys(), ...overlay.tombstones]
+  const plan = planCandidateRequests(def, params, {affectedIds})
   const derefPaths = analyzeDerefPaths(tree)
 
   /* 5. Fetch base candidates. */

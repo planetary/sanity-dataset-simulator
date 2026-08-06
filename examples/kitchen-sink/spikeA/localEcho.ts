@@ -1286,6 +1286,25 @@ function stableStringify(value: unknown): string {
   }
 }
 
+/**
+ * The cache identity for one (query, params) pair.
+ *
+ * SELF-DELIMITING, not separator-joined. `JSON.stringify` quotes and escapes
+ * the query, so the boundary between the two parts is structural and no query
+ * text can forge it — which is the property a delimiter cannot promise, because
+ * for any separator `S` a part that contains `S` moves the split. A wrong split
+ * here is not a cache miss, it is a cache HIT on the wrong plan: one query
+ * would be answered with another query’s `baseRequests`, or declared
+ * unsupported on another query’s reason.
+ *
+ * (The separator this used to use was a literal NUL byte, which additionally
+ * made git treat this whole file as binary — no `git diff`, no `grep`. See
+ * `test/repo-hygiene.test.ts`.)
+ */
+export function planCacheKey(query: string, params: Rec): string {
+  return `${JSON.stringify(query)}${stableStringify(params)}`
+}
+
 const planCache = new Map<string, ReadDecision>()
 const MAX_PLAN_CACHE = 500
 
@@ -1302,7 +1321,7 @@ async function planFor(query: unknown, params: Rec): Promise<ReadDecision | null
     return {supported: false, reason: 'not a GROQ string, so there is nothing to plan'}
   }
 
-  const key = `${query} ${stableStringify(params)}`
+  const key = planCacheKey(query, params)
   const cached = planCache.get(key)
   if (cached !== undefined) return cached
 

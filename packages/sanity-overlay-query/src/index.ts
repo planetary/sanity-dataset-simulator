@@ -17,6 +17,7 @@
  */
 
 export type {
+  CandidateOrderTerm,
   CandidatePlan,
   OverlayQueryDefinition,
   OverlayQueryDiagnostics,
@@ -43,10 +44,32 @@ export {emptyOverlaySource, resolveVirtualDocument} from './overlaySource'
 export type {OverlaySource} from './overlaySource'
 
 export {planCandidateRequests} from './planner'
-export type {CandidatePlanRequests} from './planner'
+export type {CandidatePlanContext, CandidatePlanRequests} from './planner'
 
 export {analyzeDerefPaths, collectReferenceTargets} from './derefPaths'
 export type {DerefPaths} from './derefPaths'
 
 export {evaluateOverlayQuery} from './evaluate'
 export type {EvaluateOverlayQueryOptions} from './evaluate'
+
+/* The static half of §22.5: find unregistered GROQ in a codebase before it
+ * runs. Pure and dependency free, so it is callable from CI (see
+ * `lint/check-queries.mjs`), from the CLI package, or from an ESLint rule. */
+export {
+  checkSourceForUnregisteredQueries,
+  checkSourcesForUnregisteredQueries,
+  formatQueryLintReport,
+  looksLikeGroq,
+  scanStringLiterals,
+} from './lint/queryLint'
+export type {
+  QueryLintCode,
+  QueryLintFinding,
+  QueryLintMode,
+  QueryLintOptions,
+  QueryLintReport,
+  QueryLintSeverity,
+  QueryLintSourceInput,
+  RegisteredQuerySummary,
+  SourceLiteral,
+} from './lint/queryLint'

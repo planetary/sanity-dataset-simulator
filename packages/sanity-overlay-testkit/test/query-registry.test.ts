@@ -38,16 +38,51 @@ const registry = createQueryRegistry(M_LOCAL_QUERIES)
 describe('§37 Phase 2: the [M-LOCAL] reduced registry inventory is pinned', () => {
   it('contains exactly the registered ids', () => {
     expect(M_LOCAL_QUERIES.map((d) => d.id).sort()).toEqual([
+      'article-body-text',
       'article-by-id',
       'article-by-slug',
       'article-by-slug-with-author',
+      'article-object-spread',
       'article-type-list',
       'article-with-author',
+      'articles-by-tag',
+      'articles-ordered-sliced',
+      'articles-recent-headlines',
+      'articles-referencing-author',
       'multi-type-list',
       'page-by-slug',
       'page-featured-refs',
       'unconstrained-star',
     ])
+  })
+
+  /**
+   * The corpus this registry is being grown towards is the Spike C inventory
+   * (`docs/plans/evidence/phase-1/spike-c-groq-corpus/report.md`). Three of its
+   * shapes are deliberately ABSENT rather than registered, and their absence is
+   * pinned so that adding one without its planner is a test failure:
+   *
+   *   - `article-count` / `stats-aggregate`: §22.6 step 14 evaluates the
+   *     ORIGINAL query over the candidate set, so an aggregate must materialise
+   *     everything it aggregates. Registering them would claim an exactness the
+   *     candidate plan does not deliver; they need aggregate pushdown.
+   *   - `articles-by-author-name`: the filter traverses a reference, so
+   *     membership depends on a field of the TARGET and no base-side predicate
+   *     over the referrers is complete. Needs §22.6 step 10.
+   */
+  it('the three known-hard Spike C shapes are absent, not registered', () => {
+    const registered = new Set(M_LOCAL_QUERIES.map((d) => d.id))
+    for (const id of ['article-count', 'stats-aggregate', 'articles-by-author-name']) {
+      expect(registered.has(id), `${id} must not be registered without its planner`).toBe(false)
+    }
+    // Stated as query SHAPES too, so renaming the entry does not smuggle it in.
+    const texts = M_LOCAL_QUERIES.map((d) => d.query)
+    for (const shape of ['count(', 'math::sum(', '->name ==', '->name==']) {
+      expect(
+        texts.filter((t) => t.includes(shape)),
+        `no registered query may contain ${shape}`,
+      ).toEqual([])
+    }
   })
 
   it('every id is unique', () => {
@@ -60,11 +95,17 @@ describe('§37 Phase 2: the [M-LOCAL] reduced registry inventory is pinned', () 
         .map((d) => d.id)
         .sort()
     expect(of('tier-a')).toEqual([
+      'article-body-text',
       'article-by-id',
       'article-by-slug',
       'article-by-slug-with-author',
+      'article-object-spread',
       'article-type-list',
       'article-with-author',
+      'articles-by-tag',
+      'articles-ordered-sliced',
+      'articles-recent-headlines',
+      'articles-referencing-author',
       'multi-type-list',
       'page-by-slug',
       'page-featured-refs',
@@ -72,8 +113,9 @@ describe('§37 Phase 2: the [M-LOCAL] reduced registry inventory is pinned', () 
     // §22.3 Tier C: unconstrained `*` without a finite candidate plan. Kept in
     // the registry deliberately so "must fail structurally" is executable.
     expect(of('unsupported')).toEqual(['unconstrained-star'])
-    // The [M-LOCAL] slice deliberately admits no Tier B query: aggregates,
-    // ordered slices and filter-through-reference are Phase 5 work.
+    // Still no Tier B entry: every registered shape has a candidate plan that
+    // is bounded by the query's own semantics. The Spike C Tier B shapes are
+    // absent (see above), not downgraded into this registry.
     expect(of('tier-b')).toEqual([])
   })
 
@@ -82,7 +124,12 @@ describe('§37 Phase 2: the [M-LOCAL] reduced registry inventory is pinned', () 
       M_LOCAL_QUERIES.filter((d) => d.candidatePlan.type === kind)
         .map((d) => d.id)
         .sort()
-    expect(of('ids')).toEqual(['article-by-id', 'article-with-author'])
+    expect(of('ids')).toEqual([
+      'article-body-text',
+      'article-by-id',
+      'article-object-spread',
+      'article-with-author',
+    ])
     expect(of('ids-literal')).toEqual(['page-featured-refs'])
     expect(of('slug')).toEqual([
       'article-by-slug',
@@ -90,7 +137,33 @@ describe('§37 Phase 2: the [M-LOCAL] reduced registry inventory is pinned', () 
       'page-by-slug',
     ])
     expect(of('types')).toEqual(['article-type-list', 'multi-type-list'])
+    expect(of('field-contains')).toEqual(['articles-by-tag'])
+    expect(of('references')).toEqual(['articles-referencing-author'])
+    expect(of('top-k')).toEqual(['articles-ordered-sliced', 'articles-recent-headlines'])
     expect(of('none')).toEqual(['unconstrained-star'])
+  })
+
+  /**
+   * §22.6's bounded top-K rule is stated over a slice with an exclusive end.
+   * The registration carries `sliceEnd`; the QUERY carries `[0...K]`. If those
+   * two disagree the plan fetches the wrong number of documents and the
+   * boundedness ceiling (which is parsed from the query text) is meaningless,
+   * so the agreement is asserted rather than assumed.
+   */
+  it('every top-k registration agrees with the slice in its own query text', () => {
+    const topK = M_LOCAL_QUERIES.filter((d) => d.candidatePlan.type === 'top-k')
+    expect(topK.length).toBeGreaterThan(0)
+    for (const def of topK) {
+      const plan = def.candidatePlan
+      if (plan.type !== 'top-k') throw new Error('unreachable')
+      const match = def.query.match(/\[\s*0\s*\.\.\.\s*(\d+)\s*\]/)
+      expect(match, `${def.id}: a top-k registration needs a [0...K] slice`).toBeTruthy()
+      expect(plan.sliceEnd, `${def.id}: registered sliceEnd`).toBe(Number(match![1]))
+      expect(plan.order.length, `${def.id}: an ordered slice needs an order`).toBeGreaterThan(0)
+      for (const term of plan.order) {
+        expect(['asc', 'desc']).toContain(term.direction)
+      }
+    }
   })
 
   it('every supported entry carries limits, a parity fixture and a timestamp policy', () => {

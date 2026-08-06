@@ -739,6 +739,12 @@ export async function startOverlayServer(options = {}) {
       queryChecksum: definition.queryChecksum,
       candidatePlan: definition.candidatePlan,
       maxCandidates: definition.maxCandidates,
+      /* §22.5 wants the caller able to record what it is trusting. A plan can
+       * carry a boundary that is exact-by-product-decision rather than
+       * exact-by-proof — today, the release-version namespace a
+       * `sanity::versionOf` set deliberately excludes (PRD §32) — and the caller
+       * is the party about to believe the answer, so it is told. */
+      ...(definition.notes === undefined ? {} : {notes: definition.notes}),
       baseRequests,
     }
   }

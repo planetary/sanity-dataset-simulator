@@ -84,12 +84,26 @@ const oracle = async (query: string, base: readonly FixtureDocument[], overlay: 
 const PARAM_SETS: Record<string, Array<Record<string, unknown>>> = {
   'article-by-id': [{id: 'article-05'}, {id: 'article-01'}, {id: 'article-branch-1'}, {id: 'no-such-id'}],
   'article-with-author': [{id: 'article-01'}, {id: 'article-05'}, {id: 'article-branch-1'}, {id: 'no-such-id'}],
+  'article-object-spread': [{id: 'article-01'}, {id: 'article-branch-1'}, {id: 'no-such-id'}],
+  'article-body-text': [{id: 'article-01'}, {id: 'article-05'}, {id: 'no-such-id'}],
   'page-featured-refs': [{}],
   'page-by-slug': [{slug: 'legacy-page'}, {slug: 'home'}, {slug: 'branch-page'}, {slug: 'no-such-slug'}],
   'article-by-slug': [{slug: 'article-7'}, {slug: 'article-9'}, {slug: 'branch-article'}, {slug: 'no-such-slug'}],
   'article-by-slug-with-author': [{slug: 'article-7'}, {slug: 'branch-article'}, {slug: 'no-such-slug'}],
   'article-type-list': [{}],
   'multi-type-list': [{}],
+  // `even` matches in base; `featured` matches ONLY through the mixed overlay
+  // (article-05 gains it on the branch); the last matches nothing anywhere.
+  'articles-by-tag': [{tag: 'odd'}, {tag: 'featured'}, {tag: 'no-such-tag'}],
+  // author-2 is referenced by base articles and gains a branch referrer;
+  // no-such-author must produce an empty array, never a scan-shaped guess.
+  'articles-referencing-author': [
+    {authorId: 'author-2'},
+    {authorId: 'author-5'},
+    {authorId: 'no-such-author'},
+  ],
+  'articles-ordered-sliced': [{}],
+  'articles-recent-headlines': [{}],
 }
 
 const CASES: Array<
@@ -210,6 +224,65 @@ describe('§35.11: the behaviours the overlay exists for', () => {
     expect((await evaluate('page-by-slug', {slug: 'legacy-page'}, overlay)).result).toBeNull()
     const list = (await evaluate<Array<{_id: string; _type: string}>>('multi-type-list', {}, overlay)).result
     expect(list.find((d) => d._id === 'legacy.page.v2')?._type).toBe('article')
+  })
+
+  it('a branch tag edit moves an article in and out of an array-membership filter', async () => {
+    const overlay = M_LOCAL_PARITY_OVERLAYS['mixed'](base)
+    // article-05 is tagged `odd` in base and `news, featured` on the branch.
+    const gained = (await evaluate<Array<{_id: string}>>('articles-by-tag', {tag: 'featured'}, overlay)).result
+    expect(gained.map((d) => d._id)).toEqual(['article-05'])
+    const lost = (await evaluate<Array<{_id: string}>>('articles-by-tag', {tag: 'odd'}, overlay)).result
+    expect(lost.map((d) => d._id)).not.toContain('article-05')
+    // The base still says `odd`, so this can only be right if the branch record
+    // reached the candidate set — no base filter could have selected it.
+    const inBase = (await runGroq<Array<{_id: string}>>(
+      registry.get('articles-by-tag').query,
+      base,
+      {tag: 'odd'},
+    )).map((d) => d._id)
+    expect(inBase).toContain('article-05')
+  })
+
+  it('a branch-created article is found by references() with no base row', async () => {
+    const overlay = M_LOCAL_PARITY_OVERLAYS['branch-create'](base)
+    const {result} = await evaluate<Array<{_id: string}>>(
+      'articles-referencing-author',
+      {authorId: 'author-2'},
+      overlay,
+    )
+    // article-branch-1 is cloned from article-01, which references author-2.
+    expect(result.map((d) => d._id)).toContain('article-branch-1')
+  })
+
+  it('an unmatched reference id returns an empty list rather than a scan-shaped guess', async () => {
+    const overlay = M_LOCAL_PARITY_OVERLAYS['mixed'](base)
+    const {result} = await evaluate('articles-referencing-author', {authorId: 'no-such-author'}, overlay)
+    expect(result).toEqual([])
+  })
+
+  it('tombstoning the top of an ordered slice pulls untouched documents up into it', async () => {
+    // THE top-K case: the three newest articles are removed on the branch, so
+    // three articles the base ordering puts BELOW the slice must enter it. A
+    // planner that fetched the base top 20 and stopped returns 17 documents.
+    const overlay = M_LOCAL_PARITY_OVERLAYS['slice-shift'](base)
+    const {result} = await evaluate<Array<{title: string}>>('articles-ordered-sliced', {}, overlay)
+    expect(result).toHaveLength(20)
+    const oracleTitles = (
+      await oracle(registry.get('articles-ordered-sliced').query, base, overlay, {})
+    ) as Array<{title: string}>
+    expect(result.map((d) => d.title)).toEqual(oracleTitles.map((d) => d.title))
+    // Named explicitly so the mechanism is visible, not merely implied by the
+    // oracle: article-21 is rank 21 of the untouched base order.
+    expect(result.map((d) => d.title)).toContain('Article 21')
+    expect(result.map((d) => d.title)).not.toContain('Article 1')
+  })
+
+  it('a branch edit to the ordering field reorders the slice without a base rewrite', async () => {
+    const overlay = M_LOCAL_PARITY_OVERLAYS['slice-shift'](base)
+    const {result} = await evaluate<Array<{title: string}>>('articles-ordered-sliced', {}, overlay)
+    // article-30 is the OLDEST article in base and the newest on the branch.
+    expect(result[0].title).toBe('Article 30 (branch republished)')
+    expect(result[1].title).toBe('Branch top article')
   })
 
   it('a branch-created document enters the type list', async () => {

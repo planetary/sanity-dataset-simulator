@@ -976,3 +976,94 @@ describe('fetch — queries the overlay cannot answer exactly', () => {
     expect(errors.join('\n')).toMatch(/overlay/i)
   })
 })
+
+/* ================================================================== *
+ * The query-plan cache identity
+ * ================================================================== *
+ *
+ * `planFor` caches a `/query/plan` decision under a key built from the query
+ * text AND the parameters. A key collision here is not a missed cache — it is a
+ * HIT ON THE WRONG PLAN: one query answered with another query’s
+ * `baseRequests`, or refused with another query’s reason. The read path then
+ * returns exact-looking results derived from the wrong candidate set.
+ *
+ * The key used to be `query + NUL + stableStringify(params)`. That NUL made git
+ * treat the whole of `localEcho.ts` as binary (see `repo-hygiene.test.ts`), and
+ * the de-NUL is the reason this suite exists: the obvious replacement — swapping
+ * the NUL for a printable separator — reintroduces the classic delimiter hazard
+ * the moment either part can contain the separator. `planCacheKey` therefore has
+ * no separator at all: `JSON.stringify(query)` is quoted and escaped, so the
+ * boundary is structural.
+ *
+ * The cases below are adversarial in exactly that direction: every one of them
+ * plants a candidate separator at the seam.
+ */
+describe('planCacheKey — one identity per (query, params) pair', () => {
+  const SEPARATORS = ['\u0000', ' ', ',', '|', '\n', '\t', '"', '{', '}']
+  const BASE_QUERY = '*[_id == $id][0]'
+
+  interface Case {
+    query: string
+    params: Record<string, unknown>
+  }
+
+  function adversarialCases(): Case[] {
+    const cases: Case[] = [
+      {query: BASE_QUERY, params: {}},
+      {query: BASE_QUERY, params: {id: 'a'}},
+      {query: BASE_QUERY, params: {id: 'b'}},
+      /* Differ only in the query. */
+      {query: '*[_id == $id][1]', params: {id: 'a'}},
+    ]
+    for (const separator of SEPARATORS) {
+      cases.push(
+        /* The seam moved into the query. */
+        {query: `${BASE_QUERY}${separator}`, params: {}},
+        {query: `${BASE_QUERY}${separator}{}`, params: {}},
+        {query: `${BASE_QUERY}${separator}{"id":"a"}`, params: {}},
+        /* The seam moved into the parameters. */
+        {query: BASE_QUERY, params: {id: `${separator}{}`}},
+        {query: BASE_QUERY, params: {[`${separator}id`]: 'a'}},
+        /* Both sides carry it, split differently. */
+        {query: `${BASE_QUERY}${separator}x`, params: {id: 'a'}},
+        {query: BASE_QUERY, params: {id: `${separator}x`, extra: 'a'}},
+      )
+    }
+    return cases
+  }
+
+  it('never gives two distinct pairs the same key', async () => {
+    const echo = await loadEcho({})
+    const cases = adversarialCases()
+
+    /* Independent oracle: two cases are the same input only if their query is
+     * the same string AND their parameters are the same JSON. Anything else is
+     * a distinct pair and owes a distinct key. */
+    const identity = (item: Case): string => JSON.stringify([item.query, item.params])
+    const distinctInputs = new Set(cases.map(identity))
+    expect(distinctInputs.size).toBe(cases.length)
+
+    const byKey = new Map<string, Case>()
+    const collisions: Array<[Case, Case]> = []
+    for (const item of cases) {
+      const key = echo.planCacheKey(item.query, item.params)
+      const seen = byKey.get(key)
+      if (seen === undefined) byKey.set(key, item)
+      else collisions.push([seen, item])
+    }
+
+    expect(collisions).toEqual([])
+    expect(byKey.size).toBe(cases.length)
+  })
+
+  it('still collapses re-renders of the same query onto one key', async () => {
+    const echo = await loadEcho({})
+
+    /* The cache has to keep working: Studio re-issues the same query with an
+     * equal-but-not-identical params object on every render, and parameter
+     * insertion order is not meaningful. */
+    expect(echo.planCacheKey(BASE_QUERY, {id: 'a', limit: 10})).toBe(
+      echo.planCacheKey(BASE_QUERY, {limit: 10, id: 'a'}),
+    )
+  })
+})

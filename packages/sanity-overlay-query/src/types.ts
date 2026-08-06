@@ -28,13 +28,26 @@ export type QueryPerspective = 'published' | 'drafts' | 'raw'
 /** PRD §22.4 / §13.9. */
 export type SystemTimestampPolicy = 'preserve-base' | 'preview-diverges' | 'unsupported'
 
+/** One term of a registered ordering (PRD §22.4 `orderFields`, plus direction). */
+export interface CandidateOrderTerm {
+  readonly field: string
+  /**
+   * PRD §22.4 writes `orderFields: string[]` with no direction. Exactness needs
+   * it: the bounded top-K proof is "the base top K in the SAME order as the
+   * query", and `order(publishedAt desc)` and `order(publishedAt asc)` have
+   * disjoint top-K sets. Carrying the direction is therefore a deliberate
+   * addition, not a divergence of behaviour.
+   */
+  readonly direction: 'asc' | 'desc'
+}
+
 /**
- * Candidate plans implemented by the `[M-LOCAL]` slice (PRD §37 Phase 2:
- * "ID and slug candidate planners evaluated through pinned `groq-js`").
+ * Candidate plans implemented by this package.
  *
- * `top-k` and `custom` from PRD §22.4 are deliberately absent: an ordered slice
- * needs the §22.6 bounded top-K proof, which is Phase 5 work, and registering
- * the shape without the planner would let a query claim support it does not have.
+ * Each one exists because a REAL planner implements it (`planner.ts`) and a
+ * boundedness ceiling derived from query semantics holds for it. PRD §22.4's
+ * `custom` is deliberately absent: a named external planner cannot be proven
+ * bounded from the registration alone.
  */
 export type CandidatePlan =
   /** Document lookup by ID, IDs taken from named query parameters. */
@@ -52,6 +65,56 @@ export type CandidatePlan =
    * §22.6 step 10 instead — which is why no such query is registered here.
    */
   | {type: 'slug'; types: readonly string[]; path: readonly string[]; valueFromParam: string}
+  /**
+   * §22.3 Tier A "Basic array membership": `$value in <path>`. Exact for the
+   * same reason `slug` is — the predicate reads a LOCAL array of the candidate
+   * document, so the base can answer it and a branch edit is covered by the
+   * union of branch records of those types.
+   */
+  | {
+      type: 'field-contains'
+      types: readonly string[]
+      path: readonly string[]
+      valueFromParam: string
+    }
+  /**
+   * §22.3 Tier A "`references()` for finite IDs". Membership depends only on
+   * the REFERRER's own fields, so this is a local predicate like the two above
+   * — editing the target cannot add or remove a referrer. That is exactly the
+   * property `author->name == $name` lacks, which is why filter-through-
+   * reference is not registered anywhere in this package.
+   */
+  | {type: 'references'; types: readonly string[]; idFromParam: string}
+  /**
+   * §22.6 bounded top-K, for `*[<type>] | order(...)[0...K]`.
+   *
+   * The base fetch is the top `sliceEnd` of the UNTOUCHED base order, and every
+   * branch record of the candidate types joins it (§22.6 step 6). Exactness
+   * argument, which is the reason this may be registered Tier A at all:
+   *
+   *   An untouched base document with `K` untouched documents ordered above it
+   *   cannot enter `[0...K]` after resolution. Those `K` documents are
+   *   untouched, so they are neither tombstoned nor re-ordered by the branch;
+   *   they therefore remain above it in the resolved dataset and hold it at
+   *   rank `K + 1` or worse.
+   *
+   * This is PRD §22.6's `requestedEnd + affectedCount` with the affected set
+   * excluded from the base fetch rather than added to its size — the same
+   * bound, reached without fetching a base document the branch has already
+   * replaced.
+   *
+   * Assumes the ordering is a TOTAL order over the candidate type. Ties at the
+   * slice boundary are resolved by dataset order, which the base preserves for
+   * untouched documents; a query whose ordering field ties across documents
+   * should register a second order term.
+   */
+  | {
+      type: 'top-k'
+      types: readonly string[]
+      order: readonly CandidateOrderTerm[]
+      /** Exclusive end of the query's own `[0...K]` slice. */
+      sliceEnd: number
+    }
   /** Whole type(s). Exact, and answer-proportional only when the answer IS the type. */
   | {type: 'types'; types: readonly string[]}
   /** No finite exact plan exists. Evaluating it MUST raise `UNSUPPORTED_GROQ`. */

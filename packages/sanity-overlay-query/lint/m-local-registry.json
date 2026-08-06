@@ -1,0 +1,80 @@
+{
+  "$comment": "Generated from packages/sanity-overlay-query/src/mLocalRegistry.ts. The default registry for lint/check-queries.mjs, which cannot import the TypeScript registry directly. Kept in sync by test/lint-unregistered-queries.test.ts, which fails if this file drifts.",
+  "queries": [
+    {
+      "id": "article-by-id",
+      "query": "*[_id == $id][0]{title, tags}",
+      "queryChecksum": "85db7ecc40c4c22be2ac94471343a89ed32f5e6824812a53e2250e17c3410196"
+    },
+    {
+      "id": "article-with-author",
+      "query": "*[_id == $id][0]{title, author->{name}}",
+      "queryChecksum": "bdefa8bd0acb82b26df45badd15f1fcc9f69fe0efb86d23fdab98c9252dee715"
+    },
+    {
+      "id": "page-featured-refs",
+      "query": "*[_id == \"page-home\"][0]{sections[_type == \"featuredArticles\"][0]{articles[]->{title}}}",
+      "queryChecksum": "7f43aec53a8c76e0ecce72e3289b8a7e62cb5f3c85198877e3e03ed7f9531f88"
+    },
+    {
+      "id": "article-object-spread",
+      "query": "*[_id == $id][0]{...}",
+      "queryChecksum": "110c828d3bd528e3256504c5613c7c55cb81b908008d52aa67f078229e28b330"
+    },
+    {
+      "id": "article-body-text",
+      "query": "*[_id == $id][0]{title, \"text\": pt::text(body)}",
+      "queryChecksum": "abfb11d352beeb50573bd1d15c5187e979ff3e6ceb00ad57ca65ba06b714e586"
+    },
+    {
+      "id": "page-by-slug",
+      "query": "*[_type == \"page\" && slug.current == $slug][0]{title, hero{heading, cta{label}}}",
+      "queryChecksum": "3fd076000fc3781dcddd98ea32f7f9226fd427959b89e6a38bbe98d355f4084b"
+    },
+    {
+      "id": "article-by-slug",
+      "query": "*[_type == \"article\" && slug.current == $slug][0]{title, \"slug\": slug.current}",
+      "queryChecksum": "4ccaa5586afda940b50ba524e25fc5490df0815c7f94f7bf849ed171d9a3dbc6"
+    },
+    {
+      "id": "article-by-slug-with-author",
+      "query": "*[_type == \"article\" && slug.current == $slug][0]{title, author->{name, \"slug\": slug.current}}",
+      "queryChecksum": "ae8bd83b6bb0afa127adf9589345a689e0b2dfe29729b1c104fef6d1d4c1e7f2"
+    },
+    {
+      "id": "article-type-list",
+      "query": "*[_type == \"article\"]{_id, title} | order(_id asc)",
+      "queryChecksum": "5f2bd3f4dc36fc09fb6ac30d10e06c57e182d5871bccbdb088c08d5c6ca613b7"
+    },
+    {
+      "id": "multi-type-list",
+      "query": "*[_type in [\"article\", \"page\"]]{_id, _type} | order(_id asc)",
+      "queryChecksum": "b3f601eda533741ae91a0f597cfd63e39d4a1a6a60f63439931b0778ca278871"
+    },
+    {
+      "id": "articles-by-tag",
+      "query": "*[_type == \"article\" && $tag in tags]{_id, title} | order(_id asc)",
+      "queryChecksum": "03434473de15f542290d2385608f7a7c985f45315beecf865fbc64d0fbc1bcf5"
+    },
+    {
+      "id": "articles-referencing-author",
+      "query": "*[_type == \"article\" && references($authorId)]{_id, title} | order(_id asc)",
+      "queryChecksum": "ef6c8de7424146bbae45d09952e9adf8038ba17cc613427b3461e68369a1d62c"
+    },
+    {
+      "id": "articles-ordered-sliced",
+      "query": "*[_type == \"article\"] | order(publishedAt desc)[0...20]{title, \"slug\": slug.current}",
+      "queryChecksum": "3641cadebfc34c1b8ad4e6cdd326a6c7f622549afb7f6a9954ee3fefd70e2e57"
+    },
+    {
+      "id": "articles-recent-headlines",
+      "query": "*[_type == \"article\"]{\"headline\": title, \"when\": publishedAt} | order(when desc)[0...5]",
+      "queryChecksum": "973c74d0aaf0401a3c2b06e1ff4bfe66c177a2314acf6d230466d7074db4cb4f"
+    },
+    {
+      "id": "unconstrained-star",
+      "query": "*[]{_id}",
+      "queryChecksum": "21b89f6658780eee57efea21ff5bf94dc2bd26b3fd8bf9e3fbc8223f6365c056"
+    }
+  ]
+}

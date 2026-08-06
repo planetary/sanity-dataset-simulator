@@ -67,7 +67,18 @@ export {
 /* The adapter. */
 export {FsOverlayStore, bundleChecksum} from './fsStore'
 export type {
+  ExportCheckpointToDirOptions,
+  FsCheckpointExportResult,
+  FsCheckpointImportResult,
   FsOverlayStoreHooks,
   FsOverlayStoreOptions,
+  ImportCheckpointToStoreOptions,
   MaterializedDocumentFile,
 } from './fsStore'
+
+/* Checkpoint directory I/O over core's checkpoint format (PRD §14.1, §29.1). */
+export {readCheckpointDir} from './checkpointIo'
+
+/* The direct-edit watcher (PRD §14.3, §14.4). */
+export {watchOverlay, revalidationIsNotable} from './watch'
+export type {OverlayWatchHandle, OverlayWatchOptions} from './watch'

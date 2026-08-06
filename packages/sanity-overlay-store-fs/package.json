@@ -3,8 +3,13 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "exports": {".": "./src/index.ts"},
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "test": "echo 'tested via sanity-overlay-testkit'"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1"
   }
 }

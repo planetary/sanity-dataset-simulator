@@ -17,7 +17,7 @@
  * <path> == $value]` and `*[_type in $types]`; the in-memory adapter below does
  * the same selection in plain JavaScript, which is why it needs no evaluator.
  */
-import type {QueryDocument} from './types'
+import type {CandidateOrderTerm, QueryDocument} from './types'
 
 export type BaseCandidateRequest =
   /** Documents with these exact IDs. */
@@ -28,6 +28,36 @@ export type BaseCandidateRequest =
       readonly types: readonly string[]
       readonly path: readonly string[]
       readonly value: unknown
+    }
+  /** Documents of these types whose local ARRAY at `path` contains `value`. */
+  | {
+      readonly kind: 'field-contains'
+      readonly types: readonly string[]
+      readonly path: readonly string[]
+      readonly value: unknown
+    }
+  /** Documents of these types that reference `id` anywhere (GROQ `references()`). */
+  | {
+      readonly kind: 'references'
+      readonly types: readonly string[]
+      readonly id: string
+    }
+  /**
+   * The top `limit` documents of these types in `order`, ignoring `excludeIds`
+   * — §22.6's bounded top-K base fetch. A hosted adapter issues
+   * `*[_type in $types && !(_id in $exclude)] | order(...)[0...$limit]`.
+   *
+   * The exclusion is what makes the bound `K` rather than `K + affectedCount`:
+   * a base document the branch has already replaced or removed is fetched from
+   * the overlay, never from the base, so it must not consume one of the K slots
+   * that the completeness proof reserves for UNTOUCHED documents.
+   */
+  | {
+      readonly kind: 'order-slice'
+      readonly types: readonly string[]
+      readonly order: readonly CandidateOrderTerm[]
+      readonly limit: number
+      readonly excludeIds: readonly string[]
     }
   /** Every document of these types. */
   | {readonly kind: 'types'; readonly types: readonly string[]}
@@ -51,6 +81,58 @@ function readPath(doc: QueryDocument, path: readonly string[]): unknown {
   return cursor
 }
 
+/** True when `value` contains a reference to `id` anywhere inside it. */
+function referencesId(value: unknown, id: string): boolean {
+  if (Array.isArray(value)) return value.some((item) => referencesId(item, id))
+  if (typeof value !== 'object' || value === null) return false
+  const object = value as Record<string, unknown>
+  if (object._ref === id) return true
+  return Object.values(object).some((child) => referencesId(child, id))
+}
+
+/**
+ * GROQ's value ordering, as pinned `groq-js` implements it, measured rather
+ * than assumed: `order(v desc)` over one document per type returns
+ * `[missing, boolean, string, number]`, so ascending order is
+ * numbers < strings < booleans < null/absent. Values of other kinds (objects,
+ * arrays) are not orderable and tie.
+ */
+const orderRank = (value: unknown): number => {
+  if (typeof value === 'number') return 0
+  if (typeof value === 'string') return 1
+  if (typeof value === 'boolean') return 2
+  return 3
+}
+
+function compareOrdered(a: unknown, b: unknown): number {
+  const rankA = orderRank(a)
+  const rankB = orderRank(b)
+  if (rankA !== rankB) return rankA - rankB
+  if (rankA === 3) return 0
+  if (typeof a === 'boolean' && typeof b === 'boolean') return Number(a) - Number(b)
+  if (a === b) return 0
+  return (a as number | string) < (b as number | string) ? -1 : 1
+}
+
+/**
+ * Sort a candidate pool by the registered order. `Array.prototype.sort` is
+ * stable in every engine this runs on, so documents that tie keep their DATASET
+ * order — which is what `groq-js` does too, and what makes the top-K selection
+ * agree with the whole-dataset oracle when the ordering field is not unique.
+ */
+function sortByOrder(
+  documents: readonly QueryDocument[],
+  order: readonly CandidateOrderTerm[],
+): QueryDocument[] {
+  return [...documents].sort((left, right) => {
+    for (const term of order) {
+      const comparison = compareOrdered(left[term.field], right[term.field])
+      if (comparison !== 0) return term.direction === 'desc' ? -comparison : comparison
+    }
+    return 0
+  })
+}
+
 /**
  * In-memory base source over an already perspective-resolved dataset — the
  * `memory` mode of PRD §9.2 and the substrate for fixture parity tests.
@@ -70,6 +152,32 @@ export function createMemoryBaseSource(documents: readonly QueryDocument[]): Que
           return documents.filter(
             (d) => types.has(d._type) && readPath(d, request.path) === request.value,
           )
+        }
+        case 'field-contains': {
+          const types = new Set(request.types)
+          return documents.filter((d) => {
+            if (!types.has(d._type)) return false
+            const value = readPath(d, request.path)
+            return Array.isArray(value) && value.includes(request.value)
+          })
+        }
+        case 'references': {
+          const types = new Set(request.types)
+          return documents.filter((d) => types.has(d._type) && referencesId(d, request.id))
+        }
+        case 'order-slice': {
+          const types = new Set(request.types)
+          const excluded = new Set(request.excludeIds)
+          const pool = documents.filter((d) => types.has(d._type) && !excluded.has(d._id))
+          const top = new Set(
+            sortByOrder(pool, request.order)
+              .slice(0, request.limit)
+              .map((d) => d._id),
+          )
+          // Base order, not sorted order: the port contract is "stable base
+          // order" for every request kind, and §22.6 step 13 resolves into a
+          // dataset whose order GROQ can observe through a tie.
+          return pool.filter((d) => top.has(d._id))
         }
         case 'types': {
           const types = new Set(request.types)

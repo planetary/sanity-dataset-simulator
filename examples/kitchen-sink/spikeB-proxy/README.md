@@ -9,6 +9,21 @@ Everything here is **new, additive, and self-contained**. No existing file in
 the config change needed to route the Studio through the proxy is documented below
 for the orchestrator to apply deliberately.
 
+> ### Two modes
+>
+> Everything in **this** file describes **Mode 1 — proxy**: a real Sanity project,
+> a real login, real grants, with only the data plane intercepted. It is the
+> default and nothing about it has changed.
+>
+> There is also **Mode 2 — origin** (`--origin` / `OVERLAY_BASE=none`): no Sanity
+> project, no account, no upstream at all. The server answers every request from
+> `.sanity-overlay/` on disk, hands out a fabricated fully-granted `local-dev`
+> identity, and refuses to bind anything but loopback.
+>
+> **Mode 2 is documented separately in [`ORIGIN.md`](./ORIGIN.md)** — what it
+> serves, what it deliberately does not, and the safety controls that make a
+> synthetic-identity server acceptable to run at all.
+
 ## Run
 
 ```bash

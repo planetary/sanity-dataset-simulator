@@ -1,0 +1,22 @@
+{
+  "name": "sanity-overlay-cli",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "sanity-overlay": "./bin/sanity-overlay.mjs"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "scripts": {
+    "test": "echo 'tested via sanity-overlay-testkit'"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1"
+  }
+}

@@ -40,13 +40,16 @@
  */
 import {randomUUID} from 'node:crypto'
 import {mkdir, open, readFile, readdir, rename, rm, stat, writeFile} from 'node:fs/promises'
-import {dirname, join} from 'node:path'
+import {dirname, join, resolve as resolvePath} from 'node:path'
 import {
+  CHECKPOINT_CHECKSUMS_FILE,
   OVERLAY_FORMAT_VERSION,
   assertFormatVersion,
   checksum as canonicalChecksum,
   canonicalize,
   encodeOverlayPath,
+  exportCheckpoint as renderCheckpoint,
+  importCheckpoint as parseCheckpoint,
   isChecksum,
   overlayIdFromIdentityInput,
   parse,
@@ -55,6 +58,9 @@ import {
 } from '../../sanity-overlay-core/src/index'
 import type {
   OverlayActor,
+  OverlayCheckpointChecksums,
+  OverlayCheckpointIssue,
+  OverlayCheckpointState,
   OverlayDocumentHead,
   OverlayDocumentRecord,
   OverlayManifest,
@@ -62,6 +68,8 @@ import type {
   OverlayTransactionRecord,
   SanityDocument,
 } from '../../sanity-overlay-core/src/index'
+import {readCheckpointDir} from './checkpointIo'
+import {watchOverlay, type OverlayWatchHandle, type OverlayWatchOptions} from './watch'
 import {
   DELETABLE_STATUSES,
   WRITABLE_STATUSES,
@@ -127,6 +135,7 @@ import {
 } from './intent'
 import {
   BROKEN_SUFFIX,
+  assertWithinRoot,
   GITATTRIBUTES_CONTENT,
   GITATTRIBUTES_FILE,
   GITIGNORE_CONTENT,
@@ -176,6 +185,55 @@ export interface FsOverlayStoreOptions {
    * state needs. Turn it on where the overlay is the system of record.
    */
   fsync?: boolean
+}
+
+/* ------------------------------------------------------------------ *
+ * Checkpoint I/O (PRD §14.1, §29.1, §29.7)
+ * ------------------------------------------------------------------ */
+
+export interface ExportCheckpointToDirOptions {
+  /**
+   * Directory to write, absolute or relative to the process cwd. Defaults to the
+   * store's own `.sanity-overlay/` — PRD §29.4's
+   * `sanity-overlay export --output .sanity-overlay`. Exporting in place rewrites
+   * the canonical files with identical bytes and adds `checksums.json`.
+   */
+  dir?: string
+  /** Extra files to carry alongside the canonical set; hashed but not validated. */
+  extraFiles?: Record<string, string>
+}
+
+export interface FsCheckpointExportResult {
+  overlayId: string
+  /** Absolute path of the directory written. */
+  dir: string
+  /** Relative POSIX paths written, sorted. */
+  files: string[]
+  checksums: OverlayCheckpointChecksums
+}
+
+export interface ImportCheckpointToStoreOptions {
+  /** Replace an existing overlay instead of failing (PRD §29.7). */
+  overwrite?: boolean
+  /**
+   * `'repair'` (default) normalizes stale checksum metadata per PRD §14.3 and
+   * §29.7 step 3; `'reject'` refuses any divergence, for a strict validate gate.
+   * Semantic corruption always throws, before a single byte is written.
+   */
+  onDivergence?: 'repair' | 'reject'
+  expectOverlayId?: string
+}
+
+export interface FsCheckpointImportResult {
+  overlayId: string
+  /** Absolute path of the directory read. */
+  dir: string
+  manifest: OverlayManifest
+  importedDocuments: number
+  importedSnapshots: number
+  /** Paths whose stale checksum metadata was recomputed (PRD §14.3, §29.2). */
+  repaired: string[]
+  issues: OverlayCheckpointIssue[]
 }
 
 /** Generated artifact written to `.runtime/materialized/<key>.json` (PRD §14.2, §14.4 step 6). */
@@ -733,6 +791,148 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       importedSnapshots: Object.keys(bundle.snapshots).length,
       importedTransactions: bundle.transactions.length,
     }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Checkpoint export and import — PRD §14.1, §14.5, §29.1, §29.4, §29.7
+   *
+   * `exportCanonical` above produces the *transfer* bundle: lossless, including
+   * runtime records and the transaction log. A checkpoint is the *review*
+   * surface: semantic intent plus immutable recovery snapshots, and nothing that
+   * PRD §29.1 keeps out of a PR diff. Rendering and parsing live in core, so the
+   * format is identical whatever writes it; only the bytes-to-disk step is here.
+   * ---------------------------------------------------------------- */
+
+  /** The §29.1 logical state: manifest, one intent per head, referenced snapshots. */
+  async #checkpointState(overlayId: string): Promise<OverlayCheckpointState> {
+    const manifest = await this.#loadManifest()
+    this.#assertIdentity(overlayId, manifest)
+
+    const documents: CheckpointDocumentIntent[] = []
+    const snapshots: Record<string, OverlayBaseSnapshot> = {}
+
+    for (const logicalId of Object.keys(manifest.documentHeads).sort()) {
+      const intent = await this.#loadIntent(logicalId)
+      if (intent === null) {
+        throw new OverlayStoreCorruptError(
+          this.layout.relative(this.layout.intentPath(logicalId)),
+          'manifest head has no readable intent file (PRD §34.3)',
+        )
+      }
+      documents.push(clone(intent))
+      const ref = intent.base.snapshotRef
+      if (ref !== undefined && snapshots[ref] === undefined) {
+        const snapshot = await this.#readSnapshot(ref)
+        if (snapshot === null) {
+          throw new OverlayStoreCorruptError(
+            this.layout.relative(this.layout.snapshotPath(ref)),
+            'intent references a base snapshot that is not stored',
+          )
+        }
+        snapshots[ref] = snapshot
+      }
+    }
+
+    return {manifest: clone(manifest), documents, snapshots}
+  }
+
+  /**
+   * Write the deterministic checkpoint tree (PRD §14.5 `sanity-overlay export`).
+   *
+   * Every file goes through the same temp-file-plus-rename primitive as live
+   * state, and the returned promise settles only once the last rename has
+   * completed — a caller that reports success on this promise is reporting a
+   * durable fact.
+   */
+  async exportCheckpoint(
+    overlayId: string,
+    options: ExportCheckpointToDirOptions = {},
+  ): Promise<FsCheckpointExportResult> {
+    const state = await this.#checkpointState(overlayId)
+    const files = renderCheckpoint(
+      state,
+      options.extraFiles === undefined ? {} : {extraFiles: options.extraFiles},
+    )
+
+    const dir = resolvePath(options.dir ?? this.layout.root)
+    for (const [path, text] of files) {
+      /* Containment is asserted against the *target* directory, so a crafted
+       * logical ID cannot write outside it (PRD §35.9). */
+      await this.#writeText(assertWithinRoot(dir, path), text)
+    }
+
+    return {
+      overlayId,
+      dir,
+      files: [...files.keys()],
+      checksums: parse(files.get(CHECKPOINT_CHECKSUMS_FILE)!) as OverlayCheckpointChecksums,
+    }
+  }
+
+  /**
+   * Load a committed checkpoint tree into this store (PRD §14.5
+   * `sanity-overlay import`, §29.7 "Import on preview initialization").
+   *
+   * Verification happens over the whole tree in memory before anything is
+   * written, so semantic corruption leaves the target store exactly as it was
+   * rather than half-loaded. Pointing this at the store's own root normalizes it
+   * in place — PRD §14.5 `normalize --repair-checksums`.
+   */
+  async importCheckpoint(
+    dir: string,
+    options: ImportCheckpointToStoreOptions = {},
+  ): Promise<FsCheckpointImportResult> {
+    const source = resolvePath(dir)
+    const files = await readCheckpointDir(source)
+    const parsed = parseCheckpoint(files, {
+      ...(options.onDivergence === undefined ? {} : {onDivergence: options.onDivergence}),
+      ...(options.expectOverlayId === undefined ? {} : {expectOverlayId: options.expectOverlayId}),
+    })
+
+    const existing = await this.#readManifestFile()
+    if (!existing.missing) {
+      if (options.overwrite !== true) {
+        throw new OverlayAlreadyExistsError(existing.value?.overlayId ?? '<unreadable>', {
+          hint: 'pass {overwrite: true} to replace the stored overlay (PRD §29.7)',
+        })
+      }
+      await rm(this.layout.root, {recursive: true, force: true})
+      this.#resetCaches()
+    }
+
+    await this.#scaffold()
+
+    for (const [address, snapshot] of Object.entries(parsed.state.snapshots)) {
+      await this.#writeJson(this.layout.snapshotPath(address), snapshot)
+    }
+    for (const intent of parsed.state.documents) {
+      const logicalId = toPublishedId(intent.logicalId)
+      const bytes = serialize(intent)
+      await this.#writeText(this.layout.intentPath(logicalId), bytes)
+      this.#lastValidIntents.set(logicalId, {intent, bytes})
+      this.#conflictCounts.set(logicalId, countConflicts(intent))
+    }
+    await this.#writeManifest(clone(parsed.state.manifest))
+
+    return {
+      overlayId: parsed.state.manifest.overlayId,
+      dir: source,
+      manifest: clone(parsed.state.manifest),
+      importedDocuments: parsed.state.documents.length,
+      importedSnapshots: Object.keys(parsed.state.snapshots).length,
+      repaired: [...parsed.repaired],
+      issues: [...parsed.issues],
+    }
+  }
+
+  /**
+   * Watch the canonical files for direct agent edits (PRD §14.3, §14.4).
+   *
+   * A thin trigger over {@link FsOverlayStore.revalidate}; see `watch.ts` for why
+   * it polls and why a subscriber is never notified before the work is durable.
+   */
+  watch(overlayId: string, options: OverlayWatchOptions = {}): OverlayWatchHandle {
+    return watchOverlay(this, overlayId, options)
   }
 
   /* ---------------------------------------------------------------- *

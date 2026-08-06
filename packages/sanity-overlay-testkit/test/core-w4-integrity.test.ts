@@ -458,6 +458,176 @@ describe('scanReverseReferences (PRD §19.4)', () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * Regression — separator collisions in the §19.4 dedupe key
+ * ------------------------------------------------------------------ *
+ *
+ * The scan deduplicates findings by an identity built from three strings: the
+ * referring document ID, the encoded path, and the target ID. Joining them with
+ * a separator `S` makes that identity ambiguous the moment any of the three
+ * contains `S`: the string `a S b S c S d` splits as `(a, b, "c S d")` and just
+ * as well as `("a S b", c, d)`, so two GENUINELY DIFFERENT reverse references
+ * collapse into one entry and the scan under-reports.
+ *
+ * That is not cosmetic. `incomingReferences` and `createStrongReferenceCheck`
+ * (§18.8, invariant §34.10) refuse a delete exactly when the scan still shows an
+ * incoming strong reference, so a dropped finding is a delete that should have
+ * been blocked and was not.
+ *
+ * The three parts are unconstrained strings by core's own contract: `_ref` is
+ * verbatim document content (`isReferenceValue` only requires a non-empty
+ * string) and the logical-ID encoder deliberately escapes EVERY byte outside
+ * `[a-z0-9_-]` (`encoding.ts` section (b)), which is a written statement that
+ * IDs carry arbitrary bytes. `encodeOverlayPath` is injective on its own — the
+ * collision comes from the join, not from the encoder — so the fix is a
+ * structural key, and the family below is parameterised over separators so that
+ * no future choice of `S` can reintroduce it.
+ */
+describe('the §19.4 dedupe key is separator-independent', () => {
+  const SEPARATORS: ReadonlyArray<{name: string; char: string}> = [
+    {name: 'a NUL', char: '\u0000'},
+    {name: 'a space', char: ' '},
+    {name: 'a comma', char: ','},
+    {name: 'a pipe', char: '|'},
+    {name: 'a newline', char: '\n'},
+  ]
+
+  for (const {name, char} of SEPARATORS) {
+    it(`keeps two distinct reverse references apart when the parts contain ${name}`, () => {
+      /* Both tuples join to `doc-a S $.p S $.q S b` under any separator `S`:
+       * the joined string carries three separators and the key only accounts
+       * for two of them. */
+      const firstReferrer = 'doc-a'
+      const firstTarget = `$.q${char}b`
+      const secondReferrer = `doc-a${char}$.p`
+      const secondTarget = 'b'
+
+      const state = applyTransaction(
+        emptyState(),
+        [
+          {
+            type: 'create',
+            document: {
+              _id: firstReferrer,
+              _type: 'page',
+              p: {_type: 'reference', _ref: firstTarget},
+            },
+          },
+          {
+            type: 'create',
+            document: {
+              _id: secondReferrer,
+              _type: 'page',
+              q: {_type: 'reference', _ref: secondTarget},
+            },
+          },
+        ],
+        tx(),
+      ).state
+
+      const result = scanReverseReferences(state, {targetIds: [firstTarget, secondTarget]})
+
+      /* Independent oracle: two different documents each hold one reference, at
+       * different paths, to different targets. Nothing about them is duplicate,
+       * so the scan owes exactly two findings. */
+      expect(
+        result.references.map((reference) => [
+          reference.referringDocumentId,
+          reference.path,
+          reference.targetId,
+        ]),
+      ).toEqual([
+        [firstReferrer, ['p'], firstTarget],
+        [secondReferrer, ['q'], secondTarget],
+      ])
+    })
+  }
+
+  /**
+   * The consequence, spelled out at the §18.8 boundary rather than at the key.
+   *
+   * Two documents refer to `b`: one weakly, one strongly. Their dedupe keys
+   * collide, the first one entered wins, and the survivor is the WEAK one — so
+   * the scan reports `b` as weakly referenced only and the delete check finds
+   * nothing to refuse. A strong reference is left dangling, which invariant
+   * §34.10 says can never happen.
+   *
+   * The two paths are `["p\u0000$", "q"]` and `["q"]`: encoded they are
+   * `$.p<S>$.q` and `$.q`, which is what lets one referrer ID absorb the other
+   * referrer ID plus a whole path segment.
+   */
+  it.each([
+    {name: 'a NUL', char: '\u0000'},
+    {name: 'a space', char: ' '},
+    {name: 'a comma', char: ','},
+    {name: 'a pipe', char: '|'},
+  ])('refuses a delete whose only strong referrer collides under $name', ({char}) => {
+    const weakReferrer = 'doc-a'
+    const strongReferrer = `doc-a${char}$.p`
+
+    const state = applyTransaction(
+      emptyState(),
+      [
+        {type: 'create', document: {_id: 'b', _type: 'page', title: 'Target'}},
+        {
+          type: 'create',
+          document: {
+            _id: weakReferrer,
+            _type: 'page',
+            [`p${char}$`]: {q: {_type: 'reference', _ref: 'b', _weak: true}},
+          },
+        },
+        {
+          type: 'create',
+          document: {
+            _id: strongReferrer,
+            _type: 'page',
+            q: {_type: 'reference', _ref: 'b'},
+          },
+        },
+      ],
+      tx(),
+    ).state
+
+    /* Independent oracle: the state itself. `strongReferrer` holds a reference
+     * value with no `_weak` marker, which §19.5 classifies as strong, and it is
+     * still there when the delete is attempted. §18.8 must refuse. */
+    expect(() =>
+      deleteDocument(
+        state,
+        {id: 'b'},
+        {...tx(), checkStrongReferences: createStrongReferenceCheck(state, {})},
+      ),
+    ).toThrowError(OverlayActionBlockedError)
+
+    /* And the scan the check reads must have seen both referrers, not one. */
+    expect(
+      scanReverseReferences(state, {targetIds: ['b']}).references.map(
+        (reference) => reference.strength,
+      ),
+    ).toEqual(['weak', 'strong'])
+  })
+
+  it('still collapses a genuinely duplicate finding into one entry', () => {
+    /* The other half of the contract: the fix must not turn the dedupe off.
+     * `page-1` referring to `author-1` is reported by BOTH the base hits and the
+     * overlay re-extraction, and must stay one entry marked `both`. */
+    const state = edit(
+      emptyState(),
+      {id: 'page-1', operations: [{type: 'set', path: ['title'], value: 'Compilers, revised'}]},
+      {...tx(), base},
+    ).state
+
+    const result = scanReverseReferences(state, {targetIds: ['author-1'], base, baseReferences})
+    const page1 = result.references.filter(
+      (reference) => reference.referringDocumentId === 'page-1',
+    )
+
+    expect(page1).toHaveLength(1)
+    expect(page1[0]?.source).toBe('both')
+  })
+})
+
+/* ------------------------------------------------------------------ *
  * §18.8 / §19.5 / §34.10 — strong and weak integrity checks
  * ------------------------------------------------------------------ */
 

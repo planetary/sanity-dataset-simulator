@@ -105,6 +105,40 @@ export function ovTypeChange(base: readonly QueryDocument[]): OverlaySource {
   return o
 }
 
+/**
+ * The overlay an ORDERED SLICE has to survive (§22.6 bounded top-K).
+ *
+ * Three things happen at once, and each one alone would defeat a planner that
+ * simply fetched the base top K:
+ *
+ *   - the three newest articles are tombstoned, so three untouched articles
+ *     from BELOW the requested slice must move up into it;
+ *   - the oldest article is edited to the newest timestamp, so a document the
+ *     base ordering puts last must appear first;
+ *   - a branch-created article lands inside the slice with no base row at all.
+ *
+ * A planner that fetches the base top K and stops returns a SHORT slice here,
+ * which the whole-dataset oracle catches. That is the completeness half; the
+ * boundedness half (it must not answer this by scanning the type) lives in
+ * `query-boundedness.test.ts`.
+ */
+export function ovSliceShift(base: readonly QueryDocument[]): OverlaySource {
+  const o = empty()
+  for (const id of ['article-01', 'article-02', 'article-03']) o.tombstones.add(id)
+  const promoted = find(base, 'article-30')
+  promoted.publishedAt = '2026-03-01T12:00:00Z'
+  promoted.title = 'Article 30 (branch republished)'
+  o.documents.set(promoted._id, promoted)
+  const created = find(base, 'article-10')
+  created._id = 'article-branch-top'
+  created._rev = 'branch-rev-article-branch-top'
+  created.title = 'Branch top article'
+  created.slug = slug('branch-top-article')
+  created.publishedAt = '2026-02-15T12:00:00Z'
+  o.documents.set(created._id, created)
+  return o
+}
+
 /** Create, edit and delete at once — the shape a real branch actually has. */
 export function ovMixed(base: readonly QueryDocument[]): OverlaySource {
   const o = empty()
@@ -136,5 +170,6 @@ export const M_LOCAL_PARITY_OVERLAYS: Record<
   'tombstone': () => ovTombstone(),
   'ref-target-change': ovRefTargetChange,
   'type-change': ovTypeChange,
+  'slice-shift': ovSliceShift,
   'mixed': ovMixed,
 }

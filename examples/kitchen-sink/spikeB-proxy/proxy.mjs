@@ -48,6 +48,12 @@ import {dirname, join} from 'node:path'
 import {fileURLToPath, pathToFileURL} from 'node:url'
 
 import {createRealtimeFrameGuard, isWriteRequest} from './writeGuard.mjs'
+import {
+  assertLoopbackBind,
+  isLoopbackBind,
+  isOriginModeRequested,
+  isOriginWriteRoute,
+} from './originSafety.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -240,13 +246,34 @@ export function resolveProxyConfig(options = {}) {
   const upstream = new URL(
     options.upstream || env.SANITY_API_HOST || 'https://b1n03q3z.api.sanity.io',
   )
+  /**
+   * MODE 2 (origin). Explicit opt-in only — see `originSafety.mjs`. In Mode 2
+   * `upstream` is still resolved (the default keeps the config shape stable and
+   * one less branch downstream) but is never dialled: the request path returns
+   * before it can be.
+   */
+  const origin = isOriginModeRequested(options, env)
   return {
     port: options.port ?? Number(env.PROXY_PORT || 3999),
-    bind: options.bind ?? env.PROXY_BIND ?? undefined,
+    // Mode 2 defaults to loopback instead of "every interface". An explicit
+    // non-loopback bind is not corrected here — it is refused, loudly, below.
+    bind: options.bind ?? env.PROXY_BIND ?? (origin ? '127.0.0.1' : undefined),
     upstream,
-    blockWrites:
-      options.blockWrites ??
-      (env.PROXY_BLOCK_WRITES === '1' || env.PROXY_BLOCK_WRITES === 'true'),
+    origin,
+    /**
+     * The overlay-backed request handler, injected. It lives in `origin.mjs`,
+     * which imports the TypeScript overlay packages; keeping it an option is
+     * what lets this file stay loadable by bare `node proxy.mjs` in Mode 1.
+     */
+    originHandler: options.originHandler ?? null,
+    blockWrites: origin
+      ? // In Mode 2 the guard is not a policy switch. `PROXY_BLOCK_WRITES=0`
+        // there would mean "classify nothing", and since Mode 2 routes two
+        // classified writes to the overlay, an unclassified request would fall
+        // through the whole boundary. Forced on, with no way to ask otherwise.
+        true
+      : (options.blockWrites ??
+        (env.PROXY_BLOCK_WRITES === '1' || env.PROXY_BLOCK_WRITES === 'true')),
     deriveProjectHost: options.deriveProjectHost ?? env.PROXY_DERIVE_PROJECT_HOST !== '0',
     forwardOrigin: options.forwardOrigin ?? env.PROXY_FORWARD_ORIGIN === '1',
     rewriteCookies: options.rewriteCookies ?? env.PROXY_REWRITE_COOKIES !== '0',
@@ -283,7 +310,24 @@ export function createProxyServer(options = {}) {
     logPath: LOG_PATH,
     verbose: VERBOSE,
     dialUpstream: DIAL_UPSTREAM,
+    origin: ORIGIN,
+    originHandler: ORIGIN_HANDLER,
   } = config
+
+  /* --- Mode 2 preconditions, checked before a socket exists ---------------
+   *
+   * Both are hard failures rather than warnings. Mode 2 serves a fabricated
+   * full-grant identity; a Mode 2 process that started with either of these
+   * wrong is a process that should not be running at all. */
+  if (ORIGIN) {
+    assertLoopbackBind(config.bind)
+    if (ORIGIN_HANDLER === null || typeof ORIGIN_HANDLER.handle !== 'function') {
+      throw new Error(
+        'Mode 2 (origin) needs an `originHandler` — build one with ' +
+          '`createOriginHandler()` from ./origin.mjs, or use ./runOrigin.mjs.',
+      )
+    }
+  }
 
   const upstreamIsTls = UPSTREAM.protocol === 'https:'
   const upstreamPort = Number(UPSTREAM.port || (upstreamIsTls ? 443 : 80))
@@ -424,7 +468,16 @@ export function createProxyServer(options = {}) {
     }
 
     // --- 2. Overlay write guard ----------------------------------------------
-    if (isBlockedWrite(req.method, req.url || '/')) {
+    //
+    // MODE 2 NOTE. The guard is consulted first and unchanged. The only thing
+    // Mode 2 adds is a second question asked of the *same* verdict: is this one
+    // of the two writes the overlay owns? If not, the 403 below stands exactly
+    // as it does in Mode 1. `isOriginWriteRoute` is strict-canonical, so no
+    // normalisation escape can reach the overlay through this branch — see
+    // `originSafety.mjs`.
+    const originOwnsWrite =
+      ORIGIN && isOriginWriteRoute(req.method, req.url || '/', ORIGIN_HANDLER?.dataset)
+    if (!originOwnsWrite && isBlockedWrite(req.method, req.url || '/')) {
       const body = JSON.stringify({
         error: {
           code: 'OVERLAY_WRITE_BLOCKED',
@@ -447,7 +500,38 @@ export function createProxyServer(options = {}) {
       return
     }
 
-    // --- 3. Forward ------------------------------------------------------------
+    // --- 3. MODE 2: answer from the overlay, and never dial anything ---------
+    if (ORIGIN) {
+      Promise.resolve(ORIGIN_HANDLER.handle(req, res, {pathname, search, apiPath, cors: corsHeaders(req)}))
+        .then(() => finish(res.statusCode || 200, false))
+        .catch((err) => {
+          if (!res.headersSent) {
+            const body = JSON.stringify({
+              error: {
+                code: 'OVERLAY_ORIGIN_ERROR',
+                description: 'The overlay origin failed to answer this request',
+                message: err?.message ?? String(err),
+              },
+            })
+            try {
+              res.writeHead(500, {
+                ...corsHeaders(req),
+                'Content-Type': 'application/json; charset=utf-8',
+                'Content-Length': Buffer.byteLength(body),
+              })
+              res.end(body)
+            } catch {
+              res.destroy()
+            }
+          } else {
+            res.destroy()
+          }
+          finish(500, false)
+        })
+      return
+    }
+
+    // --- 4. Mode 1: forward upstream -------------------------------------------
     const hostname = resolveUpstreamHostname(req)
     const sse = isListenPath(apiPath)
 
@@ -649,6 +733,11 @@ export function createProxyServer(options = {}) {
     }
 
     // --- write guard, transport-independent ----------------------------------
+    //
+    // MODE 2 does NOT extend the origin write allowlist to this path. The two
+    // overlay-owned routes are ordinary POSTs with a body; there is no reason
+    // for either to arrive as an upgrade, and "the same write, but wearing two
+    // extra headers" is precisely the shape this handler's 403 exists to stop.
     if (isBlockedWrite(req.method, req.url || '/')) {
       const body = JSON.stringify({
         error: {
@@ -673,6 +762,31 @@ export function createProxyServer(options = {}) {
         clientSocket.destroy()
       }
       finish(403, true)
+      return
+    }
+
+    // --- MODE 2: the socket terminates here; there is nothing to tunnel to ----
+    if (ORIGIN) {
+      let status = 501
+      try {
+        if (typeof ORIGIN_HANDLER.handleUpgrade === 'function') {
+          status = ORIGIN_HANDLER.handleUpgrade(req, clientSocket, head, {pathname, search, apiPath}) || 101
+        } else if (clientSocket.writable) {
+          clientSocket.end(
+            'HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          )
+        }
+      } catch (err) {
+        if (clientSocket.writable) {
+          clientSocket.end(
+            'HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          )
+        } else {
+          clientSocket.destroy()
+        }
+        status = 500
+      }
+      finish(status)
       return
     }
 
@@ -867,6 +981,31 @@ export function createProxyServer(options = {}) {
       socket.destroy()
     }
   })
+
+  /* --- Mode 2: the same check again, against the address really bound -------
+   *
+   * `assertLoopbackBind(config.bind)` above reads the *config*. `listen()` takes
+   * its own host argument and never consults it, so a launcher that passed
+   * `server.listen(port)` — or `listen(port, '0.0.0.0')` — would sail past the
+   * construction-time check and publish a full-grant identity server on every
+   * interface. The authority on where a socket is bound is the socket, so the
+   * socket is asked, and a wrong answer closes it before the first request. */
+  if (ORIGIN) {
+    server.on('listening', () => {
+      const address = server.address()
+      const bound = address === null || typeof address === 'string' ? address : address.address
+      if (isLoopbackBind(bound)) return
+      server.close()
+      server.emit(
+        'error',
+        new Error(
+          `Mode 2 (origin) refused to serve: the socket bound ${String(bound)}, which is not a ` +
+            'loopback address. Its identity is synthetic and unauthenticated; it may only ' +
+            'listen on 127.0.0.0/8 or ::1.',
+        ),
+      )
+    })
+  }
 
   server.proxyConfig = config
   return server
