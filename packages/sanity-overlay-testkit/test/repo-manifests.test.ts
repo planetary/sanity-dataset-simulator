@@ -17,10 +17,36 @@
  * resolve them through the hoisted root and pass on exactly the input that
  * breaks in the wild.
  *
- * Cross-package imports in this repo are written as RELATIVE paths
- * (`../../sanity-overlay-core/src/index`) on purpose — packages are consumed
- * from source, not from a build output. Relative specifiers are therefore not
- * dependencies and are skipped, not flagged.
+ * WHY RELATIVE SPECIFIERS ARE NO LONGER SKIPPED.
+ *
+ * This file, and `test/studio-install.test.ts` before it, skipped every
+ * specifier beginning with `.` — the stated reason being that cross-package
+ * imports here are written as relative paths on purpose, packages being consumed
+ * from source rather than from a build output, so a relative specifier is not a
+ * dependency and cannot be missing from a manifest.
+ *
+ * The first half of that is true and still is. The conclusion was not. A
+ * relative specifier that leaves its own package root, such as
+ * `../../sanity-overlay-core/src/index` written inside
+ * `packages/sanity-overlay-store-fs/src/`, is not "not a dependency" — it is a
+ * dependency expressed in a form no manifest can declare and no installer can
+ * satisfy. `packages/` is a directory that exists in this checkout and nowhere
+ * else. Installed from a registry, or linked into a consumer's `node_modules`,
+ * the path resolves to nothing and the package fails to load.
+ *
+ * That is the SAME defect the rest of this file exists to catch — an import the
+ * consumer cannot resolve, invisible in-repo because the checkout happens to
+ * have the file where the path points — and skipping the specifier hid the
+ * larger half of it. Skipping meant the test named "the package can actually be
+ * installed and resolved" was green while no package in the workspace could be
+ * installed at all.
+ *
+ * So the convention changes: a relative specifier that stays inside its own
+ * package is correct and is ignored; one that escapes is a defect and is named.
+ * The 85 that exist today are pinned in KNOWN_ESCAPING below rather than
+ * silently skipped, in the same self-cleaning shape as every other pinned list
+ * here — a new one turns this red, and fixing one turns it red too, until the
+ * entry is deleted. The pin is a blocked-work ledger, not an exemption.
  */
 import {existsSync, readdirSync, readFileSync, statSync} from 'node:fs'
 import {dirname, join, resolve, sep} from 'node:path'
@@ -571,6 +597,287 @@ describe('every package declares what it imports', () => {
   )
 })
 
+/*
+ * ---------------------------------------------------------------------------
+ * Imports that leave their own package.
+ *
+ * See the header for why these are a defect rather than a convention. The
+ * question each answers is: would Node still find this file if the package were
+ * unpacked on its own, anywhere else on disk? A specifier that resolves outside
+ * the package directory answers no.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * True when `specifier`, written in `file`, resolves outside `pkgPath`.
+ *
+ * Bare specifiers are NOT this check's business — they resolve through
+ * node_modules and are already covered by "every package declares what it
+ * imports" above. Only path specifiers can escape a directory.
+ */
+function escapesPackage(pkgPath: string, file: string, specifier: string): boolean {
+  if (!specifier.startsWith('.') && !specifier.startsWith('/')) return false
+  const target = specifier.startsWith('/') ? specifier : resolve(dirname(file), specifier)
+  /*
+   * The trailing separator is load-bearing. A bare `startsWith(pkgPath)` would
+   * read `packages/sanity-overlay-core-extra/...` as being inside
+   * `packages/sanity-overlay-core`, and an escape into a sibling whose name
+   * merely starts with this one's would pass silently.
+   */
+  return target !== pkgPath && !target.startsWith(`${pkgPath}${sep}`)
+}
+
+/**
+ * The top-level directories a package's own manifest publishes — the union of
+ * the roots named by `exports`, `bin` and `files`.
+ *
+ * Scoping to these is the difference between the claim being made and a
+ * different, false one. `sanity-overlay-testkit/test/` reaches into every
+ * sibling package by relative path 275 times, and that is correct: it is the
+ * workspace's test runner, it is not reachable from any `exports` entry, and no
+ * consumer ever loads it. Flagging it would report 275 defects that do not
+ * exist. What must resolve after an install is what `exports` and `bin` can
+ * reach, and that is exactly what is scanned.
+ */
+function shippedRoots(pkg: Pkg): string[] {
+  const entries = [
+    ...Object.values(pkg.manifest.exports ?? {}),
+    ...Object.values(pkg.manifest.bin ?? {}),
+    ...(pkg.manifest.files ?? []),
+  ]
+  const roots = new Set<string>()
+  for (const entry of entries) {
+    const first = entry.replace(/^\.\//, '').split('/')[0]
+    if (first !== '' && first !== '.') roots.add(first)
+  }
+  return [...roots].sort()
+}
+
+function escapingImports(pkg: Pkg): string[] {
+  const roots = shippedRoots(pkg).map((root) => join(pkg.path, root) + sep)
+  const out: string[] = []
+  for (const file of sourceFiles(pkg.path)) {
+    if (!roots.some((root) => file.startsWith(root))) continue
+    for (const specifier of moduleSpecifiers(readFileSync(file, 'utf8'))) {
+      if (escapesPackage(pkg.path, file, specifier)) out.push(`${rel(file)} -> ${specifier}`)
+    }
+  }
+  return [...new Set(out)].sort()
+}
+
+describe('an import that leaves its own package is found', () => {
+  /*
+   * Synthetic, because the pinned list below stops being able to prove anything
+   * about the classifier the moment it is emptied — which is the whole goal. A
+   * classifier that returned `false` for everything would satisfy an empty
+   * KNOWN_ESCAPING forever and report the workspace as installable while it was
+   * not. These cases keep it honest independently of the repo's state.
+   */
+  const P = `${sep}pkg`
+  const FILE = join(P, 'src', 'a.ts')
+
+  it('accepts specifiers that stay inside the package', () => {
+    expect(escapesPackage(P, FILE, './b')).toBe(false)
+    expect(escapesPackage(P, FILE, './nested/b')).toBe(false)
+    expect(escapesPackage(P, FILE, '../lib/b')).toBe(false)
+    expect(escapesPackage(P, join(P, 'src', 'deep', 'a.ts'), '../../b')).toBe(false)
+  })
+
+  it('rejects a specifier that resolves into a sibling package', () => {
+    expect(escapesPackage(P, FILE, '../../other/src/index')).toBe(true)
+    expect(escapesPackage(P, FILE, '../../../elsewhere')).toBe(true)
+  })
+
+  it('rejects an absolute specifier', () => {
+    /* Absolute paths are checkout-specific in the same way and worse. */
+    expect(escapesPackage(P, FILE, '/somewhere/else')).toBe(true)
+  })
+
+  it('is not fooled by a sibling whose name starts with this package name', () => {
+    /* `/pkg` vs `/pkg-extra`: a prefix match without a separator says "inside". */
+    expect(escapesPackage(P, FILE, '../../pkg-extra/src/index')).toBe(true)
+  })
+
+  it('leaves bare specifiers to the manifest check', () => {
+    expect(escapesPackage(P, FILE, 'groq-js')).toBe(false)
+    expect(escapesPackage(P, FILE, '@sanity/client')).toBe(false)
+    expect(escapesPackage(P, FILE, 'node:fs')).toBe(false)
+  })
+})
+
+describe('the shipped surface of a package is what gets scanned', () => {
+  it('reads the roots a manifest actually publishes', () => {
+    const cli = ALL.find((p) => p.dir === 'sanity-overlay-cli')!
+    const query = ALL.find((p) => p.dir === 'sanity-overlay-query')!
+    expect(shippedRoots(cli)).toEqual(['bin', 'src'])
+    expect(shippedRoots(query)).toEqual(['parity', 'src'])
+  })
+
+  it('every package ships at least one directory, and it exists', () => {
+    /*
+     * Same failure mode `typecheckRoots` guards against: a manifest edit that
+     * left `shippedRoots` empty would drop the package out of the scan below
+     * with nothing going red — a silent under-report, which is the direction
+     * this whole file treats as dangerous.
+     */
+    for (const pkg of ALL) {
+      const roots = shippedRoots(pkg)
+      expect(roots.length, `${pkg.dir}: ships nothing`).toBeGreaterThan(0)
+      for (const root of roots) {
+        expect(existsSync(join(pkg.path, root)), `${pkg.dir}: ${root}`).toBe(true)
+      }
+    }
+  })
+})
+
+describe('no package imports its way out of its own directory', () => {
+  /*
+   * PINNED BLOCKED WORK, not an allowlist.
+   *
+   * Every entry here is a real defect: the importing package cannot be
+   * installed while the entry stands. They are pinned rather than merely
+   * skipped so that the count is visible, the work is enumerated, and the two
+   * directions both fail — a NEW escaping import is red because it is not
+   * listed, and a FIXED one is red because it still is.
+   *
+   * Clearing an entry means declaring the target as a workspace dependency
+   * (`"sanity-overlay-core": "workspace:*"`) and importing it by package name.
+   * That REQUIRES `pnpm install` at the repo root first: pnpm's isolated linker
+   * creates `packages/<pkg>/node_modules/<dep>` only for dependencies a manifest
+   * declares, and none are declared today, so a package-name import resolves to
+   * `Cannot find package` until the install has run. Verified 2026-08-06 by
+   * converting one import and watching it fail, then pass with the link in
+   * place.
+   *
+   * Several targets are DEEP paths (`sanity-overlay-core/src/store/contract`,
+   * `sanity-overlay-query/src/planner`). Those need a subpath `exports` entry
+   * on the target package as well, or the import must move to the barrel.
+   */
+  const KNOWN_ESCAPING: Record<string, string[]> = {
+    'sanity-overlay-cli': [
+      'packages/sanity-overlay-cli/src/commands/cleanup.ts -> ../../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-cli/src/commands/codemod.ts -> ../../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-cli/src/commands/conflicts.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/diff.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/history.ts -> ../../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-cli/src/commands/inspect.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/lint.ts -> ../../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-cli/src/commands/normalize.ts -> ../../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-cli/src/commands/query.ts -> ../../../sanity-overlay-client/src/index',
+      'packages/sanity-overlay-cli/src/commands/query.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/query.ts -> ../../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-cli/src/commands/rebase.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/reset.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/status.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/validate.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/commands/validate.ts -> ../../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-cli/src/diff.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/overlay.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/overlay.ts -> ../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-cli/src/records.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/render.ts -> ../../sanity-overlay-core/src/index',
+    ],
+    'sanity-overlay-client': [
+      'packages/sanity-overlay-client/src/assets.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-client/src/base.ts -> ../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-client/src/client.ts -> ../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-client/src/dev/seedOverlay.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-client/src/dev/seedOverlay.ts -> ../../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-client/src/env.ts -> ../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-client/src/fsLoader.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-client/src/fsLoader.ts -> ../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-client/src/overlaySource.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-client/src/overlaySource.ts -> ../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-client/src/types.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-client/src/types.ts -> ../../sanity-overlay-query/src/index',
+    ],
+    'sanity-overlay-core': [],
+    'sanity-overlay-next': [
+      'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-next/src/queries.ts -> ../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-next/src/server.ts -> ../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-next/src/translate.ts -> ../../sanity-overlay-core/src/index',
+    ],
+    'sanity-overlay-query': [
+      'packages/sanity-overlay-query/src/registry.ts -> ../../sanity-overlay-core/src/checksum',
+    ],
+    'sanity-overlay-store-fs': [
+      'packages/sanity-overlay-store-fs/src/assetStore.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-store-fs/src/checkpointIo.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-store-fs/src/contract.ts -> ../../sanity-overlay-core/src/store/contract',
+      'packages/sanity-overlay-store-fs/src/errors.ts -> ../../sanity-overlay-core/src/store/errors',
+      'packages/sanity-overlay-store-fs/src/fsStore.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-store-fs/src/intent.ts -> ../../sanity-overlay-core/src/store/intent',
+      'packages/sanity-overlay-store-fs/src/layout.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-store-fs/src/watch.ts -> ../../sanity-overlay-core/src/index',
+    ],
+    'sanity-overlay-studio': [
+      'packages/sanity-overlay-studio/src/client/facade.ts -> ../../../sanity-overlay-client/src/stagingHost',
+      'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-query/src/baseSource',
+      'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-query/src/overlaySource',
+      'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-query/src/planner',
+      'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-query/src/registry',
+      'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-query/src/types',
+      'packages/sanity-overlay-studio/src/client/perspective.ts -> ../../../sanity-overlay-query/src/baseSource',
+      'packages/sanity-overlay-studio/src/client/perspective.ts -> ../../../sanity-overlay-query/src/overlaySource',
+      'packages/sanity-overlay-studio/src/client/perspective.ts -> ../../../sanity-overlay-query/src/types',
+      'packages/sanity-overlay-studio/src/client/readPlan.ts -> ../../../sanity-overlay-query/src/baseSource',
+      'packages/sanity-overlay-studio/src/client/readPlan.ts -> ../../../sanity-overlay-query/src/evaluate',
+      'packages/sanity-overlay-studio/src/client/readPlan.ts -> ../../../sanity-overlay-query/src/overlaySource',
+      'packages/sanity-overlay-studio/src/client/readPlan.ts -> ../../../sanity-overlay-query/src/planner',
+      'packages/sanity-overlay-studio/src/client/readPlan.ts -> ../../../sanity-overlay-query/src/registry',
+      'packages/sanity-overlay-studio/src/client/readPlan.ts -> ../../../sanity-overlay-query/src/types',
+      'packages/sanity-overlay-studio/src/client/readSource.ts -> ../../../sanity-overlay-query/src/baseSource',
+      'packages/sanity-overlay-studio/src/client/readSource.ts -> ../../../sanity-overlay-query/src/overlaySource',
+      'packages/sanity-overlay-studio/src/client/readSource.ts -> ../../../sanity-overlay-query/src/types',
+      'packages/sanity-overlay-studio/src/client/reads.ts -> ../../../sanity-overlay-query/src/baseSource',
+      'packages/sanity-overlay-studio/src/client/reads.ts -> ../../../sanity-overlay-query/src/overlaySource',
+      'packages/sanity-overlay-studio/src/client/reads.ts -> ../../../sanity-overlay-query/src/types',
+      'packages/sanity-overlay-studio/src/client/transport.ts -> ../../../sanity-overlay-client/src/stagingHost',
+      'packages/sanity-overlay-studio/src/conflictPanel.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-studio/src/conflicts.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-studio/src/documentActions.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-studio/src/operations.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-studio/src/options.ts -> ../../sanity-overlay-client/src/env',
+      'packages/sanity-overlay-studio/src/options.ts -> ../../sanity-overlay-client/src/stagingHost',
+      'packages/sanity-overlay-studio/src/ui/conflictPanel.ts -> ../../../sanity-overlay-core/src/index',
+    ],
+    'sanity-overlay-testkit': [
+      'packages/sanity-overlay-testkit/src/mergeFixtures.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-testkit/src/referenceFixtures.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-testkit/src/referenceFixtures.ts -> ../../sanity-overlay-core/src/references/index',
+      'packages/sanity-overlay-testkit/src/referenceFixtures.ts -> ../../sanity-overlay-core/src/validation/index',
+      'packages/sanity-overlay-testkit/src/storeContract.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-testkit/src/validationFixtures.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-testkit/src/validationFixtures.ts -> ../../sanity-overlay-core/src/validation/index',
+    ],
+  }
+
+  it('KNOWN_ESCAPING names every package, so a new one cannot be added unnoticed', () => {
+    expect(Object.keys(KNOWN_ESCAPING).sort()).toEqual(ALL.map((p) => p.dir).sort())
+  })
+
+  it.each(ALL.map((p) => [p.dir, p] as const))(
+    '%s: only the escaping imports known today are present',
+    (dir, pkg) => {
+      expect(escapingImports(pkg)).toEqual([...KNOWN_ESCAPING[dir]].sort())
+    },
+  )
+
+  it('the workspace still cannot be installed, and the ledger says by how much', () => {
+    /*
+     * The headline `[M-LOCAL]` blocker as a single number, so progress is
+     * legible and completion is unambiguous: this reaches 0 when every package
+     * resolves its siblings by name. It is derived from the scan, not from the
+     * pinned list, so it cannot drift from reality.
+     */
+    expect(ALL.flatMap((pkg) => escapingImports(pkg)).length).toBe(85)
+  })
+})
+
 describe('every package declares the types for the builtins it uses', () => {
   /*
    * `node:fs` resolves at runtime with no manifest entry at all, so the check
@@ -596,7 +903,7 @@ describe('every package declares the types for the builtins it uses', () => {
    *
    * `sanity-overlay-client` IS a real entry: `src/fsLoader.ts` is TypeScript
    * inside `include`, it imports `node:fs` and `node:path`, and the package
-   * reports 16 errors today for that reason alone (verified: with
+   * reports 21 errors today for that reason alone (verified: with
    * `@types/node` reachable it is clean, 0 errors). It is excluded from the
    * typecheck gate in .github/workflows/ci.yml until this is run:
    *
@@ -621,7 +928,7 @@ describe('every package declares the types for the builtins it uses', () => {
 describe('the typecheck gate covers every package it can', () => {
   /*
    * `.github/workflows/ci.yml` runs `tsc --noEmit -p <project>` for a HAND
-   * WRITTEN list of packages, because three of the seven do not typecheck yet.
+   * WRITTEN list of packages, because four of the eight are held out today.
    * A hand-written list rots in silence: a package gets fixed, or a new package
    * is added, and it simply never enters the gate. Nothing fails, so nobody
    * looks.
@@ -630,15 +937,26 @@ describe('the typecheck gate covers every package it can', () => {
    * above. Every package must be either gated or explicitly excluded, and
    * moving one between the two turns this red until BOTH files agree.
    *
-   * Each exclusion, with what clears it (the workflow carries the long form):
-   *   sanity-overlay-client   16 errors, all missing @types/node.
+   * Each exclusion, with what clears it (the workflow carries the long form).
+   * Counts are re-measured with `tsc --noEmit -p <package>`; they are comments,
+   * so nothing turns red when they drift -- re-measure before trusting one.
+   *
+   *   sanity-overlay-client   21 errors, all missing @types/node (TS2307 on
+   *                           node:*, TS2580 process/Buffer, TS2503 NodeJS, and
+   *                           the `unref` on a DOM `number` timer handle that
+   *                           follows from the same missing lib).
    *                           pnpm --filter sanity-overlay-client add -D -E "@types/node@^22.20.1"
-   *   sanity-overlay-cli      30 errors, same class; it already DECLARES
-   *                           @types/node but is absent from pnpm-lock.yaml.
-   *                           pnpm install   (at the repo root)
-   *   sanity-overlay-studio    1 error: the undeclared groq-js import.
-   *                           pnpm --filter sanity-overlay-studio add -E "groq-js@2.0.0"
-   *   sanity-overlay-testkit  24 errors, none in its own harness -- assets,
+   *   sanity-overlay-cli       0 errors. The remedy has already been applied:
+   *                           @types/node is declared AND now present in
+   *                           pnpm-lock.yaml. This exclusion is stale and the
+   *                           package is ready to move into the gate; doing so
+   *                           is a .github/workflows/ci.yml change, so both
+   *                           files must move together to keep the assertion
+   *                           below green.
+   *   sanity-overlay-studio    0 errors. Same story: groq-js is declared and in
+   *                           pnpm-lock.yaml, so the undeclared-import error is
+   *                           gone. Stale exclusion, same paired move.
+   *   sanity-overlay-testkit  39 errors, none in its own harness -- assets,
    *                           studio-observable, write-guard, client-revalidate,
    *                           proxy-tls, core-boundaries, and the untyped .mjs
    *                           imports from examples/kitchen-sink.

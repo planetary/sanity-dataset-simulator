@@ -321,7 +321,6 @@ describe('reads are delegated, not blocked', () => {
     ['datasets.list', (c: Rec) => ((c.datasets as Rec).list as CallableFunction)()],
     ['projects.list', (c: Rec) => ((c.projects as Rec).list as CallableFunction)()],
     ['releases.get', (c: Rec) => ((c.releases as Rec).get as CallableFunction)('r')],
-    ['live.events', (c: Rec) => ((c.live as Rec).events as CallableFunction)()],
     [
       'mediaLibrary.video.getPlaybackInfo',
       (c: Rec) =>
@@ -331,6 +330,24 @@ describe('reads are delegated, not blocked', () => {
     const {client, wrapped} = harness()
     await Promise.resolve(invoke(wrapped)).catch(() => undefined)
     expect(client.escaped).toContain(label)
+  })
+
+  it('live.events is the one read that is NOT delegated', async () => {
+    /* It was in the table above until 2026-08-06, and that was the defect.
+     * Sanity Live streams a result the Content Lake evaluated itself, so an
+     * event arrives after the overlay-resolved render and replaces the branch
+     * with staging content (PRD §23.3, §37 Phase 5). The refusal arrives on the
+     * error channel of an Observable because that is what `events()` returns
+     * and what sanity 6.8.0 subscribes to. Class-level coverage — the
+     * observable client, the cached namespace reference, and the
+     * `client.listen()` boundary that must NOT be swept up with it — is in
+     * `studio-live-bypass.test.ts`. */
+    const {client, wrapped} = harness()
+    const result = ((wrapped.live as Rec).events as CallableFunction)()
+
+    expect(typeof (result as Rec).subscribe).toBe('function')
+    await expect(drain(result)).rejects.toThrow(/blocked live\.events/)
+    expect(client.escaped).not.toContain('live.events')
   })
 
   it('passes a read `request` straight through', async () => {

@@ -490,6 +490,293 @@ describe('writeGuard · the latch holds for every way it can be set', () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * 2c. P1-2 — bytes are released past a JUDGED boundary, or not at all
+ * ------------------------------------------------------------------ *
+ * The security review of 2026-08-06 falsified the invariant this module states
+ * at its own `createRealtimeFrameGuard` header — *"Bytes are only released once
+ * the frame they belong to has been parsed AND classified"*.
+ *
+ * `releaseUpTo` was advanced by any frame that was not itself a fragment. A
+ * control frame is classified `{write: false, reason: 'control frame'}`, so a
+ * PING arriving in the middle of a fragmented message advanced the release
+ * marker past **every byte scanned so far** — including the held fragment,
+ * which had never been judged. RFC 6455 §5.4 explicitly permits control frames
+ * to be interleaved into a fragmented message, so this costs an attacker one
+ * two-byte PING. A new final TEXT frame did the same thing by a different
+ * route: it reset `fragment = null`, judged only its own payload, and its
+ * allowlisted verdict flushed the discarded chain.
+ *
+ * The latch is not the defect and is not touched here — in most of these
+ * vectors the guard *does* latch, and the FIN continuation never leaves. What
+ * leaves is the prefix, and a prefix carrying the whole `mutate` body is the
+ * thing the invariant promised could not happen.
+ *
+ * THE ORACLE IS THE UPSTREAM'S VIEW, NOT THE GUARD'S. Every assertion below
+ * decodes the bytes in `forward` with a reader written for this file and asks
+ * what a compliant peer would see. Asserting on `frames` would only re-read the
+ * guard's own opinion of what it did.
+ */
+
+interface DecodedFrame {
+  fin: boolean
+  opcode: number
+  payload: string
+}
+
+/** An independent RFC 6455 reader: what does the upstream socket actually see? */
+function decodeUpstream(buffer: Buffer): DecodedFrame[] {
+  const out: DecodedFrame[] = []
+  let offset = 0
+  while (offset + 2 <= buffer.length) {
+    const fin = (buffer[offset] & 0x80) !== 0
+    const opcode = buffer[offset] & 0x0f
+    const masked = (buffer[offset + 1] & 0x80) !== 0
+    let length = buffer[offset + 1] & 0x7f
+    let cursor = offset + 2
+    if (length === 126) {
+      length = buffer.readUInt16BE(cursor)
+      cursor += 2
+    } else if (length === 127) {
+      length = Number(buffer.readBigUInt64BE(cursor))
+      cursor += 8
+    }
+    let key = Buffer.alloc(0)
+    if (masked) {
+      key = Buffer.from(buffer.subarray(cursor, cursor + 4))
+      cursor += 4
+    }
+    if (cursor + length > buffer.length) break
+    const payload = Buffer.from(buffer.subarray(cursor, cursor + length))
+    if (masked) for (let i = 0; i < payload.length; i++) payload[i] ^= key[i % 4]
+    out.push({fin, opcode, payload: payload.toString('utf8')})
+    offset = cursor + length
+  }
+  return out
+}
+
+const MUTATE_BODY = JSON.stringify({
+  jsonrpc: '2.0',
+  method: 'mutate',
+  params: {mutations: [{createOrReplace: {_id: 'article-01', _type: 'article', title: 'pwned'}}]},
+  id: 'frag-evil',
+})
+
+const QUERY_BODY = JSON.stringify({
+  jsonrpc: '2.0',
+  method: 'query',
+  params: {query: '*[_type=="article"]'},
+  id: 'q-1',
+})
+
+const PING_FRAME = encodeClientFrame(Buffer.from('hi'), {opcode: 0x9})
+const PONG_FRAME = encodeClientFrame(Buffer.from('yo'), {opcode: 0xa})
+
+/**
+ * Assert nothing of an unjudged message escaped: neither the exact bytes of the
+ * frames that carried it, nor a decoded payload that mentions the method.
+ */
+function expectNoLeak(forwarded: Buffer, heldFrames: Buffer[], label: string): void {
+  for (const held of heldFrames) {
+    expect(forwarded.includes(held), `${label}: the raw bytes of a held frame reached upstream`).toBe(
+      false,
+    )
+  }
+  for (const frame of decodeUpstream(forwarded)) {
+    expect(frame.payload.includes('mutate'), `${label}: upstream saw "${frame.payload}"`).toBe(false)
+    expect(frame.payload.includes('createOrReplace'), `${label}: upstream saw a mutation body`).toBe(
+      false,
+    )
+  }
+}
+
+describe('writeGuard · a held fragment cannot be released by anything but its own verdict', () => {
+  /** The review's vector C, and the whole shape of the finding. */
+  it('C. TEXT(fin=0, full mutate) + PING + CONT(fin=1) leaks nothing', () => {
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const first = encodeClientFrame(Buffer.from(MUTATE_BODY), {opcode: 0x1, fin: false})
+    const last = encodeClientFrame(Buffer.alloc(0), {opcode: 0x0, fin: true})
+    const result = guard.inspect(Buffer.concat([first, PING_FRAME, last]))
+    expectNoLeak(result.forward, [first, last], 'vector C')
+    expect(result.blocked, 'the reassembled mutate must still latch').not.toBeNull()
+  })
+
+  it('D. TEXT(fin=0, full mutate) + TEXT(fin=1, query) leaks nothing', () => {
+    // A data frame arriving while a message is in progress is an RFC 6455 §5.4
+    // protocol violation. The guard previously treated it as a reset and judged
+    // only the newcomer — whose method was `query` — so its verdict released
+    // both frames and the guard never saw a write at all.
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const first = encodeClientFrame(Buffer.from(MUTATE_BODY), {opcode: 0x1, fin: false})
+    const second = encodeClientFrame(Buffer.from(QUERY_BODY), {opcode: 0x1, fin: true})
+    const result = guard.inspect(Buffer.concat([first, second]))
+    expectNoLeak(result.forward, [first, second], 'vector D')
+    expect(result.blocked, 'a TEXT frame mid-message must latch, not reset').not.toBeNull()
+  })
+
+  it('E. the same bytes split across inspect() calls leak nothing either', () => {
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const first = encodeClientFrame(Buffer.from(MUTATE_BODY), {opcode: 0x1, fin: false})
+    const last = encodeClientFrame(Buffer.alloc(0), {opcode: 0x0, fin: true})
+    let forwarded = Buffer.alloc(0)
+    for (const chunk of [first, PING_FRAME, last]) {
+      forwarded = Buffer.concat([forwarded, guard.inspect(chunk).forward])
+    }
+    expectNoLeak(forwarded, [first, last], 'vector E')
+  })
+
+  it('F. TEXT(fin=0) + PONG + CONT(fin=0) + PONG + CONT(fin=1) leaks nothing, once or twice', () => {
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const cut = Math.floor(MUTATE_BODY.length / 3)
+    const p1 = encodeClientFrame(Buffer.from(MUTATE_BODY.slice(0, cut)), {opcode: 0x1, fin: false})
+    const p2 = encodeClientFrame(Buffer.from(MUTATE_BODY.slice(cut, cut * 2)), {
+      opcode: 0x0,
+      fin: false,
+    })
+    const p3 = encodeClientFrame(Buffer.from(MUTATE_BODY.slice(cut * 2)), {opcode: 0x0, fin: true})
+    const result = guard.inspect(Buffer.concat([p1, PONG_FRAME, p2, PONG_FRAME, p3]))
+    expectNoLeak(result.forward, [p1, p2, p3], 'vector F')
+    expect(result.blocked).not.toBeNull()
+  })
+
+  /**
+   * The class, generated: ANY control frame at ANY position inside a fragmented
+   * mutate message. Enumerating C and F would leave `close`, and the head and
+   * tail positions, uncovered — and the defect had nothing to do with which
+   * control frame it was.
+   */
+  const CONTROL_FRAMES: ReadonlyArray<readonly [string, number]> = [
+    ['ping', 0x9],
+    ['pong', 0xa],
+    ['close', 0x8],
+  ]
+
+  const INTERLEAVINGS: ReadonlyArray<readonly [string, number]> = [
+    ['before the first fragment', 0],
+    ['between the two fragments', 1],
+    ['immediately before the FIN continuation', 2],
+  ]
+
+  for (const [controlName, controlOpcode] of CONTROL_FRAMES) {
+    for (const [where, position] of INTERLEAVINGS) {
+      it(`a ${controlName} frame ${where} releases no fragment bytes`, () => {
+        const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+        const cut = Math.floor(MUTATE_BODY.length / 2)
+        const p1 = encodeClientFrame(Buffer.from(MUTATE_BODY.slice(0, cut)), {
+          opcode: 0x1,
+          fin: false,
+        })
+        const p2 = encodeClientFrame(Buffer.from(MUTATE_BODY.slice(cut)), {opcode: 0x0, fin: true})
+        const control = encodeClientFrame(Buffer.alloc(0), {opcode: controlOpcode})
+        const parts = [p1, p2]
+        parts.splice(position, 0, control)
+        const result = guard.inspect(Buffer.concat(parts))
+        expectNoLeak(result.forward, [p1, p2], `${controlName} at ${position}`)
+      })
+    }
+  }
+
+  /**
+   * The D class, generated: a DATA frame of any shape, at any point in an open
+   * chain. Enumerating only `TEXT(fin=1)` would leave the guard free to keep
+   * treating `TEXT(fin=0)` as a reset — the same defect, one flag away.
+   */
+  const INTERRUPTING_DATA_FRAMES: ReadonlyArray<readonly [string, number, boolean]> = [
+    ['a final TEXT frame', 0x1, true],
+    ['a non-final TEXT frame', 0x1, false],
+    ['a binary frame', 0x2, true],
+  ]
+
+  for (const [label, opcode, fin] of INTERRUPTING_DATA_FRAMES) {
+    for (const [where, afterFragments] of [
+      ['right after the opening fragment', 1],
+      ['after a continuation', 2],
+    ] as ReadonlyArray<readonly [string, number]>) {
+      it(`${label} arriving ${where} leaks nothing and latches`, () => {
+        const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+        const cut = Math.floor(MUTATE_BODY.length / 2)
+        const chain = [
+          encodeClientFrame(Buffer.from(MUTATE_BODY.slice(0, cut)), {opcode: 0x1, fin: false}),
+          encodeClientFrame(Buffer.from(MUTATE_BODY.slice(cut)), {opcode: 0x0, fin: false}),
+        ].slice(0, afterFragments)
+        const interrupter = encodeClientFrame(Buffer.from(QUERY_BODY), {opcode, fin})
+        const result = guard.inspect(Buffer.concat([...chain, interrupter]))
+        expectNoLeak(result.forward, chain, `${label} ${where}`)
+        expect(result.blocked, 'an interrupted message has no single meaning').not.toBeNull()
+      })
+    }
+  }
+
+  it('a fragmented mutate spread over one inspect() call per frame leaks nothing', () => {
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const cut = Math.floor(MUTATE_BODY.length / 2)
+    const p1 = encodeClientFrame(Buffer.from(MUTATE_BODY.slice(0, cut)), {opcode: 0x1, fin: false})
+    const p2 = encodeClientFrame(Buffer.from(MUTATE_BODY.slice(cut)), {opcode: 0x0, fin: true})
+    let forwarded = Buffer.alloc(0)
+    for (const chunk of [p1, PING_FRAME, PONG_FRAME, p2]) {
+      forwarded = Buffer.concat([forwarded, guard.inspect(chunk).forward])
+    }
+    expectNoLeak(forwarded, [p1, p2], 'per-frame chunks')
+  })
+})
+
+/**
+ * The mirror property. Everything above would also be satisfied by a guard that
+ * forwarded nothing at all, so the legitimate cases are pinned just as hard:
+ * an allowlisted fragmented message, control frames and all, must reach the
+ * upstream byte-for-byte, in order, exactly once.
+ */
+describe('writeGuard · holding is a delay, not a drop', () => {
+  it('releases the whole chain — control frames included — once the method is known', () => {
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const cut = Math.floor(QUERY_BODY.length / 2)
+    const p1 = encodeClientFrame(Buffer.from(QUERY_BODY.slice(0, cut)), {opcode: 0x1, fin: false})
+    const p2 = encodeClientFrame(Buffer.from(QUERY_BODY.slice(cut)), {opcode: 0x0, fin: true})
+    const sent = Buffer.concat([p1, PING_FRAME, p2])
+    const result = guard.inspect(sent)
+    expect(result.blocked).toBeNull()
+    expect(result.forward.equals(sent)).toBe(true)
+  })
+
+  it('releases exactly once when the chain arrives in separate chunks', () => {
+    // "Released twice" is the other half of an offset-based release: bytes held
+    // in `pending` and then re-scanned on the next chunk can be emitted again.
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const third = Math.floor(QUERY_BODY.length / 3)
+    const p1 = encodeClientFrame(Buffer.from(QUERY_BODY.slice(0, third)), {opcode: 0x1, fin: false})
+    const p2 = encodeClientFrame(Buffer.from(QUERY_BODY.slice(third, third * 2)), {
+      opcode: 0x0,
+      fin: false,
+    })
+    const p3 = encodeClientFrame(Buffer.from(QUERY_BODY.slice(third * 2)), {opcode: 0x0, fin: true})
+    const chunks = [p1, PING_FRAME, p2, PONG_FRAME, p3]
+    let forwarded = Buffer.alloc(0)
+    for (const chunk of chunks) forwarded = Buffer.concat([forwarded, guard.inspect(chunk).forward])
+    expect(forwarded.equals(Buffer.concat(chunks))).toBe(true)
+  })
+
+  it('a control frame outside any fragmented message is forwarded immediately', () => {
+    // Holding must be scoped to an in-progress message; a keepalive on an idle
+    // connection cannot be made to wait for a message that may never come.
+    const guard = createRealtimeFrameGuard({enforce: true}) as FrameGuard
+    const result = guard.inspect(PING_FRAME)
+    expect(result.forward.equals(PING_FRAME)).toBe(true)
+  })
+
+  it('observation mode stays byte-transparent through the same interleaving', () => {
+    // PROXY_BLOCK_WRITES=0 promises the tunnel is not filtered. The fix must not
+    // start holding bytes there, or the two modes stop meaning the same thing.
+    const guard = createRealtimeFrameGuard({enforce: false}) as FrameGuard
+    const first = encodeClientFrame(Buffer.from(MUTATE_BODY), {opcode: 0x1, fin: false})
+    const last = encodeClientFrame(Buffer.alloc(0), {opcode: 0x0, fin: true})
+    const sent = Buffer.concat([first, PING_FRAME, last])
+    const result = guard.inspect(sent)
+    expect(result.forward.equals(sent)).toBe(true)
+    expect(result.blocked).toBeNull()
+    expect(result.frames.some((f) => f.write)).toBe(true) // still classified, still reported
+  })
+})
+
+/* ------------------------------------------------------------------ *
  * 3. end to end through the proxy
  * ------------------------------------------------------------------ */
 
@@ -790,6 +1077,26 @@ describe('spikeB-proxy · the upgraded tunnel is audited, not opaque', () => {
     expect(frames.map((row) => row.rpc)).toEqual(['mutate'])
     expect(frames[0].blocked).toBe(false)
     expect(frames[0].wouldBlock).toBe(true)
+  })
+
+  it('a mutate hidden in a fragment behind a PING never reaches the upstream socket', async () => {
+    // P1-2 end to end. The unit tests above prove `forward` is empty; this
+    // proves the proxy's own plumbing agrees, because `forwardFromClient`
+    // writes whatever the guard hands back and nothing else re-derives it.
+    const upstream = await useUpstream()
+    const proxy = await startProxy(upstream.origin, {blockWrites: true})
+    const {socket} = await openSocket(proxy.port)
+
+    const first = encodeClientFrame(Buffer.from(MUTATE_BODY), {opcode: 0x1, fin: false})
+    const last = encodeClientFrame(Buffer.alloc(0), {opcode: 0x0, fin: true})
+    socket.write(Buffer.concat([first, PING_FRAME, last]))
+
+    await until(
+      () => proxy.readLog().some((row) => row.frame === true && row.blocked === true),
+      'a blocked frame row for the fragmented mutate',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(Buffer.concat(upstream.received)).toHaveLength(0)
   })
 
   it('a frame arriving in the same segment as the handshake is still inspected', async () => {

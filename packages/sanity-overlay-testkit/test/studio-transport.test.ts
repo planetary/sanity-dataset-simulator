@@ -367,12 +367,54 @@ describe('reads', () => {
     expect(result.outcome).toBe('ok')
   })
 
-  it('runs a GROQ read through POST /query', async () => {
-    const {fetch, calls} = stubFetch(() => ({body: {ok: true, result: []}}))
+  /**
+   * THERE IS NO `transport.query()`, AND THAT IS THE POINT.
+   *
+   * It existed, was never called by anything, and could not have worked if it
+   * had been. `/query` is one half of a TWO-PARTY protocol (`queries.ts` in
+   * `sanity-overlay-next`): the overlay derives a candidate plan, the CALLER
+   * fetches those base documents — it is the only party holding a Sanity
+   * credential — and the overlay then evaluates the query over branch plus the
+   * documents it was handed. The removed method sent a bare `{query, params}`:
+   *
+   *  - with no `queryId`, the endpoint could only recognise the text by
+   *    checksum against the §22.5 registry, so a Studio-composed query was a
+   *    400 `UNSUPPORTED_QUERY`; and, far worse,
+   *  - with no `baseDocuments`, a query that DID match was evaluated against an
+   *    empty base and answered `[]` — a silent approximation, which §5.5 forbids
+   *    outright and which no error would have surfaced.
+   *
+   * Studio reads therefore evaluate in the browser (`client/reads.ts`), where
+   * the credential is. A method that looks usable and is neither called nor
+   * correct is a trap for the next author, so the surface is pinned exactly.
+   */
+  it('exposes no `query` method — a Studio read cannot be one call', () => {
+    const {fetch} = stubFetch(() => ({body: {ok: true}}))
     const transport = createOverlayTransport({apiUrl: 'http://localhost:3998', fetch})
-    await transport.query({query: '*[_type == $t]', params: {t: 'article'}})
-    expect(calls[0].url).toBe('http://localhost:3998/query')
-    expect(calls[0].body).toMatchObject({query: '*[_type == $t]', params: {t: 'article'}})
+
+    expect(Object.keys(transport).sort()).toEqual([
+      'apiUrl',
+      'commit',
+      'operation',
+      'resolve',
+      'state',
+    ])
+    expect('query' in transport).toBe(false)
+  })
+
+  it('never reaches /query at all', async () => {
+    const {fetch, calls} = stubFetch(() => ({body: {ok: true, revision: 1}}))
+    const transport = createOverlayTransport({apiUrl: 'http://localhost:3998', fetch})
+
+    await transport.state()
+    await transport.resolve({mode: 'version', ids: ['article-1']})
+    await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'tx-1'})
+    await transport.operation({kind: 'rebase', payload: {}, idempotencyKey: 'op-1'})
+
+    /* Every endpoint this transport can reach, exercised. None of them is
+     * `/query`: if one ever is, the two-party read protocol has been
+     * short-circuited somewhere. */
+    expect(calls.map((call) => call.url).some((url) => url.includes('/query'))).toBe(false)
   })
 
   it('reads the overlay state for the status banner', async () => {

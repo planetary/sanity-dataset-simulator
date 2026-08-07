@@ -127,6 +127,34 @@ jobs:
   # WHAT IT DOES NOT COVER. Each exclusion is a measured error count, not a
   # guess, and each names the one thing that clears it:
   #
+  #   sanity-overlay-cli       0 errors, RE-MEASURED 2026-08-06. It was excluded
+  #                            because packages/sanity-overlay-cli was absent
+  #                            from the `importers` block of pnpm-lock.yaml, so
+  #                            its already-DECLARED @types/node was never
+  #                            installed. That has been re-locked; the exclusion
+  #                            was stale and the package is gated above.
+  #                            It also now imports two modules from
+  #                            sanity-overlay-studio (src/ci/scan.ts →
+  #                            classifyTokenEnvKey, HOSTED_FEATURES), which is
+  #                            the second reason both are gated together: the
+  #                            §37 Phase 6 write-token and unsupported-plugin
+  #                            checks reuse the Studio's own rules rather than
+  #                            restating them, so a type change in either
+  #                            package must break here and not in a preview.
+  #
+  #   sanity-overlay-studio    0 errors, RE-MEASURED 2026-08-06. The one error
+  #                            (TS2307 `Cannot find module 'groq-js'` at
+  #                            src/client/readPlan.ts) was a genuinely undeclared
+  #                            dependency; groq-js is now declared and present in
+  #                            pnpm-lock.yaml, so the exclusion was stale. This
+  #                            is the package a consumer actually installs, and
+  #                            an undeclared import in it is an
+  #                            ERR_MODULE_NOT_FOUND at Studio boot on their
+  #                            machine — exactly the species a typecheck gate
+  #                            catches and nothing else here does.
+  #
+  # WHAT IT STILL DOES NOT COVER:
+  #
   #   sanity-overlay-client    16 errors, ALL of them missing-@types/node
   #                            (TS2307 on node:fs / node:path, TS2503 NodeJS,
   #                            TS2580 process). Verified: with @types/node
@@ -139,42 +167,6 @@ jobs:
   #                            packages/sanity-overlay-testkit/test/repo-manifests.test.ts,
   #                            which goes red when the entry is added and the
   #                            list is not cleaned up.)
-  #
-  #   sanity-overlay-cli       30 errors, same class and same cause -- but cli
-  #                            ALREADY declares "@types/node": "^22.20.1". It is
-  #                            simply not installed, because packages/sanity-overlay-cli
-  #                            is absent from the `importers` block of
-  #                            pnpm-lock.yaml. Verified: with @types/node
-  #                            reachable the project is clean, 0 errors. Blocked
-  #                            on re-locking, NOT on adding anything:
-  #
-  #                              pnpm install     # at the repo root, then commit pnpm-lock.yaml
-  #
-  #                            NOTE this is not only a typecheck problem. While
-  #                            cli and studio are missing from `importers`, the
-  #                            `pnpm install --frozen-lockfile` step in the test
-  #                            job above fails outright, so the whole workflow
-  #                            is down before any test runs. Run that command
-  #                            first.
-  #
-  #   sanity-overlay-studio    1 error: TS2307 `Cannot find module 'groq-js'` at
-  #                            src/client/readPlan.ts:39. That is a real
-  #                            undeclared dependency -- an ERR_MODULE_NOT_FOUND
-  #                            at Studio boot on a consumer's machine, invisible
-  #                            in-repo only because the workspace root hoists it.
-  #                            Two independent tests already report it
-  #                            (test/repo-manifests.test.ts and
-  #                            test/studio-install.test.ts). groq-js must be a
-  #                            HARD dependency, not a peer -- no Studio ships it
-  #                            as a resolvable top-level module, and unlike
-  #                            @sanity/client it has no cross-copy identity
-  #                            problem. Blocked on:
-  #
-  #                              pnpm --filter sanity-overlay-studio add -E "groq-js@2.0.0"
-  #
-  #                            2.0.0 is the version sanity-overlay-query and the
-  #                            testkit already pin; a different one would mean
-  #                            two evaluators disagreeing about the same query.
   #
   #   sanity-overlay-testkit   24 errors, none of them in this package's own
   #                            harness: 7 in test/assets-model.test.ts, 6 in
@@ -226,3 +218,113 @@ jobs:
         run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-query
       - name: typecheck sanity-overlay-next
         run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-next
+      - name: typecheck sanity-overlay-cli
+        run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-cli
+      - name: typecheck sanity-overlay-studio
+        run: pnpm --filter sanity-overlay-testkit exec tsc --noEmit -p ../sanity-overlay-studio
+
+  # ---------------------------------------------------------------------------
+  # query-lint
+  #
+  # PRD §22.5: "[MUST] CI runs the codemod in check mode and the lint rule in
+  # error mode after migration." Until this job existed, both halves of that
+  # requirement were reachable only by typing a path, which is documentation
+  # rather than enforcement -- an unregistered query, a direct @sanity/client or
+  # a native Sanity Live subscription could land and CI stayed green.
+  #
+  # Both steps are the SAME code the runtime uses. The lint step loads
+  # M_LOCAL_QUERIES in process rather than a JSON manifest, so the gate cannot
+  # drift from the registry the evaluator resolves against, and the codemod step
+  # runs in check mode, so it never writes in CI.
+  #
+  # WHAT IT COVERS, and why the scope is these five and not `packages/`:
+  #
+  #   sanity-overlay-core       0 findings over 85 files
+  #   sanity-overlay-store-fs   0 over 9
+  #   sanity-overlay-cli        0 over 25
+  #   sanity-overlay-next       0 over 7
+  #   sanity-overlay-query      0 over 14 (src + parity), and 15 GROQ literals
+  #                             RESOLVED to registered query IDs -- so the gate
+  #                             is reading real queries, not scanning nothing.
+  #
+  # Every count above was measured, 2026-08-06, by running the command below.
+  # If a leg here ever reports "0 literals scanned", the paths are wrong and the
+  # gate is vacuous.
+  #
+  # WHAT IT DOES NOT COVER. Each exclusion is a measured count and a reason, not
+  # an oversight:
+  #
+  #   sanity-overlay-client   3 findings, ALL in src/base.ts -- the base-request
+  #   sanity-overlay-studio   6 findings, 5 of them the same shape in
+  #                           src/client/{reads,incomingReferences}.ts.
+  #                           These are the PLANNER's own base requests
+  #                           (`*[_id in $ids]`, `*[_type in $types]`, and the
+  #                           dynamic field predicate §22.6 step 5 builds). The
+  #                           rule is specified for "preview-aware APPLICATION
+  #                           code" (§22.5); the layer that CONSTRUCTS candidate
+  #                           requests is the one thing that must build GROQ
+  #                           dynamically, and registering those would mean
+  #                           registering the planner's internals as frontend
+  #                           queries. The 6th is a real finding and is reported
+  #                           to the studio owner:
+  #                           packages/sanity-overlay-studio/src/index.ts:28
+  #                           imports @sanity/client directly.
+  #
+  #   sanity-overlay-testkit  301 findings. Test fixtures hold GROQ literals by
+  #                           definition -- that is what a parity fixture IS.
+  #                           Linting the suite would be linting the oracle.
+  #
+  #   examples/**             10 findings across kitchen-sink (spike sources,
+  #                           PRD §0.6 disposable) and 2 in
+  #                           examples/local-site/src/queries.ts, which is the
+  #                           one genuine FRONTEND MIGRATION target in this repo
+  #                           and is owned elsewhere. Adding examples/local-site
+  #                           here is the next step for whoever owns it: register
+  #                           its two article queries, run
+  #                           `sanity-overlay codemod --write examples/local-site`,
+  #                           then add the path to both steps below.
+  #
+  # A CONSUMING PROJECT points these at its own app directory instead. That is
+  # the whole intent of §22.5 -- this repo has no production frontend of its own
+  # (§0.0: nothing here writes to a Sanity dataset).
+  query-lint:
+    name: query lint (PRD §22.5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Exit 2 on ANY finding: unregistered GROQ, a query text that drifted from
+      # its registered checksum, a dynamically constructed query, a direct
+      # @sanity/client import, or a native Sanity Live subscription. Strict is
+      # the default and is passed explicitly so a future default change cannot
+      # silently downgrade this gate to warn mode.
+      - name: unregistered queries and overlay-bypassing clients
+        run: >
+          node packages/sanity-overlay-cli/bin/sanity-overlay.mjs lint --mode strict
+          packages/sanity-overlay-core/src
+          packages/sanity-overlay-store-fs/src
+          packages/sanity-overlay-cli/src
+          packages/sanity-overlay-next/src
+          packages/sanity-overlay-query/src
+          packages/sanity-overlay-query/parity
+
+      # Check mode, never --write: CI reports that a migration is outstanding,
+      # it does not perform one. Exit 2 covers both a pending rewrite and a file
+      # the codemod refused, because both are unfinished migration work.
+      - name: client-import codemod (check mode)
+        run: >
+          node packages/sanity-overlay-cli/bin/sanity-overlay.mjs codemod
+          packages/sanity-overlay-core/src
+          packages/sanity-overlay-store-fs/src
+          packages/sanity-overlay-cli/src
+          packages/sanity-overlay-next/src
+          packages/sanity-overlay-query/src
+          packages/sanity-overlay-query/parity

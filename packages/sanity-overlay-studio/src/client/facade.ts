@@ -376,6 +376,12 @@ function createFacade(options: OverlayFacadeOptions): {
   const proxyCache = new WeakMap<object, object>()
   const methodCache = new WeakMap<object, Map<PropertyKey, unknown>>()
   const namespaceCache = new WeakMap<object, object>()
+  /* Guarded callbacks, keyed by the caller's own function then by the guard it
+   * was built for. Identity matters: sanity 6.8.0 reads client properties inside
+   * effect dependency arrays, and a fresh wrapper per access is what caused the
+   * historical resubscribe storm. The same reasoning applies to an argument a
+   * caller passes twice. */
+  const callbackCache = new WeakMap<object, Map<string, unknown>>()
   const namespaceMethodCache = new WeakMap<object, Map<PropertyKey, unknown>>()
 
   /* ------------------------------------------- the client's own Observable */
@@ -606,6 +612,39 @@ function createFacade(options: OverlayFacadeOptions): {
           run()
           return value
         })
+  }
+
+  /**
+   * Refuse a Content Lake PUSH stream (PRD §23.3, §37 Phase 5).
+   *
+   * ALWAYS an Observable, on both the promise client and the observable one,
+   * and NOT parameterised by `kind`. `LiveClient.events()` is declared to return
+   * an Observable and `client.live` is the same object on both sides in
+   * `@sanity/client@7.26.0`; sanity 6.8.0 calls `.subscribe({next, error})` on
+   * the result directly (`LiveQueries-rJao7vYj.js`,
+   * `PresentationToolGrantsCheck-CITNu5DG.js`). A rejected Promise here would
+   * be a `TypeError: .subscribe is not a function` at the call site — an
+   * unattributable crash instead of a refusal the host can report.
+   *
+   * REFUSAL, NOT SILENCE, AND NOT A PARTIAL STREAM. An Observable that simply
+   * never emits would leave the loader waiting forever with no explanation; one
+   * fed from the overlay's own echo would carry local writes only and would be
+   * an approximation presented as Sanity Live, which §5.5 forbids outright.
+   * Both call sites above route `error` into their own state, so this surfaces
+   * where a Studio user can see it.
+   */
+  function refuseLivePush(label: string): unknown {
+    const error = markOverlayRefusal(
+      new Error(
+        `[sanity-overlay-studio] blocked ${label}: Sanity Live streams query results the ` +
+          'Content Lake evaluated itself, so an event would arrive after the overlay-resolved ' +
+          'render and replace the branch with staging content (PRD §23.3, §37 Phase 5). Use the ' +
+          'overlay event stream or a refetch signal instead — there is no partial live stream ' +
+          'that would be honest to show.',
+      ),
+    )
+    noteError(error.message)
+    return observableThrowing(error)
   }
 
   function refuseUnechoable(kind: Kind, label: string, reason: string): unknown {
@@ -853,6 +892,94 @@ function createFacade(options: OverlayFacadeOptions): {
     return tapReadErrors(result)
   }
 
+  /**
+   * ─────────────────────────────────────────────────────────────────────────
+   * **THE SAME RULE, FOR THE OTHER DIRECTION.**
+   *
+   * `wrapIfClient` closes one channel: a capability handed BACK as a return
+   * value. A capability can also be handed FORWARD, as an argument to a callback
+   * the library invokes on the caller's behalf — and the "structural" claim
+   * above did not cover that, because such an object never crosses a return.
+   *
+   * THE DEFECT THIS CLOSES (security review P1-3). `@sanity/client@7.26.0`:
+   *
+   *     patch(patchOrDocumentId, patchOps) {
+   *       const isBuilder = typeof patchOps == "function"
+   *       if (isBuilder) {
+   *         const patch = patchOps(new Patch(patchOrDocumentId, {}, this.#client))
+   *
+   * (`dist/index.js:631-641`; `ObservableTransaction.patch` at `:668-678`.) The
+   * facade calls the real method with `target` = the RAW `Transaction`, so
+   * `this.#client` is the raw client and the `Patch` the callback receives holds
+   * it. `p.commit()` inside that callback is `rawClient.mutate(...)`:
+   *
+   *     wrapped.transaction().patch('article-01', (p) => {
+   *       p.set({title: 'owned'}); p.commit(); return p
+   *     })
+   *
+   * — a live write to the Sanity API, reaching neither the overlay nor the
+   * proxy, from a Studio that believes writing is impossible.
+   *
+   * THE CLASS, not the instance. Two things are guarded on the way out, by the
+   * same predicates the return path uses: a `@sanity/client`, and a builder
+   * (anything carrying a `commit`). So the next method @sanity/client ships that
+   * hands a capability into a callback is covered on arrival, whatever it is
+   * called and whichever argument slot it reads.
+   *
+   * INSTANCEOF SURVIVES. `Transaction.patch` throws unless the callback returns
+   * something `instanceof Patch`. A `Proxy` forwards `getPrototypeOf`, so the
+   * guarded patch is still a `Patch` — and `serialize()` on it still reads the
+   * real operations.
+   * ─────────────────────────────────────────────────────────────────────────
+   */
+  function guardOutward(value: unknown, label: string, kind: Kind): unknown {
+    if (isSanityClientInstance(value)) return wrap(value as object, kind)
+    if (isRec(value) && typeof value.commit === 'function') {
+      return blockFluentCommit(value as object, label, kind)
+    }
+    return value
+  }
+
+  /**
+   * Guard every function argument, so anything the library hands INTO it is
+   * guarded before the caller can touch it.
+   *
+   * Non-function arguments are returned untouched, and a guarded callback's
+   * return value is passed back to the library unchanged — the library's own
+   * checks on it (`instanceof Patch`) must still see what it expects.
+   */
+  function guardArguments(args: unknown[], label: string, kind: Kind): unknown[] {
+    let guarded: unknown[] | undefined
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index]
+      if (typeof arg !== 'function') continue
+      if (guarded === undefined) guarded = [...args]
+      guarded[index] = guardCallback(arg as (...a: unknown[]) => unknown, label, kind)
+    }
+    return guarded ?? args
+  }
+
+  function guardCallback(
+    callback: (...args: unknown[]) => unknown,
+    label: string,
+    kind: Kind,
+  ): (...args: unknown[]) => unknown {
+    let perCallback = callbackCache.get(callback)
+    if (!perCallback) {
+      perCallback = new Map()
+      callbackCache.set(callback, perCallback)
+    }
+    const key = `${kind}:${label}`
+    const existing = perCallback.get(key)
+    if (existing) return existing as (...args: unknown[]) => unknown
+
+    const guarded = (...args: unknown[]): unknown =>
+      callback(...args.map((value) => guardOutward(value, label, kind)))
+
+    perCallback.set(key, guarded)
+    return guarded
+  }
+
   function tapReadErrors(result: unknown): unknown {
     if (isPromiseLike(result)) {
       return result.then(
@@ -976,7 +1103,10 @@ function createFacade(options: OverlayFacadeOptions): {
           }
         } else {
           wrapped = (...args: unknown[]): unknown => {
-            const result = fn.apply(target, args)
+            /* THE ARGUMENT CHANNEL. `Transaction.patch(id, fn)` constructs a
+             * raw-client-bound `Patch` and hands it to `fn` — see
+             * `guardOutward`. This is the call that used to let it through. */
+            const result = fn.apply(target, guardArguments(args, label, kind))
             /* A builder holds its client in a private field, so it cannot hand
              * one back today — but `wrapIfClient` costs one prototype walk and
              * removes the need for that to stay true. */
@@ -1044,7 +1174,12 @@ function createFacade(options: OverlayFacadeOptions): {
         const label = `${path}.${name}`
         let wrapped: (...args: unknown[]) => unknown
 
-        if (namespaceMethodKind(path, name) === 'write') {
+        const methodKind = namespaceMethodKind(path, name)
+
+        if (methodKind === 'push') {
+          /* Not `kind`-dependent: see `refuseLivePush`. */
+          wrapped = (): unknown => refuseLivePush(label)
+        } else if (methodKind === 'write') {
           wrapped = (): unknown => refuseUnechoable(kind, label, namespaceRefusalReason(path))
         } else if (path === 'users' && name === 'getById') {
           /* `client.users.getById('me')` builds the same `/users/me` URL as the
@@ -1052,10 +1187,12 @@ function createFacade(options: OverlayFacadeOptions): {
           wrapped = (...args: unknown[]): unknown =>
             args[0] === 'me' ? tapIdentityProbe(fn.apply(t, args), label) : fn.apply(t, args)
         } else {
-          /* Same rule as the main proxy: a namespace method that hands back a
-           * client hands back a wrapped one. None does today; the rule is the
-           * point, not the current inventory. */
-          wrapped = (...args: unknown[]): unknown => wrapIfClient(fn.apply(t, args), kind)
+          /* Same rule as the main proxy, in both directions: a namespace method
+           * that hands back — or hands INTO a callback — a client or a builder
+           * hands out a guarded one. None does today; the rule is the point,
+           * not the current inventory. */
+          wrapped = (...args: unknown[]): unknown =>
+            wrapIfClient(fn.apply(t, guardArguments(args, path, kind)), kind)
         }
 
         perTarget.set(prop, wrapped)
@@ -1216,7 +1353,7 @@ function createFacade(options: OverlayFacadeOptions): {
           wrapped = (): unknown => refuseUnechoable(kind, name, RELEASE_PLANE_REASON)
         } else if (name === 'patch' || name === 'transaction') {
           wrapped = (...args: unknown[]): unknown => {
-            const result = fn.apply(t, args)
+            const result = fn.apply(t, guardArguments(args, name, kind))
             return isRec(result) ? blockFluentCommit(result as object, name, kind) : result
           }
         } else if (CLONING_METHODS.has(name)) {
@@ -1232,7 +1369,11 @@ function createFacade(options: OverlayFacadeOptions): {
           wrapped = (...args: unknown[]): unknown =>
             tapRead(fn.apply(t, args), requestedIdsFrom(args), authoritative)
         } else {
-          wrapped = (...args: unknown[]): unknown => wrapIfClient(fn.apply(t, args), kind)
+          /* The default branch guards BOTH directions: whatever an unclassified
+           * method returns, and whatever it hands into a callback. Everything
+           * above either refuses outright or owns its own argument handling. */
+          wrapped = (...args: unknown[]): unknown =>
+            wrapIfClient(fn.apply(t, guardArguments(args, name, kind)), kind)
         }
 
         perTarget.set(prop, wrapped)

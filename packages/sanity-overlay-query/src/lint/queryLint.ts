@@ -37,6 +37,9 @@ export interface SourceLiteral {
   /** Literal content with escapes resolved; `${…}` marks an interpolation. */
   readonly text: string
   readonly kind: 'string' | 'template'
+  /** Offset of the opening quote, and of the first character after the close. */
+  readonly index: number
+  readonly end: number
   /** True when a template literal contains `${…}`: its runtime text is unknown. */
   readonly interpolated: boolean
   /** True when the literal is an operand of `+`: likewise unknown. */
@@ -45,6 +48,13 @@ export interface SourceLiteral {
   readonly tag?: string
   /** Name of the call the literal is an argument of, e.g. `fetch`, `defineQuery`. */
   readonly callee?: string
+  /**
+   * The identifier immediately before the literal, whitespace skipped — `from`
+   * in `from '@sanity/client'`, `import` in a bare side-effect import. This is
+   * what makes "module specifier" distinguishable from "a string that happens
+   * to name a package", which the import half of the rule depends on.
+   */
+  readonly precedingWord?: string
   /** 1-based. */
   readonly line: number
   /** 1-based. */
@@ -117,6 +127,13 @@ export function scanStringLiterals(source: string): SourceLiteral[] {
     while (i > 0 && IDENTIFIER.test(source[i - 1])) i--
     if (i === end) return undefined
     return {name: source.slice(i, end), start: i}
+  }
+
+  /** The identifier before `start`, whitespace skipped: `from '…'`, `import '…'`. */
+  const wordBefore = (start: number): string | undefined => {
+    let i = start
+    while (i > 0 && /\s/.test(source[i - 1])) i--
+    return identifierBefore(i)?.name
   }
 
   /** The call this literal is the first argument of, e.g. `client.fetch(<here>`. */
@@ -225,14 +242,18 @@ export function scanStringLiterals(source: string): SourceLiteral[] {
       const end = terminated ? i + 1 : i
       const tag = template ? identifierBefore(start)?.name : undefined
       const callee = calleeBefore(start)
+      const precedingWord = wordBefore(start)
       const concatenated = previous === '+' || nextSignificant(end) === '+'
       literals.push({
         text,
         kind: template ? 'template' : 'string',
+        index: start,
+        end,
         interpolated,
         concatenated,
         ...(tag === undefined ? {} : {tag}),
         ...(callee === undefined ? {} : {callee}),
+        ...(precedingWord === undefined ? {} : {precedingWord}),
         line: startLine,
         column: startColumn,
       })
@@ -275,10 +296,92 @@ export function looksLikeGroq(literal: SourceLiteral): boolean {
 }
 
 /* ================================================================== *
+ * B2. Which literals are module specifiers, and which of those reach
+ *     the Content Lake past the overlay.
+ *
+ * PRD §22.5 asks the rule to block two things, and the second is the
+ * one with the silent failure mode: "direct overlay-bypassing Sanity
+ * clients in preview-aware application code". An unregistered query is
+ * REFUSED by the registry at runtime, so it surfaces as a 422. A direct
+ * `@sanity/client` is never offered to the registry at all — it reads
+ * base and renders staging content while the rest of the deployment
+ * believes it is on a branch.
+ * ================================================================== */
+
+/**
+ * Packages whose client talks to the Content Lake directly. Matched as a
+ * package boundary, not a prefix: `@sanity/client-lookalike` is a different
+ * package and flagging it would be a false positive.
+ */
+const BYPASSING_MODULES = ['@sanity/client', 'next-sanity'] as const
+
+/**
+ * Named imports that subscribe the page to Content Lake pushes.
+ *
+ * Separated from the plain import finding because the FIX is different, and a
+ * rule that sends the reader to the wrong fix is worse than silence: swapping
+ * the import leaves the subscription in place, and the subscription is the
+ * bypass. §37 Phase 5 lists "Disable native Sanity Live in overlay mode" as its
+ * own task for the same reason.
+ */
+export const LIVE_SPECIFIERS = [
+  'defineLive',
+  'SanityLive',
+  'useLiveQuery',
+  'useLiveEvents',
+] as const
+
+/** The Live specifier an import clause names, if any. */
+export const liveSpecifierIn = (clause: string): string | undefined =>
+  LIVE_SPECIFIERS.find((name) => new RegExp(`\\b${name}\\b`).test(clause))
+
+/** True when `text` is `pkg` or a subpath of it (`pkg/sub`), never `pkg-other`. */
+const isModule = (text: string, pkg: string): boolean =>
+  text === pkg || text.startsWith(`${pkg}/`)
+
+export function bypassingModuleOf(literal: SourceLiteral): string | undefined {
+  /* Position first. `const externals = ['@sanity/client']` names the package
+   * without importing it, and so does an error message. */
+  const isSpecifier =
+    literal.precedingWord === 'from' ||
+    literal.precedingWord === 'import' ||
+    literal.callee === 'require' ||
+    literal.callee === 'import'
+  if (!isSpecifier) return undefined
+  return BYPASSING_MODULES.find((pkg) => isModule(literal.text, pkg))
+}
+
+/**
+ * The import clause preceding a `from '…'` specifier — `{createClient}`,
+ * `* as sanity`, `client`, or `''` for `import '…'` and `require('…')`.
+ *
+ * Read by walking back to the `import` or `export` keyword, because the clause
+ * is what distinguishes a live subscription from an ordinary client import, and
+ * because the codemod needs the same span to rewrite.
+ */
+export function importClauseOf(source: string, literal: SourceLiteral): string | undefined {
+  const head = source.slice(0, literal.index)
+  const keyword = Math.max(head.lastIndexOf('import'), head.lastIndexOf('export'))
+  if (keyword === -1) return undefined
+  const before = keyword === 0 ? '' : source[keyword - 1]
+  if (before !== '' && IDENTIFIER.test(before)) return undefined
+  const between = source.slice(keyword, literal.index)
+  return between
+    .replace(/^(import|export)\b/, '')
+    .replace(/\bfrom\s*$/, '')
+    .trim()
+}
+
+/* ================================================================== *
  * C. The rule.
  * ================================================================== */
 
-export type QueryLintCode = 'unregistered-query' | 'query-text-drift' | 'dynamic-query'
+export type QueryLintCode =
+  | 'unregistered-query'
+  | 'query-text-drift'
+  | 'dynamic-query'
+  | 'direct-client-import'
+  | 'live-bypass'
 export type QueryLintSeverity = 'error' | 'warning'
 /**
  * §22.5: "[MUST] Reject unregistered queries in strict preview mode" and
@@ -304,8 +407,26 @@ export interface QueryLintFinding {
   readonly message: string
 }
 
+/**
+ * A GROQ literal that IS registered, and the ID it resolves to.
+ *
+ * §22.5 "[MUST] Every production frontend query used in overlay mode has a
+ * stable query ID". The environment-aware client is called with the ID, not the
+ * text, so a rule that only says "not registered" leaves the reader to grep the
+ * registry by hand for the thing they must type. The resolution is already
+ * computed to decide the finding; reporting it closes the loop, and it is what
+ * the codemod attaches.
+ */
+export interface RegisteredQueryResolution {
+  readonly file: string
+  readonly line: number
+  readonly column: number
+  readonly queryId: string
+}
+
 export interface QueryLintReport {
   readonly findings: readonly QueryLintFinding[]
+  readonly resolved: readonly RegisteredQueryResolution[]
   readonly filesChecked: number
   readonly literalsScanned: number
   readonly errorCount: number
@@ -329,16 +450,17 @@ const normalize = (query: string): string => query.replace(/\s+/g, ' ').trim()
 const excerpt = (text: string): string =>
   text.length <= 160 ? text : `${text.slice(0, 157)}...`
 
-export function checkSourceForUnregisteredQueries(
-  input: QueryLintSourceInput,
-): QueryLintFinding[] {
+function checkSource(input: QueryLintSourceInput): {
+  findings: QueryLintFinding[]
+  resolved: RegisteredQueryResolution[]
+} {
   const severity: QueryLintSeverity = input.mode === 'strict' ? 'error' : 'warning'
-  const exact = new Set(input.registry.map((entry) => entry.query))
+  const exact = new Map(input.registry.map((entry) => [entry.query, entry.id]))
   const normalized = new Map(input.registry.map((entry) => [normalize(entry.query), entry.id]))
   const findings: QueryLintFinding[] = []
+  const resolved: RegisteredQueryResolution[] = []
 
   for (const literal of scanStringLiterals(input.source)) {
-    if (!looksLikeGroq(literal)) continue
     const at = {
       file: input.file,
       line: literal.line,
@@ -346,6 +468,37 @@ export function checkSourceForUnregisteredQueries(
       query: excerpt(literal.text),
       severity,
     }
+
+    const bypassed = bypassingModuleOf(literal)
+    if (bypassed !== undefined) {
+      const clause = importClauseOf(input.source, literal) ?? ''
+      const live = liveSpecifierIn(clause)
+      findings.push(
+        live === undefined
+          ? {
+              ...at,
+              code: 'direct-client-import',
+              message:
+                `${literal.text} talks to the Content Lake directly, so every read through it ` +
+                `bypasses the overlay and renders base content while the deployment believes ` +
+                `it is on a branch. §22.5 requires the environment-aware client here: import ` +
+                `it from sanity-overlay-client and call it with a registered query ID.`,
+            }
+          : {
+              ...at,
+              code: 'live-bypass',
+              message:
+                `${live} subscribes the page to Content Lake pushes, which arrive already ` +
+                `evaluated and overwrite whatever the overlay resolved — a bypass no import ` +
+                `swap can fix. §37 Phase 5 "Disable native Sanity Live in overlay mode": ` +
+                `remove the live subscription and watch the overlay instead ` +
+                `(OverlayClient.watch / revalidate).`,
+            },
+      )
+      continue
+    }
+
+    if (!looksLikeGroq(literal)) continue
 
     if (literal.interpolated || literal.concatenated) {
       // Deliberately checked BEFORE registration: the static parts matching a
@@ -361,7 +514,16 @@ export function checkSourceForUnregisteredQueries(
       continue
     }
 
-    if (exact.has(literal.text)) continue
+    const registeredId = exact.get(literal.text)
+    if (registeredId !== undefined) {
+      resolved.push({
+        file: input.file,
+        line: literal.line,
+        column: literal.column,
+        queryId: registeredId,
+      })
+      continue
+    }
 
     const drifted = normalized.get(normalize(literal.text))
     if (drifted !== undefined) {
@@ -386,7 +548,13 @@ export function checkSourceForUnregisteredQueries(
     })
   }
 
-  return findings
+  return {findings, resolved}
+}
+
+export function checkSourceForUnregisteredQueries(
+  input: QueryLintSourceInput,
+): QueryLintFinding[] {
+  return checkSource(input).findings
 }
 
 export function checkSourcesForUnregisteredQueries(
@@ -394,17 +562,19 @@ export function checkSourcesForUnregisteredQueries(
   options: QueryLintOptions,
 ): QueryLintReport {
   const findings: QueryLintFinding[] = []
+  const resolved: RegisteredQueryResolution[] = []
   let literalsScanned = 0
   for (const file of files) {
     literalsScanned += scanStringLiterals(file.source).length
-    for (const finding of checkSourceForUnregisteredQueries({...file, ...options})) {
-      findings.push(finding)
-    }
+    const outcome = checkSource({...file, ...options})
+    findings.push(...outcome.findings)
+    resolved.push(...outcome.resolved)
   }
   const errorCount = findings.filter((f) => f.severity === 'error').length
   const warningCount = findings.length - errorCount
   return {
     findings,
+    resolved,
     filesChecked: files.length,
     literalsScanned,
     errorCount,

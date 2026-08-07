@@ -148,15 +148,34 @@ describe('dispatch', () => {
     expect(undeclared).toEqual([])
   })
 
-  it('declares exactly the two §37 Phase 2 store tasks the PRD gives no command name for', () => {
+  it('declares exactly the four mandated tasks the PRD gives no command name for', () => {
     /* "Local runtime history" and "Local cleanup" are Phase 2 Filesystem store
-     * tasks. The PRD mandates the capability and never names a verb for it, so
-     * these two ARE our deviation — a small one, and recorded here rather than
-     * discovered later in a diff. */
-    expect(Object.keys(COMMANDS_BEYOND_PRD).sort()).toEqual(['cleanup', 'history'])
+     * tasks. "Build and run client-import codemod" and "Add lint rule for
+     * direct client imports and unregistered queries" are Phase 5 Frontend
+     * migration tasks, and §22.5 requires CI to RUN both — "CI runs the codemod
+     * in check mode and the lint rule in error mode". A mandated CI gate needs
+     * an invocation, and §14.5 names no verb for one.
+     *
+     * All four ARE our deviation — a small one, and recorded here rather than
+     * discovered later in a diff. The guard is not the count: it is that each
+     * verb names the §37 task it exists to serve. */
+    expect(Object.keys(COMMANDS_BEYOND_PRD).sort()).toEqual([
+      'cleanup',
+      'codemod',
+      'history',
+      'lint',
+    ])
     for (const rationale of Object.values(COMMANDS_BEYOND_PRD)) {
-      expect(rationale).toMatch(/§37 Phase 2/)
+      expect(rationale).toMatch(/§37 Phase \d/)
     }
+    /* And the phase each one claims is the phase that actually names it. */
+    expect(COMMANDS_BEYOND_PRD.history).toMatch(/§37 Phase 2/)
+    expect(COMMANDS_BEYOND_PRD.cleanup).toMatch(/§37 Phase 2/)
+    expect(COMMANDS_BEYOND_PRD.lint).toMatch(/§37 Phase 5/)
+    expect(COMMANDS_BEYOND_PRD.codemod).toMatch(/§37 Phase 5/)
+    /* §22.5 is the requirement that makes a CI-runnable verb necessary at all. */
+    expect(COMMANDS_BEYOND_PRD.lint).toMatch(/§22\.5/)
+    expect(COMMANDS_BEYOND_PRD.codemod).toMatch(/§22\.5/)
   })
 
   it('--help lists every command and the exit-code table', async () => {

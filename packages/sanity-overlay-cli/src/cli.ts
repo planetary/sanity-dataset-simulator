@@ -12,12 +12,15 @@
  * applied to both streams.
  */
 import {parseArgs} from 'node:util'
+import {runCi} from './commands/ci'
 import {runCleanup} from './commands/cleanup'
+import {runCodemod} from './commands/codemod'
 import {runConflicts} from './commands/conflicts'
 import {runDiff} from './commands/diff'
 import {runExport, runImport} from './commands/checkpoint'
 import {runHistory} from './commands/history'
 import {runInspect} from './commands/inspect'
+import {runLint} from './commands/lint'
 import {runNormalize} from './commands/normalize'
 import {runQuery} from './commands/query'
 import {runRebase} from './commands/rebase'
@@ -100,6 +103,12 @@ export const COMMANDS_BEYOND_PRD = Object.freeze({
     'PRD §37 Phase 2 Filesystem store tasks → "Local runtime history". The task is mandated; §14.5 names no verb for reading the local transaction log.',
   cleanup:
     'PRD §37 Phase 2 Filesystem store tasks → "Local cleanup", carrying §15.7 retention to fs mode. The task is mandated; §14.5 names no verb for it.',
+  lint:
+    'PRD §37 Phase 5 Frontend migration → "Add lint rule for direct client imports and unregistered queries", enforcing §22.5 "CI runs … the lint rule in error mode". The task is mandated; §14.5 names no verb for it.',
+  codemod:
+    'PRD §37 Phase 5 Frontend migration → "Build and run client-import codemod", enforcing §22.5 "CI runs the codemod in check mode". The task is mandated; §14.5 names no verb for it.',
+  ci:
+    'PRD §37 Phase 6 CI → the whole ten-line block ("Validate overlay file schemas", "Validate branch schema", "Validate strong references", "Check unsupported plugins", "Check no write tokens in preview configuration", "Check checkpoint status policy", "Report conflict summary on PR", the base drift scan and the PR status refresh). Every one of those tasks is mandated and §14.5 names a verb for none of them. One verb rather than seven, because a CI job needs ONE exit code over the whole checklist and seven commands would each have reported a different half of it.',
 } as const)
 
 /**
@@ -124,6 +133,9 @@ export const CLI_COMMANDS = Object.freeze([
   'normalize',
   'history',
   'cleanup',
+  'lint',
+  'codemod',
+  'ci',
 ] as const)
 
 export type CliCommand = (typeof CLI_COMMANDS)[number]
@@ -201,6 +213,31 @@ const COMMAND_OPTIONS: Record<CliCommand, Record<string, unknown>> = {
     'keep-last': {type: 'string'},
     'keep-after-revision': {type: 'string'},
   },
+  lint: {
+    mode: {type: 'string'},
+    ext: {type: 'string'},
+    ignore: {type: 'string', multiple: true},
+  },
+  codemod: {
+    write: {type: 'boolean'},
+    module: {type: 'string'},
+    ext: {type: 'string'},
+    ignore: {type: 'string', multiple: true},
+  },
+  ci: {
+    check: {type: 'string', multiple: true},
+    'allow-skip': {type: 'string', multiple: true},
+    schema: {type: 'string'},
+    base: {type: 'string'},
+    config: {type: 'string', multiple: true},
+    'env-file': {type: 'string', multiple: true},
+    'checkpoint-policy': {type: 'string'},
+    format: {type: 'string'},
+    report: {type: 'string'},
+    repository: {type: 'string'},
+    pr: {type: 'string'},
+    sha: {type: 'string'},
+  },
 }
 
 const USAGE_SUMMARY: Record<CliCommand, string> = {
@@ -218,6 +255,9 @@ const USAGE_SUMMARY: Record<CliCommand, string> = {
     're-run the §14.4 direct-edit checks; --repair-checksums recomputes stale ones',
   history: 'the local overlay transaction log — what this branch did, in order',
   cleanup: 'reclaim orphan artifacts and prune runtime growth (destructive — needs --confirm)',
+  lint: 'fail the build on unregistered GROQ or an overlay-bypassing Sanity client (PRD §22.5)',
+  codemod: 'rewrite direct @sanity/client imports to the overlay client; --check by default',
+  ci: 'run the PRD §37 Phase 6 CI checks over this overlay and its preview configuration',
 }
 
 function helpText(): string {
@@ -255,6 +295,13 @@ function helpText(): string {
     '  export/import --bundle is lossless; --output/--input is the §29.1 review tree.',
     '  history is the OVERLAY log, not Sanity History, and lives in gitignored',
     '  .runtime/ — a fresh clone or a checkpoint import has none (PRD §14.1, §29.2).',
+    '  lint and codemod scan SOURCE files under --root (or the given paths), not the',
+    '  overlay. Both exit 2 on findings so CI fails; codemod needs --write to change',
+    '  anything, and refuses a file it cannot rewrite completely (PRD §22.5).',
+    '  ci runs the PRD §37 Phase 6 checks. A check it cannot run reports "skip" and',
+    '  fails the run unless named in --allow-skip, so an inert gate has to be declared',
+    '  in the workflow rather than passing in silence. Every check reports what it',
+    '  measured, so a green run over an empty file set is visible as such.',
   )
   return lines.join('\n')
 }
@@ -281,6 +328,10 @@ async function dispatch(
   values: Record<string, unknown>,
   positionals: readonly string[],
   ctx: CommandContext,
+  /* Only `ci --report pr` reads it, and only for the GitHub inputs a workflow
+   * exports (GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_SHA). Passed rather than
+   * read from `process.env` for the same reason everything else here is. */
+  env: Readonly<Record<string, string | undefined>>,
 ): Promise<number> {
   switch (command) {
     case 'status':
@@ -359,6 +410,41 @@ async function dispatch(
         ...(typeof values.order === 'string' ? {order: values.order} : {}),
         mutations: values.mutations === true,
       })
+    case 'lint':
+      return runLint(ctx, {
+        paths: positionals,
+        ...(typeof values.mode === 'string' ? {mode: values.mode} : {}),
+        ...(typeof values.ext === 'string' ? {ext: values.ext} : {}),
+        ...(Array.isArray(values.ignore) ? {ignore: values.ignore as string[]} : {}),
+      })
+    case 'codemod':
+      return runCodemod(ctx, {
+        paths: positionals,
+        write: values.write === true,
+        ...(typeof values.module === 'string' ? {module: values.module} : {}),
+        ...(typeof values.ext === 'string' ? {ext: values.ext} : {}),
+        ...(Array.isArray(values.ignore) ? {ignore: values.ignore as string[]} : {}),
+      })
+    case 'ci':
+      return runCi(ctx, {
+        ...(Array.isArray(values.check) ? {check: values.check as string[]} : {}),
+        ...(Array.isArray(values['allow-skip'])
+          ? {allowSkip: values['allow-skip'] as string[]}
+          : {}),
+        ...(typeof values.schema === 'string' ? {schema: values.schema} : {}),
+        ...(typeof values.base === 'string' ? {base: values.base} : {}),
+        ...(Array.isArray(values.config) ? {config: values.config as string[]} : {}),
+        ...(Array.isArray(values['env-file']) ? {envFile: values['env-file'] as string[]} : {}),
+        ...(typeof values['checkpoint-policy'] === 'string'
+          ? {checkpointPolicy: values['checkpoint-policy']}
+          : {}),
+        ...(typeof values.format === 'string' ? {format: values.format} : {}),
+        ...(typeof values.report === 'string' ? {report: values.report} : {}),
+        ...(typeof values.repository === 'string' ? {repository: values.repository} : {}),
+        ...(typeof values.pr === 'string' ? {pr: values.pr} : {}),
+        ...(typeof values.sha === 'string' ? {sha: values.sha} : {}),
+        env,
+      })
     case 'cleanup':
       return runCleanup(ctx, {
         confirm: values.confirm === true,
@@ -427,7 +513,7 @@ export async function runCli(options: RunCliOptions): Promise<number> {
         if (json) write(toJson(value))
       },
     }
-    return await dispatch(command, values, positionals, ctx)
+    return await dispatch(command, values, positionals, ctx, options.env ?? {})
   } catch (error) {
     const cli: CliError = asCliError(error)
     if (json) {

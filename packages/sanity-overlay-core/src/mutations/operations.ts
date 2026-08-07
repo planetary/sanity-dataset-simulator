@@ -17,8 +17,9 @@
  * | `diffMatchPatch` | Exact patch application to the observed string (§17.9) | the path |
  * | `replaceDocument` | Whole-document replacement (§17.10) | every user field, old and new |
  */
-import {OverlayMutationError, OverlayPathError} from '../errors'
+import {OverlayMutationError, OverlayPathError, OverlayPrototypeKeyError} from '../errors'
 import {encodeOverlayPath} from '../encoding'
+import {isForbiddenKey} from '../serialize'
 import type {SanityDocument} from '../types/document'
 import type {OverlayOperation} from '../types/operations'
 import {isKeySegment, type OverlayPath} from '../types/path'
@@ -80,10 +81,36 @@ function assertDocument(value: unknown, context: string): SanityDocument {
   return value as unknown as SanityDocument
 }
 
+/**
+ * Refuse a §35.14 prototype key in ANY segment of an operation path.
+ *
+ * §13.6 says a string segment names an object property; §35.14 says `__proto__`,
+ * `constructor` and `prototype` can never be own keys of canonical overlay JSON.
+ * A path naming one therefore addresses a member the format cannot hold, and
+ * §5.5 leaves exactly one legal answer: refuse it, with a code, before anything
+ * is applied.
+ *
+ * EVERY SEGMENT, not just the root. `a.__proto__.b` is the same defect one level
+ * down, and a root-only check is what let it through (security review 2026-08-06
+ * P2-5): the write was applied, reported committed, and stored as `"a": {}`.
+ *
+ * A `{_key}` segment is exempt on purpose — its `_key` is a VALUE compared
+ * against array items, never a property name, so `items[_key=="__proto__"]` is
+ * ordinary content and refusing it would lose data for no reason.
+ */
+function assertNoPrototypeKeyInPath(path: OverlayPath): void {
+  for (let index = 0; index < path.length; index += 1) {
+    const segment = path[index]
+    if (typeof segment !== 'string' || !isForbiddenKey(segment)) continue
+    throw new OverlayPrototypeKeyError(segment, [encodeOverlayPath(path.slice(0, index + 1))])
+  }
+}
+
 function assertWritablePath(path: OverlayPath): void {
   if (!Array.isArray(path) || path.length === 0) {
     operationError('Operation path must be a non-empty OverlayPath (PRD §13.6)', {path})
   }
+  assertNoPrototypeKeyInPath(path)
   const root = path[0]
   if (typeof root === 'string' && PROTECTED_SYSTEM_FIELDS.includes(root as never)) {
     operationError(

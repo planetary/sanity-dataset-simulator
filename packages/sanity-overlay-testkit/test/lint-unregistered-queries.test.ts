@@ -276,6 +276,148 @@ describe('what this checker cannot detect, stated as executable limits', () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * 5b. THE OTHER HALF OF THE §22.5 RULE.
+ *
+ * "[MUST] Provide an ESLint rule that blocks unregistered GROQ
+ * construction AND DIRECT OVERLAY-BYPASSING SANITY CLIENTS in
+ * preview-aware application code."
+ *
+ * The GROQ half above was built first. This half was missing entirely,
+ * and it is the half that matters more: an unregistered query is
+ * REFUSED at runtime by the registry, so the worst case is a loud 422.
+ * A direct `@sanity/client` never reaches the registry at all — it
+ * reads the Content Lake and renders base content while every other
+ * signal in the deployment says "branch". That failure is silent.
+ *
+ * Native Sanity Live is the same hole with a push instead of a pull, so
+ * it gets its own code rather than being folded into the import
+ * finding: §37 Phase 5 lists "Disable native Sanity Live in overlay
+ * mode" as its own task, and the fix is a deletion, not a swap.
+ * ------------------------------------------------------------------ */
+
+describe('§22.5: direct overlay-bypassing Sanity clients', () => {
+  it('a named import from @sanity/client is reported', () => {
+    const findings = check(`import {createClient} from '@sanity/client'\n`)
+    expect(findings).toHaveLength(1)
+    expect(findings[0].code).toBe('direct-client-import')
+    expect(findings[0].severity).toBe('error')
+    expect(findings[0].line).toBe(1)
+    expect(findings[0].message).toMatch(/overlay/i)
+  })
+
+  it('reports every import form, not only the named one', () => {
+    for (const source of [
+      `import client from '@sanity/client'`,
+      `import * as sanity from '@sanity/client'`,
+      `import '@sanity/client'`,
+      `export {createClient} from '@sanity/client'`,
+      `const {createClient} = require('@sanity/client')`,
+      `const mod = await import('@sanity/client')`,
+      `import {createClient} from '@sanity/client/stega'`,
+      `import {createClient} from 'next-sanity'`,
+    ]) {
+      expect(codes(source), source).toContain('direct-client-import')
+    }
+  })
+
+  it('does not report the environment-aware client, nor a lookalike path', () => {
+    for (const source of [
+      `import {createOverlayClient} from 'sanity-overlay-client'`,
+      `import {createOverlayClient} from '../../sanity-overlay-client/src/index'`,
+      `import {thing} from '@sanity/client-lookalike'`,
+      `import {defineField} from 'sanity'`,
+    ]) {
+      expect(check(source), source).toEqual([])
+    }
+  })
+
+  it('does not report the module name when it is data rather than an import', () => {
+    // A dependency list, an error message or an allowlist mentions the package
+    // without importing it. Flagging those is how a rule becomes noise.
+    for (const source of [
+      `const externals = ['@sanity/client', 'next-sanity']`,
+      `throw new Error('do not import @sanity/client here')`,
+      `const map = {'@sanity/client': 'sanity-overlay-client'}`,
+    ]) {
+      expect(check(source), source).toEqual([])
+    }
+  })
+
+  it('warn mode downgrades the severity without losing the finding', () => {
+    const source = `import {createClient} from '@sanity/client'`
+    expect(check(source, 'warn').map((f) => f.severity)).toEqual(['warning'])
+    expect(check(source, 'strict').map((f) => f.severity)).toEqual(['error'])
+  })
+})
+
+describe('§37 Phase 5: native Sanity Live is an overlay bypass of its own', () => {
+  it('importing defineLive or SanityLive is reported as live-bypass, not as an import', () => {
+    for (const source of [
+      `import {defineLive} from 'next-sanity'`,
+      `import {SanityLive} from 'next-sanity/live'`,
+      `import {defineLive, sanityFetch} from 'next-sanity'`,
+    ]) {
+      expect(codes(source), source).toEqual(['live-bypass'])
+    }
+  })
+
+  it('the message says why a rewrite is not the fix', () => {
+    const finding = check(`import {defineLive} from 'next-sanity'`)[0]
+    // Live pushes Content Lake changes straight into the page: there is no
+    // overlay-aware equivalent to swap in, so the fix is removal plus the
+    // overlay's own change subscription.
+    expect(finding.message).toMatch(/Content Lake|bypass/i)
+    expect(finding.message).toMatch(/remove|delete|overlay event|watch/i)
+  })
+
+  it('a live import is ONE finding, not a live-bypass plus a client import', () => {
+    // Reporting both would send the reader to swap the import, which is the
+    // wrong fix and leaves the subscription in place.
+    expect(codes(`import {defineLive} from 'next-sanity'`)).toEqual(['live-bypass'])
+  })
+
+  it('a client obtained indirectly and used as `.live.events()` is NOT detected', () => {
+    // Stated as a limit, like every other. The rule reads module specifiers and
+    // import clauses; it does not resolve values. The case is closed instead by
+    // the environment-aware client having no `.live` at all — pinned in
+    // test/query-live-bypass.test.ts.
+    expect(check(`getClient().live.events().subscribe(render)`)).toEqual([])
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 5c. §22.5 "Every production frontend query used in overlay mode has
+ * a stable query ID". A rule that only says "not registered" leaves the
+ * reader to grep the registry for the ID by hand; the resolution is
+ * already computed to decide the finding, so it is reported.
+ * ------------------------------------------------------------------ */
+
+describe('§22.5: a registered literal resolves to the ID that must be called', () => {
+  it('reports the query ID for a literal that matches a registration byte for byte', () => {
+    const def = M_LOCAL_QUERIES[0]
+    const report = checkSourcesForUnregisteredQueries(
+      [{file: 'app/page.tsx', source: `const q = \`${def.query}\`\n`}],
+      {registry: REGISTRY, mode: 'strict'},
+    )
+    expect(report.ok).toBe(true)
+    expect(report.resolved).toEqual([
+      {file: 'app/page.tsx', line: 1, column: 11, queryId: def.id},
+    ])
+  })
+
+  it('resolves nothing for an unregistered or drifted literal', () => {
+    const drifted = M_LOCAL_QUERIES[0].query.replace(/ /g, '  ')
+    for (const source of [`const q = '*[_type == "secret"]'`, `const q = \`${drifted}\``]) {
+      const report = checkSourcesForUnregisteredQueries([{file: 'a.ts', source}], {
+        registry: REGISTRY,
+        mode: 'strict',
+      })
+      expect(report.resolved, source).toEqual([])
+    }
+  })
+})
+
+/* ------------------------------------------------------------------ *
  * 6. Whole-project checking and the report.
  * ------------------------------------------------------------------ */
 

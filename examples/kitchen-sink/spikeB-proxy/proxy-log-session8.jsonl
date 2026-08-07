@@ -1,0 +1,111 @@
+{"at":"2026-08-07T01:02:05.976Z","method":"OPTIONS","path":"/v2026-05-04/users/me","status":204,"ms":4,"blocked":false}
+{"at":"2026-08-07T01:02:05.983Z","method":"GET","path":"/v2026-05-04/users/me","status":200,"ms":372,"blocked":false}
+{"at":"2026-08-07T01:02:06.364Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/grants","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-07T01:02:06.370Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/user-applications","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.374Z","method":"OPTIONS","path":"/v2021-12-15/projects/b1n03q3z","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.387Z","method":"OPTIONS","path":"/v2025-02-19/journey/asset-limit","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.388Z","method":"OPTIONS","path":"/v2025-02-19/journey/document-limit","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.389Z","method":"GET","path":"/v2025-02-19/journey/asset-limit","status":200,"ms":10,"blocked":false}
+{"at":"2026-08-07T01:02:06.390Z","method":"GET","path":"/v2025-02-19/journey/document-limit","status":200,"ms":9,"blocked":false}
+{"at":"2026-08-07T01:02:06.405Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.406Z","method":"OPTIONS","path":"/v2025-02-19/features","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.366Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/grants","status":304,"ms":188,"blocked":false}
+{"at":"2026-08-07T01:02:06.376Z","method":"GET","path":"/v2021-12-15/projects/b1n03q3z","status":304,"ms":320,"blocked":false}
+{"at":"2026-08-07T01:02:06.696Z","method":"OPTIONS","path":"/v1/help","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.697Z","method":"OPTIONS","path":"/v1/help","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.698Z","method":"OPTIONS","path":"/v1/help","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.698Z","method":"OPTIONS","path":"/v2025-02-19/descriptors/claim","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.699Z","method":"POST","path":"/v2025-02-19/descriptors/claim","status":403,"ms":0,"blocked":true}
+{"at":"2026-08-07T01:02:06.371Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/user-applications","status":200,"ms":355,"blocked":false}
+{"at":"2026-08-07T01:02:06.727Z","method":"OPTIONS","path":"/v2023-12-11/journey/trial","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.554Z","method":"GET","path":"/v2025-02-19/features","status":304,"ms":187,"blocked":false}
+{"at":"2026-08-07T01:02:06.741Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.743Z","method":"OPTIONS","path":"/v2023-12-11/journey/trial","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.744Z","method":"OPTIONS","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.402Z","method":"GET","path":"/v2025-02-19/journey/asset-limit","status":200,"ms":349,"blocked":false}
+{"at":"2026-08-07T01:02:06.744Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":67,"blocked":false}
+{"at":"2026-08-07T01:02:06.727Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":94,"blocked":false}
+{"at":"2026-08-07T01:02:06.777Z","method":"GET","path":"/v2022-06-30/socket/parity","status":502,"ms":80,"blocked":false,"upgrade":true}
+{"at":"2026-08-07T01:02:06.704Z","method":"GET","path":"/v1/help","status":304,"ms":188,"blocked":false}
+{"at":"2026-08-07T01:02:06.893Z","method":"OPTIONS","path":"/v2025-02-19/agent/oTu7RImef/bundles/mine/listen","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.894Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.894Z","method":"OPTIONS","path":"/v2021-06-07/projects/b1n03q3z/datasets/parity/acl","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-07T01:02:06.896Z","method":"OPTIONS","path":"/v2025-02-19/users/me/keyvalue/studio.structure-tool.layout.article,studio.structure-tool.sort-order.article","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.823Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":84,"blocked":false}
+{"at":"2026-08-07T01:02:06.399Z","method":"GET","path":"/v2025-02-19/journey/document-limit","status":200,"ms":518,"blocked":false}
+{"at":"2026-08-07T01:02:06.751Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":179,"blocked":false}
+{"at":"2026-08-07T01:02:06.918Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.structure-tool.layout.article,studio.structure-tool.sort-order.article","status":200,"ms":184,"blocked":false}
+{"at":"2026-08-07T01:02:07.103Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.104Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.105Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.106Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.106Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.107Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.108Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:06.931Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":185,"blocked":false}
+{"at":"2026-08-07T01:02:06.908Z","method":"GET","path":"/v2021-06-07/projects/b1n03q3z/datasets/parity/acl","status":200,"ms":213,"blocked":false}
+{"at":"2026-08-07T01:02:06.811Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":422,"blocked":false}
+{"at":"2026-08-07T01:02:06.897Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":337,"blocked":false}
+{"at":"2026-08-07T01:02:06.833Z","method":"GET","path":"/v2022-06-30/socket/parity","status":101,"ms":477,"blocked":false,"upgrade":true}
+{"at":"2026-08-07T01:02:07.316Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":483,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"authorization","rpcId":"f1SrADe9u7XUWImjzRfZ","wouldBlock":false,"reason":"allowlisted RPC method authorization"}
+{"at":"2026-08-07T01:02:07.235Z","method":"GET","path":"/v2025-02-19/data/history/parity/events/documents/drafts.article-01","status":200,"ms":331,"blocked":false}
+{"at":"2026-08-07T01:02:07.568Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-07T01:02:07.570Z","method":"OPTIONS","path":"/v2025-02-19/data/doc/parity/article-01,drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.573Z","method":"OPTIONS","path":"/v2024-09-01/projects/b1n03q3z/user-applications","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:07.586Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":753,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_rollcall","rpcId":"SWFADXYbanxOSv6I6YUv","wouldBlock":false,"reason":"allowlisted RPC method presence_rollcall"}
+{"at":"2026-08-07T01:02:07.586Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":753,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_subscribe","rpcId":"csmu1T5FWoAmDvgW7THH","wouldBlock":false,"reason":"allowlisted RPC method presence_subscribe"}
+{"at":"2026-08-07T01:02:07.589Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":756,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"-zLqMmVt6-bOLplzA59V","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-07T01:02:07.573Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":194,"blocked":false}
+{"at":"2026-08-07T01:02:07.767Z","method":"GET","path":"/v2025-02-19/data/doc/parity/article-01,drafts.article-01","status":200,"ms":183,"blocked":false}
+{"at":"2026-08-07T01:02:08.071Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":1238,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-07T01:02:07.952Z","method":"GET","path":"/v2024-09-01/projects/b1n03q3z/user-applications","status":200,"ms":206,"blocked":false}
+{"at":"2026-08-07T01:02:08.159Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:08.160Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:08.161Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:08.162Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":196,"blocked":false}
+{"at":"2026-08-07T01:02:08.359Z","method":"OPTIONS","path":"/v2025-02-19/data/listen/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:08.359Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:08.360Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":184,"blocked":false}
+{"at":"2026-08-07T01:02:08.544Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":200,"blocked":false}
+{"at":"2026-08-07T01:02:08.745Z","method":"GET","path":"/v2025-02-19/data/history/parity/transactions/drafts.article-01","status":200,"ms":228,"blocked":false}
+{"at":"2026-08-07T01:02:08.974Z","method":"OPTIONS","path":"/v2025-02-19/users/me/keyvalue/studio.timezone.input.article-01.publishedAt","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:02:08.974Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":191,"blocked":false}
+{"at":"2026-08-07T01:02:37.524Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":30691,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"hKjA6VywfXBfP5E74DMr","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-07T01:02:38.064Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":31231,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-07T01:03:07.523Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":60690,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"w7VRSkDa1Y-r1AgRx1rs","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-07T01:03:08.150Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":61318,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-07T01:03:37.523Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":90690,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"KlY2fUmOABEK1O-qbh96","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-07T01:03:38.098Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":91265,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-07T01:04:07.523Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":120690,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"sRW65rATbQS45Qk-d3NZ","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-07T01:04:08.067Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":121234,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-07T01:02:07.235Z","method":"GET","path":"/v2025-02-19/data/listen/parity","status":200,"ms":149365,"blocked":false}
+{"at":"2026-08-07T01:04:36.604Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":335,"blocked":false}
+{"at":"2026-08-07T01:04:36.940Z","method":"GET","path":"/v2025-02-19/users/me/keyvalue/studio.timezone.input.article-01.publishedAt","status":200,"ms":182,"blocked":false}
+{"at":"2026-08-07T01:04:37.123Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:37.124Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:37.124Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:37.125Z","method":"OPTIONS","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:37.125Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":183,"blocked":false}
+{"at":"2026-08-07T01:04:37.309Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:37.310Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:37.310Z","method":"OPTIONS","path":"/v2023-12-18/intake/telemetry-status","status":204,"ms":1,"blocked":false}
+{"at":"2026-08-07T01:04:37.524Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":150691,"blocked":false,"upgrade":true,"frame":true,"opcode":1,"rpc":"presence_announce","rpcId":"HTauaCxVRASRLwXrIuBe","wouldBlock":false,"reason":"allowlisted RPC method presence_announce"}
+{"at":"2026-08-07T01:04:37.312Z","method":"GET","path":"/v2023-12-11/journey/trial","status":200,"ms":262,"blocked":false}
+{"at":"2026-08-07T01:04:37.577Z","method":"GET","path":"/v2025-03-01/ping","status":200,"ms":87,"blocked":false}
+{"at":"2026-08-07T01:04:37.665Z","method":"GET","path":"/v2025-02-19/projects/b1n03q3z/datasets","status":304,"ms":178,"blocked":false}
+{"at":"2026-08-07T01:04:37.844Z","method":"OPTIONS","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:37.844Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":188,"blocked":false}
+{"at":"2026-08-07T01:04:38.190Z","method":"WS","path":"/v2022-06-30/socket/parity","status":101,"ms":151357,"blocked":false,"upgrade":true,"frame":true,"opcode":10,"rpc":null,"rpcId":null,"wouldBlock":false,"reason":"control frame"}
+{"at":"2026-08-07T01:04:38.032Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":190,"blocked":false}
+{"at":"2026-08-07T01:04:38.223Z","method":"GET","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":200,"ms":212,"blocked":false}
+{"at":"2026-08-07T01:04:38.435Z","method":"GET","path":"/v2025-02-19/data/history/parity/documents/drafts.article-01","status":200,"ms":186,"blocked":false}
+{"at":"2026-08-07T01:04:38.622Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":188,"blocked":false}
+{"at":"2026-08-07T01:04:38.811Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":196,"blocked":false}
+{"at":"2026-08-07T01:04:39.008Z","method":"GET","path":"/v2023-12-18/intake/telemetry-status","status":200,"ms":191,"blocked":false}
+{"at":"2026-08-07T01:04:39.200Z","method":"GET","path":"/v2025-02-19/data/doc/parity/drafts.author-2","status":200,"ms":212,"blocked":false}
+{"at":"2026-08-07T01:04:39.414Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:39.414Z","method":"OPTIONS","path":"/v2025-02-19/data/query/parity","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:39.415Z","method":"OPTIONS","path":"/v2023-12-18/intake/batch","status":204,"ms":0,"blocked":false}
+{"at":"2026-08-07T01:04:39.415Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":178,"blocked":false}
+{"at":"2026-08-07T01:04:39.594Z","method":"GET","path":"/v2025-02-19/data/query/parity","status":200,"ms":193,"blocked":false}
+{"at":"2026-08-07T01:04:39.787Z","method":"POST","path":"/v2023-12-18/intake/batch","status":403,"ms":0,"blocked":true}

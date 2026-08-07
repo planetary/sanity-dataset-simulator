@@ -1,0 +1,8 @@
+# Per-run scratch: the overlay root the suite writes, the JSONL logs it audits,
+# traces and screenshots. Wiped and recreated by `harness/globalSetup.mjs` at the
+# start of every run, so nothing here is ever evidence of anything.
+#
+# Committing an audit log is a DELIBERATE act: copy it out of `.artifacts/run/`
+# into `docs/plans/evidence/` under a dated name, the way
+# `proxy-log-reverify.jsonl` was. Never `git add -f` from here.
+.artifacts/

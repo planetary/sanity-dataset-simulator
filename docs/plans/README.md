@@ -172,6 +172,22 @@ Execution rules that apply to every phase (§0.6): each spike runs in an isolate
 | 9 | `phase-9-hardening-release.md` | Plan doc not yet written |
 | Cross-phase | [testing-strategy.md](testing-strategy.md) | Written |
 
+### 7.1 Phase 9 documentation set
+
+PRD §37 Phase 9 names a documentation set as part of its exit checklist. These are the documents, and they live outside `docs/plans/` because they are product documentation rather than delivery planning:
+
+| Document | Phase 9 checklist line | State |
+|---|---|---|
+| [README.md](../../README.md) | Documentation complete | Written 2026-08-06 |
+| [migration-from-sanity-client.md](../migration-from-sanity-client.md) | Migration guide for existing Sanity clients | Written 2026-08-06 |
+| [plugin-compatibility.md](../plugin-compatibility.md) | Plugin compatibility guide | Written 2026-08-06 |
+| [query-registry.md](../query-registry.md) | Query registry guide | Written 2026-08-06 |
+| [runbook.md](../runbook.md) | On-call and incident runbook | Written 2026-08-06 |
+| `examples/local-site/` + `examples/kitchen-sink/` | Example application | Built; not owned by this document |
+| [evidence/phase-1/human-validation-script.md](evidence/phase-1/human-validation-script.md) | *Not a Phase 9 line* — it discharges §0.6 for Phase 1 and is listed here because it is the procedure every gate is blocked on | Written 2026-08-06, **never run** |
+
+Writing them does not tick the Phase 9 boxes. Phase 9 also requires performance budgets, failure injection, a security review with no unresolved P0/P1 findings, cleanup automation, a versioned package release and a Sanity upgrade compatibility process, and it closes against the §5.4 and §5.5 targets. The security review has been **run** ([security-review-2026-08-06.md](evidence/phase-1/security-review-2026-08-06.md)) and **found 3 P1 and 0 P0**, so that line is measured and failing rather than absent. Nothing else on the list is discharged, and no package is publishable (see §9 note 2).
+
 Source of truth: [PRD-v1.md](../PRD-v1.md). Frequently referenced sections: [§0 Read this first](../PRD-v1.md), [§1 Requirement language](../PRD-v1.md), [§5 Success criteria](../PRD-v1.md), [§36 Feasibility spikes](../PRD-v1.md), [§37 Implementation plan](../PRD-v1.md), [§38 Acceptance criteria](../PRD-v1.md), [§39 Risks and open decisions](../PRD-v1.md).
 
 ---
@@ -197,7 +213,7 @@ Every plan document under `docs/plans/` must follow these rules.
 
 **Traceability.** Every task, gate, and exit criterion cites its PRD section inline, e.g. `(PRD §36.2)`. Do not invent requirements, targets, or scope that are not in the PRD. Where a plan adds sequencing, grouping, or staffing structure that is not itself in the PRD, label it **"Plan-level guidance"**.
 
-**Phase numbering.** Wherever a document cites PRD §37, it must state the offset explicitly: roadmap Phase N maps to PRD §37 Phase N-1 for N = 1 through 7; roadmap Phase 8 covers PRD §37 Phases 7 and 8; roadmap Phase 9 maps to PRD §37 Phase 9, because the one-phase offset closes at the merge. See [section 4](#4-prd-phase-number-mapping).
+**Phase numbering.** Wherever a document cites PRD §37, it must state the offset explicitly: roadmap Phase N maps to PRD §37 Phase N-1 for N = 1 through 8; roadmap Phase 9 maps to PRD §37 Phase 9, because PRD Phase 8 (promotion) no longer exists and the one-phase offset closes there. See [section 4](#4-prd-phase-number-mapping). *(Corrected 2026-08-06: this paragraph still carried the pre-amendment "roadmap Phase 8 covers PRD §37 Phases 7 and 8", which [section 4](#4-prd-phase-number-mapping) superseded on 2026-08-05.)*
 
 **Milestone discipline.** Per §1.4, a phase plan may implement later-milestone foundations early, but may not redefine an earlier milestone as complete. Acceptance tests report results by milestone.
 
@@ -209,41 +225,52 @@ Every plan document under `docs/plans/` must follow these rules.
 
 ## 9. Status tracking
 
-| Roadmap phase | Title | Status | Plan doc | Exit evidence location |
-|---|---|---|---|---|
-| 1 | Repository audit and feasibility gates | In progress (harness scaffolding done, 2026-08-03) | `phase-1-audit-and-feasibility.md` | [evidence/phase-1/](evidence/phase-1/gate-review.md) |
-| 2 | Core domain engine and memory adapter | Not started | `phase-2-core-domain.md` | TBD |
-| 3 | Local filesystem mode | Not started | `phase-3-local-fs-mode.md` | TBD |
-| 4 | Blob preview persistence and identity | Not started | `phase-4-blob-preview.md` | TBD |
-| 5 | Studio core parity | Not started | `phase-5-studio-parity.md` | TBD |
-| 6 | GROQ query layer and frontend migration | Not started | `phase-6-query-layer.md` | TBD |
-| 7 | Conflicts, checkpoint and CI | Not started | `phase-7-conflicts-checkpoint-ci.md` | TBD |
-| 8 | Branch assets (local and preview only) | Not started | `phase-8-assets.md` | TBD |
-| 9 | Hardening and reusable release | Not started | `phase-9-hardening-release.md` | TBD |
+**Corrected 2026-08-06.** This table previously listed phases 2 through 9 as "Not started" while their packages were built and the suite stood at 89 files / 6,558 tests — recorded as finding F-12 in the [phase-3 acceptance audit](evidence/phase-3/acceptance-audit.md). The wording below separates two things the old table conflated: **work built** and **milestone signed**. Per PRD §1.4 the second never follows from the first.
+
+| Roadmap phase | Title | Work built | Signable? | Plan doc | Exit evidence |
+|---|---|---|---|---|---|
+| 1 | Repository audit and feasibility gates | Spikes A, C, D, F run; B and E partly | **No** — A, B, D conditional; E partial; C, F not started; §0.6 human validation outstanding for every gate | `phase-1-audit-and-feasibility.md` | [gate-review.md](evidence/phase-1/gate-review.md) |
+| 2 | Core domain engine and memory adapter | Engineering-complete (§10 acceptance 10/10, two caveats) | **No** — blocked by Phase 1's gate constraint | `phase-2-core-domain.md` | [phase-2/acceptance-audit.md](evidence/phase-2/acceptance-audit.md) |
+| 3 | Local filesystem mode | Store, CLI (16 commands), environment-aware client, watcher, Studio plugin | **No** — §38.1 audited at 6 met / 3 partial / 1 not met, plus four structural blockers | `phase-3-local-fs-mode.md` (not written) | [phase-3/acceptance-audit.md](evidence/phase-3/acceptance-audit.md) |
+| 4 | Blob preview persistence and identity | **Nothing.** `OVERLAY_MODE=blob` throws at startup | No | `phase-4-blob-preview.md` (not written) | — |
+| 5 | Studio core parity | Facade, document actions, hosted-feature removal, overlay-aware reads, conflict panel | **No** — none of the three exit lines discharged; there is no browser E2E suite that can run | `phase-5-studio-parity.md` (not written) | [phase-3/acceptance-audit.md §3](evidence/phase-3/acceptance-audit.md) |
+| 6 | GROQ query layer and frontend migration | Registry, planner, evaluator, codemod, lint rule; 17/17 Spike C queries within §5.4 budgets | Partial — the Studio uses a **second, uncovered** planner and does not consume the registry | `phase-6-query-layer.md` (not written) | [spike-c-groq-corpus/](evidence/phase-1/spike-c-groq-corpus/report.md) |
+| 7 | Conflicts, checkpoint and CI | Conflict engine, resolution actions, export/import, 8 CI checks, GitHub PR reporting | Partial — the conflict panel is unreachable in a browser (`GET /state` reports no conflicts) | `phase-7-conflicts-checkpoint-ci.md` (not written) | — |
+| 8 | Branch assets (local and preview only) | Asset store, synthetic asset documents, delivery, usage tracking — **never verified in a browser**; `client.assets.upload` is refused, so a branch cannot contain a new image | No | `phase-8-assets.md` (not written) | — |
+| 9 | Hardening and reusable release | Documentation set written ([§7.1](#71-phase-9-documentation-set)); example application built; security review run | **No** — no package is installable; the security review found **3 P1, 0 P0**, so §5.5's "no unresolved P0 or P1" bar is not met; no performance or failure-injection evidence; no release | `phase-9-hardening-release.md` (not written) | [security-review-2026-08-06.md](evidence/phase-1/security-review-2026-08-06.md) |
+
+**Two notes that govern every row.**
+
+1. **The Phase 1 gate constraint still binds.** PRD §0.3's preamble and [§5.1](#51-hard-sequencing-constraints-prd-derived) both say implementation does not complete until all six gates pass. Nothing below Phase 1 can be signed until they do, and the §0.6 human validation is user-owned work — see the [human validation script](evidence/phase-1/human-validation-script.md).
+2. **No package is installable.** Packages cross-import their siblings by relative filesystem path that escapes their own root — **106 such specifiers** across `packages/*/src` as measured on 2026-08-06 (testkit excluded). Everything above runs from inside this monorepo only.
 
 ### 9.1 Gate tracker (PRD §0.3)
 
-- [ ] Gate A: Studio data-plane interception (Strategy A `unstable_clientFactory` and Strategy B HTTP proxy, run in parallel)
-- [ ] Gate B: Listener and editor-state protocol
-- [ ] Gate C: Blob concurrency
-- [ ] Gate D: Query parity
-- [ ] Gate E: Safety and trust boundary
-- [ ] Gate F: Lifecycle
+No box is ticked, because **§0.6's one human validation of the actual Studio workflow is outstanding for every gate** and no gate may be signed without it. Current standing per [gate-review.md](evidence/phase-1/gate-review.md):
+
+- [ ] Gate A: Studio data-plane interception — **conditional pass.** Both tracks ran in parallel. The *"0 direct requests to Sanity"* claim is **withdrawn** (4 direct telemetry POSTs, CDP capture). Conditions: D13 ratification, the HTTP/1.1 concurrency ceiling, §0.6 human validation.
+- [ ] Gate B: Listener and editor-state protocol — **conditional pass.** §21.4.1 criteria 1, 3, 4, 5 automated; criterion 2 is split and its **input-device half (cursor jumps, keystroke loss under real debounce) is browser-only and unmeasured**.
+- [ ] Gate C: Blob concurrency — **not started.** User-blocked on a Vercel project and a private Blob token.
+- [ ] Gate D: Query parity — **pass on correctness, boundedness and latency (2026-08-05).** 17/17 within §5.4 budgets; Tier C count 1. Open: `query.maxCandidateDocuments` unratified, and the launch-critical query list does not exist so the Tier-C *ratio* has no denominator.
+- [ ] Gate E: Safety and trust boundary — **partial.** All 6 facade gaps closed; proxy default-deny with live 403 evidence. Remaining: a read-only preview token and the deployed (Vercel) half.
+- [ ] Gate F: Lifecycle — **not started.** User-blocked, same unblock as C.
+
+The procedure that closes the §0.6 clause for Gates A and B is [evidence/phase-1/human-validation-script.md](evidence/phase-1/human-validation-script.md).
 
 ### 9.2 Milestone acceptance tracker (PRD §38)
 
-`[M-LOCAL]` — Local MVP (§38.1), roadmap Phase 3:
+`[M-LOCAL]` — Local MVP (§38.1), roadmap Phase 3. **No box is ticked: `[M-LOCAL]` cannot be signed** while the Phase 1 gate constraint binds. The audited verdict per line, from the [phase-3 acceptance audit](evidence/phase-3/acceptance-audit.md) (2026-08-06) — **6 met, 3 partial, 1 not met**:
 
-- [ ] `OVERLAY_MODE=fs` works with live staging base.
-- [ ] Existing document can be edited.
-- [ ] New document can be created.
-- [ ] Draft and branch publish work.
-- [ ] Delete uses tombstone.
-- [ ] Basic reference dereference works.
-- [ ] Registered ID and slug queries work.
-- [ ] Studio writes canonical files.
-- [ ] Git diff is deterministic.
-- [ ] Staging cannot be mutated.
+- [ ] `OVERLAY_MODE=fs` works with live staging base. — **NOT MET.** No artifact. The environment-variable drift that caused it has since been fixed (the read client now accepts all three prefixes and refuses an absent mode), but the live-base evidence still does not exist.
+- [ ] Existing document can be edited. — **MET** at the Node layer and live on the *spike* stack; not on the product path.
+- [ ] New document can be created. — **MET**, with the same caveat; the one live artifact came from Mode 2, which has no base at all.
+- [ ] Draft and branch publish work. — **PARTIAL.** Node evidence reads from disk or a restarted server; no browser evidence on the product path.
+- [ ] Delete uses tombstone. — **MET.** Every assertion has staging holding the document as the control.
+- [ ] Basic reference dereference works. — **MET**, with the best oracle in the repo (a live Content Lake comparison) — which is `describe.skipIf` and vanishes silently in CI.
+- [ ] Registered ID and slug queries work. — **MET** for the §37 Phase 2 slice. Caveat: the *Studio* does not use that registry.
+- [ ] Studio writes canonical files. — **PARTIAL.** The write reaches disk and the file is canonical, but nothing composes the shipped `unstable_clientFactory` with a real server, and the write is performed by spike code.
+- [ ] Git diff is deterministic. — **PARTIAL.** Byte-level determinism is well evidenced (hand-derived golden, cross-tree byte equality, `eol=lf`, CI matrix). No test invokes `git`. *(The audit's separate claim that `.gitignore` hides the overlay from Git is **stale** — `.sanity-overlay/` is tracked as of 2026-08-06.)*
+- [ ] Staging cannot be mutated. — **MET; the best-evidenced claim in the repository.** Four independent layers, with non-vacuity controls on both sides — a too-weak guard *and* a block-everything guard both fail the contract.
 
 `[M-PREVIEW]` — Preview MVP (§38.2), roadmap Phase 4:
 

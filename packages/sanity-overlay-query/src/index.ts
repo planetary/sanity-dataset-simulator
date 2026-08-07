@@ -62,12 +62,31 @@ export type {EvaluateOverlayQueryOptions} from './evaluate'
  * runs. Pure and dependency free, so it is callable from CI (see
  * `lint/check-queries.mjs`), from the CLI package, or from an ESLint rule. */
 export {
+  bypassingModuleOf,
   checkSourceForUnregisteredQueries,
   checkSourcesForUnregisteredQueries,
   formatQueryLintReport,
+  importClauseOf,
   looksLikeGroq,
   scanStringLiterals,
 } from './lint/queryLint'
+/* The transform half of §22.5: rewrite a project's direct client imports, and
+ * refuse — loudly, per construct — everything it cannot prove. */
+export {
+  formatCodemodReport,
+  rewriteClientImports,
+  runClientImportCodemod,
+} from './codemod/clientImports'
+export type {
+  ClientCodemodOptions,
+  CodemodFileResult,
+  CodemodFollowUp,
+  CodemodRefusal,
+  CodemodRefusalConstruct,
+  CodemodReport,
+  CodemodRewrite,
+} from './codemod/clientImports'
+
 export type {
   QueryLintCode,
   QueryLintFinding,
@@ -76,6 +95,7 @@ export type {
   QueryLintReport,
   QueryLintSeverity,
   QueryLintSourceInput,
+  RegisteredQueryResolution,
   RegisteredQuerySummary,
   SourceLiteral,
 } from './lint/queryLint'

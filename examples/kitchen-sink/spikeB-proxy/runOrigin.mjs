@@ -15,8 +15,10 @@
 //   --port=<n>       PROXY_PORT           default 3999
 //   --bind=<addr>    PROXY_BIND           default 127.0.0.1; a non-loopback
 //                                         address is REFUSED, with no override
-//   --project=<id>   SANITY_STUDIO_PROJECT_ID   the project id Studio is configured with
-//   --dataset=<name> SANITY_STUDIO_DATASET      the one dataset this origin serves
+//   --project=<id>   the project id Studio is configured with; without the flag
+//                    it comes from examples/kitchen-sink/.env or the declared
+//                    default, NEVER from the ambient shell (see studioIdentity.mjs)
+//   --dataset=<name> the one dataset this origin serves; same rule
 //   --overlay=<id>   OVERLAY_ID           overlay id; default overlay-origin-local
 //   --log=<path>     PROXY_LOG            JSONL request log
 //
@@ -30,6 +32,10 @@ register('./tsResolveHook.mjs', import.meta.url)
 
 const {createProxyServer} = await import('./proxy.mjs')
 const {isOriginModeRequested, originStartupBanner} = await import('./originSafety.mjs')
+const {loadExplicitEnv} = await import('../../explicitEnv.mjs')
+const {DECLARED_STUDIO_IDENTITY, STUDIO_IDENTITY_KEYS, studioIdentity} = await import(
+  '../studioIdentity.mjs'
+)
 
 const KNOWN = ['origin', 'root', 'port', 'bind', 'project', 'dataset', 'overlay', 'log']
 
@@ -66,13 +72,27 @@ if (!isOriginModeRequested({origin: flags.origin}, env)) {
   process.exit(2)
 }
 
-const root =
-  flags.root ??
-  env.OVERLAY_ROOT ??
-  fileURLToPath(new URL('../', import.meta.url)) /* examples/kitchen-sink */
+/** `examples/kitchen-sink` — the overlay root's default, and where `.env` lives. */
+const STUDIO_DIR = fileURLToPath(new URL('../', import.meta.url))
 
-const projectId = flags.project ?? env.SANITY_STUDIO_PROJECT_ID ?? 'b1n03q3z'
-const dataset = flags.dataset ?? env.SANITY_STUDIO_DATASET ?? 'parity'
+const root = flags.root ?? env.OVERLAY_ROOT ?? STUDIO_DIR
+
+/* Mode 2 stamps this identity into the overlay it opens and serves it to Studio
+ * as the project a fully-granted `local-dev` may edit. A shell must not be able
+ * to choose it: declared source (or the `--project`/`--dataset` flags someone
+ * typed) only, and a disagreeing ambient value is refused. Everything else here
+ * — port, bind, log path, overlay id — is a switch about this machine. */
+const declared = studioIdentity(
+  loadExplicitEnv({
+    dirs: [STUDIO_DIR],
+    keys: STUDIO_IDENTITY_KEYS,
+    defaults: DECLARED_STUDIO_IDENTITY,
+    who: 'spike-b origin',
+  }),
+)
+
+const projectId = flags.project ?? declared.projectId
+const dataset = flags.dataset ?? declared.dataset
 const port = Number(flags.port ?? env.PROXY_PORT ?? 3999)
 const bind = flags.bind ?? env.PROXY_BIND ?? '127.0.0.1'
 

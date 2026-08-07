@@ -44,7 +44,7 @@
  *      the resource-scoped data plane (`/projects/<p>/datasets/<d>/mutate`,
  *      `/canvases/<id>/…`) got covered without ever appearing in the log.
  *
- * FOUR RULINGS, ALL FAIL-CLOSED
+ * FIVE RULINGS, ALL FAIL-CLOSED
  * -----------------------------
  *   - `OPTIONS` is never a write. CORS preflight must succeed or the browser
  *     never delivers the 403 that follows, and the developer sees a CORS error
@@ -72,6 +72,12 @@
  *     Content Lake resolves those the same way is not knowable from here, and a
  *     request with two possible meanings is exactly what default-deny is for.
  *     Nothing @sanity/client builds contains a dot segment, so no read is lost.
+ *   - A request line whose PATH is truncated at a literal `#` is never a read,
+ *     for the same reason: the guard classifies the head, `proxy.mjs` forwards
+ *     `pathname + search` and `splitPath` only cuts at `?`, so the tail travels
+ *     upstream where it can spell `../data/mutate/<ds>`. A `#` after a `?` is
+ *     query text on both sides and is left alone (security review 2026-08-06,
+ *     P1-1). See `analysePath` for why the `?`/`#` cut happens exactly once.
  *
  * WHAT THIS GUARD DOES NOT DO
  * ---------------------------
@@ -230,9 +236,44 @@ function resolveDotSegments(path) {
  * Matching a *canonical* path is the whole point — a rule set applied to an
  * attacker-chosen spelling is not a rule set (Spike F gap 20).
  *
+ * CUT ONCE, ON THE RAW LINE (security review 2026-08-06, P1-1)
+ * ------------------------------------------------------------
+ * This function used to re-cut at `?`/`#` after every decode pass, on the
+ * stated reasoning that "repeated decoding can only ever reveal more path, so
+ * it can only ever make the guard stricter". That was false, and it was the
+ * only genuine bypass the §5.5 review found in this classifier.
+ *
+ * A percent-encoded `?` is a PATH CHARACTER (RFC 3986 §3.3), not a delimiter.
+ * Decoding `%3F` and then cutting there does not reveal path — it DISCARDS
+ * path, and everything after it, including the `..` segments that `readReason`
+ * step 0 exists to refuse:
+ *
+ *     POST /data/query%3F/../actions/<ds>
+ *          re-cut  -> /data/query           -> "GROQ over POST", allowed
+ *          on the wire, unchanged, and RFC 3986 §5.2.4 `remove_dot_segments`
+ *          resolves the raw bytes to /data/actions/<ds> — the Studio write API.
+ *
+ * So the cut happens exactly once, against the bytes the proxy actually
+ * received, and every later pass may only ever add to what the guard can see.
+ * The contract's `encoded-delimiter` group is the permanent statement of this.
+ *
+ * A LITERAL `#` IS STILL CUT — AND THAT IS WHY IT IS AMBIGUOUS
+ * -----------------------------------------------------------
+ * Cutting at `#` on the raw line is right: `e2e/audit/readAllowlist.mjs` and
+ * every URL parser do the same, and refusing to cut would put this guard and
+ * the independent audit allowlist into disagreement. But `#` is not legal in an
+ * origin-form request target, Node's HTTP parser hands it through verbatim, and
+ * `proxy.mjs` forwards `pathname + search` where `splitPath` only cuts at `?`.
+ * The discarded text therefore DOES reach the upstream. That is the same "two
+ * possible meanings" situation dot segments create, so it gets the same answer:
+ * never a read. A `#` that appears AFTER a `?` lives inside the query string,
+ * never reaches the path on either side, and is left alone — GROQ text is full
+ * of them.
+ *
  * @param {unknown} rawUrl
- * @returns {{path: string, dotSegments: boolean}} the canonical path, plus
- *   whether producing it required resolving `.`/`..` segments.
+ * @returns {{path: string, dotSegments: boolean, fragmentTruncated: boolean}}
+ *   the canonical path, plus the two ways producing it made the request mean
+ *   two different things to the two ends of the proxy.
  */
 function analysePath(rawUrl) {
   let path = typeof rawUrl === 'string' ? rawUrl : String(rawUrl ?? '')
@@ -245,15 +286,20 @@ function analysePath(rawUrl) {
     path = firstSlash === -1 ? '/' : afterScheme.slice(firstSlash)
   }
 
+  // The ONE cut, on the raw request line. A `#` ahead of any `?` truncates the
+  // PATH the guard classifies while the proxy relays the whole thing.
+  const hashIndex = path.indexOf('#')
+  const queryIndex = path.indexOf('?')
+  const fragmentTruncated = hashIndex !== -1 && (queryIndex === -1 || hashIndex < queryIndex)
   path = cutAt(cutAt(path, '#'), '?')
 
-  // Decode to a fixed point (bounded), re-cutting each pass so an encoded `?`
-  // or `#` cannot smuggle path text past the first cut. Repeated decoding can
-  // only ever reveal more path, so it can only ever make the guard stricter.
+  // Decode to a fixed point (bounded). NOTHING is cut again: a delimiter that
+  // only appears after decoding was percent-encoded on the wire, which makes it
+  // an ordinary path character to everyone downstream.
   for (let pass = 0; pass < 5; pass++) {
     const decoded = safeDecode(path)
     if (decoded === path) break
-    path = cutAt(cutAt(decoded, '#'), '?')
+    path = decoded
   }
 
   if (!path.startsWith('/')) path = `/${path}`
@@ -268,7 +314,7 @@ function analysePath(rawUrl) {
   }
 
   if (path.length > 1) path = path.replace(/\/+$/, '') || '/'
-  return {path, dotSegments: resolved.sawDotSegment}
+  return {path, dotSegments: resolved.sawDotSegment, fragmentTruncated}
 }
 
 /**
@@ -327,8 +373,14 @@ function isAgentWriteAction(path) {
  * recognised read, or `null` when it is not — and "not" is the answer for
  * every path this function has never been told about.
  */
-function readReason(verb, path, dotSegments) {
+function readReason(verb, path, dotSegments, fragmentTruncated) {
   if (verb === 'OPTIONS') return 'CORS preflight is never a write'
+
+  // 0a. A request line whose PATH was truncated at a literal `#` is never a
+  //     read: the guard classified the head, the proxy forwards the whole
+  //     thing, and the tail is free to carry `../data/mutate/<ds>`. Same
+  //     ruling, same reason, as the dot-segment rule below.
+  if (fragmentTruncated) return null
 
   // 0. A path that needed `.`/`..` resolved is never a read.
   //
@@ -388,17 +440,28 @@ function readReason(verb, path, dotSegments) {
 export function classifyRequest(request) {
   const {method, url} = request || {}
   const verb = String(method ?? '').toUpperCase()
-  const {path, dotSegments} = analysePath(url)
-  const reason = readReason(verb, path, dotSegments)
+  const {path, dotSegments, fragmentTruncated} = analysePath(url)
+  const reason = readReason(verb, path, dotSegments, fragmentTruncated)
   if (reason !== null) return {write: false, path, reason}
-  return {
-    write: true,
-    path,
-    reason: dotSegments
-      ? 'path carries "." or ".." segments, so the proxy and Content Lake could ' +
-        'read it differently — never a read (default-deny)'
-      : 'not on the read allowlist (default-deny)',
+  if (dotSegments) {
+    return {
+      write: true,
+      path,
+      reason:
+        'path carries "." or ".." segments, so the proxy and Content Lake could ' +
+        'read it differently — never a read (default-deny)',
+    }
   }
+  if (fragmentTruncated) {
+    return {
+      write: true,
+      path,
+      reason:
+        'the request line carries a literal "#" in its path, so the guard and the ' +
+        'upstream see different paths — never a read (default-deny)',
+    }
+  }
+  return {write: true, path, reason: 'not on the read allowlist (default-deny)'}
 }
 
 /**
@@ -536,12 +599,37 @@ const MAX_FRAME_BYTES = 128 * 1024
 /**
  * A streaming RFC 6455 reader for the CLIENT -> UPSTREAM leg.
  *
- * Bytes are only released once the frame they belong to has been parsed AND
+ * Bytes are only released once the MESSAGE they belong to has been parsed AND
  * classified — a reader that forwarded optimistically could not take the prefix
  * of a mutation back. On the first blocked frame the guard latches shut and
  * forwards nothing else for the lifetime of the connection: the client has
  * demonstrated intent, and re-admitting it after one rejection would make the
  * block advisory.
+ *
+ * MESSAGE, NOT FRAME (security review 2026-08-06, P1-2)
+ * -----------------------------------------------------
+ * That invariant was stated here before and was false. `releaseUpTo` advanced
+ * past everything scanned so far whenever a frame was not itself a fragment —
+ * and a control frame is not a fragment. RFC 6455 §5.4 expressly allows control
+ * frames to be interleaved into a fragmented message, so a two-byte PING sent
+ * after `TEXT(fin=0, <the whole mutate body>)` released the held fragment
+ * upstream. A new final TEXT frame did the same by another route: it silently
+ * reset the chain, judged only its own (allowlisted) payload, and that verdict
+ * flushed the discarded bytes too.
+ *
+ * The accounting is therefore stated in terms of what was JUDGED:
+ *
+ *   - `scanned` walks every complete frame; `releaseUpTo` only ever moves to a
+ *     point where no message is in progress, i.e. a judged message boundary.
+ *   - A control frame arriving while a chain is open is held WITH the chain. It
+ *     is still classified and reported immediately, so the audit trail is not
+ *     delayed; only its bytes wait. Ordering is preserved, which a "forward
+ *     control frames on a side channel" fix would not do.
+ *   - A data frame arriving while a chain is open is an RFC 6455 §5.4 protocol
+ *     violation, and is treated as one instead of as a reset.
+ *   - `held` remembers how far the previous call had already parsed, so held
+ *     bytes are never re-parsed. Without it a re-scan would append a
+ *     continuation payload to the reassembly buffer twice.
  *
  * @returns {{inspect: (chunk: Buffer) => {frames: Array<object>, forward: Buffer, blocked: object|null}}}
  */
@@ -554,6 +642,8 @@ export function createRealtimeFrameGuard(options = {}) {
   let pending = Buffer.alloc(0)
   /** Payload of a fragmented message in progress (FIN=0 chains). */
   let fragment = null
+  /** Bytes at the front of `pending` already parsed AND classified, but held. */
+  let held = 0
   let latched = null
 
   /** Decode one frame from the front of `buffer`, or null if it is incomplete. */
@@ -604,6 +694,22 @@ export function createRealtimeFrameGuard(options = {}) {
     }
 
     if (frame.opcode === OPCODE_TEXT) {
+      if (fragment !== null) {
+        // RFC 6455 §5.4: a data frame may not interrupt a fragmented message.
+        // The old code read this as "start over", discarded the chain and
+        // judged only the newcomer — so an allowlisted method in the second
+        // frame released the first one's unjudged bytes (P1-2, vector D).
+        // There is no reading of this stream both ends agree on, which is the
+        // same situation the HTTP leg answers with default-deny.
+        fragment = null
+        return {
+          opcode: frame.opcode,
+          rpcMethod: null,
+          rpcId: null,
+          write: true,
+          reason: 'text frame arrived while a fragmented message was in progress (RFC 6455 §5.4)',
+        }
+      }
       fragment = frame.fin ? null : {payload: frame.payload}
       if (!frame.fin) {
         return {opcode: frame.opcode, rpcMethod: null, rpcId: null, write: false, reason: 'fragment'}
@@ -685,11 +791,11 @@ export function createRealtimeFrameGuard(options = {}) {
 
       pending = pending.length === 0 ? Buffer.from(chunk) : Buffer.concat([pending, chunk])
       const frames = []
-      // `scanned` walks every complete frame; `releaseUpTo` only advances past a
-      // message that has been JUDGED. A non-final fragment is scanned but not
-      // released, so a `mutate` split across two frames cannot get its first
-      // half forwarded before the guard has seen the method name.
-      let scanned = 0
+      // `scanned` walks every complete frame; `releaseUpTo` only ever advances
+      // to a point where NO message is in progress — a judged message boundary.
+      // Scanning resumes at `held`, the frontier the previous call reached, so
+      // nothing is parsed, classified or reassembled twice.
+      let scanned = held
       let releaseUpTo = 0
 
       for (;;) {
@@ -723,15 +829,31 @@ export function createRealtimeFrameGuard(options = {}) {
           latched = verdict
           break
         }
-        // A fragment is allowed-so-far, not allowed: hold its bytes until the
-        // continuation chain finishes and the method is known. In observation
-        // mode nothing is ever held — the tunnel stays byte-transparent, exactly
-        // as PROXY_BLOCK_WRITES=0 promises on the HTTP leg.
-        if (!isFragment || !enforce) releaseUpTo = scanned
+
+        if (!enforce) {
+          // Observation mode holds nothing — the tunnel stays byte-transparent,
+          // exactly as PROXY_BLOCK_WRITES=0 promises on the HTTP leg.
+          releaseUpTo = scanned
+          continue
+        }
+
+        // `fragment !== null` means a message is open and unjudged. Nothing
+        // behind it may leave, whatever THIS frame turned out to be: a control
+        // frame is allowed to interleave (RFC 6455 §5.4) and its own verdict
+        // says nothing about the bytes it is sitting between. Holding is a
+        // delay, not a drop — the whole run is released together the moment the
+        // continuation chain closes and its method is known.
+        if (fragment === null && !isFragment) releaseUpTo = scanned
       }
 
       const forward = Buffer.from(pending.subarray(0, releaseUpTo))
-      pending = latched ? Buffer.alloc(0) : Buffer.from(pending.subarray(releaseUpTo))
+      if (latched) {
+        pending = Buffer.alloc(0)
+        held = 0
+      } else {
+        pending = Buffer.from(pending.subarray(releaseUpTo))
+        held = scanned - releaseUpTo
+      }
       return {frames, forward, blocked: latched}
     },
   }

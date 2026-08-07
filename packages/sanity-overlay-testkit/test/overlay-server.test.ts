@@ -1640,3 +1640,285 @@ describe('spikeA overlay server — POST /query', () => {
     expect(json.result).toEqual({title: 'BRANCH'})
   })
 })
+
+/* ------------------------------------------------------------------ *
+ * Cross-site request forgery on the write route (review P2-4)
+ * ------------------------------------------------------------------ *
+ *
+ * Spike A's server and `sanity-overlay-next`'s are two mountings of the same
+ * idea, so they must refuse the same shapes. The vector is the CORS-SAFELISTED
+ * simple request: `POST` + `Content-Type: text/plain` triggers no preflight, so
+ * any page the developer happens to have open can drive `/commit`. The CORS
+ * allowlist here is already a real allowlist (it grants only the Studio dev
+ * origin), so the read-exfiltration half does not apply — the blind WRITE does.
+ *
+ * `test/next-csrf.test.ts` states the policy and the reasoning behind each
+ * clause; this block pins that the spike agrees with it.
+ */
+
+const EVIL_ORIGIN = 'https://evil.example'
+
+function forgedCommit(
+  server: Booted,
+  headers: Record<string, string>,
+  key = 'csrf-1',
+): Promise<Response> {
+  return fetch(`${server.url}/commit`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      idempotencyKey: key,
+      kind: 'actions',
+      payload: editAction('forged'),
+      baseDocuments: [BASE_ARTICLE],
+    }),
+  })
+}
+
+describe('POST /commit refuses a cross-site write', () => {
+  it('refuses the CORS-safelisted `text/plain` simple request', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+    const response = await forgedCommit(server, {
+      'content-type': 'text/plain',
+      origin: EVIL_ORIGIN,
+    })
+    expect(response.status).toBe(415)
+    expect(((await response.json()) as any).error.code).toBe('UNSUPPORTED_MEDIA_TYPE')
+    /* Checked on disk, not in the response body: a server that answered 415 and
+     * wrote anyway would pass a body-only assertion. */
+    await expect(readIntent(root, 'article-1')).rejects.toThrow()
+  })
+
+  it('refuses a non-allowlisted Origin even with a JSON content type', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+    const response = await forgedCommit(server, {
+      'content-type': 'application/json',
+      origin: EVIL_ORIGIN,
+    })
+    expect(response.status).toBe(403)
+    expect(((await response.json()) as any).error.code).toBe('FORBIDDEN_ORIGIN')
+    await expect(readIntent(root, 'article-1')).rejects.toThrow()
+  })
+
+  it('refuses `Sec-Fetch-Site: cross-site` when no Origin is sent', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+    const response = await forgedCommit(server, {
+      'content-type': 'application/json',
+      'sec-fetch-site': 'cross-site',
+    })
+    expect(response.status).toBe(403)
+    await expect(readIntent(root, 'article-1')).rejects.toThrow()
+  })
+
+  it('refuses the opaque `null` origin', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+    const response = await forgedCommit(server, {
+      'content-type': 'application/json',
+      origin: 'null',
+    })
+    expect(response.status).toBe(403)
+    await expect(readIntent(root, 'article-1')).rejects.toThrow()
+  })
+
+  it('still accepts the Studio origin, a same-origin caller and a caller with no Origin', async () => {
+    const server = await boot(await makeRoot())
+    const accepted: Array<Record<string, string>> = [
+      {'content-type': 'application/json', origin: STUDIO_ORIGIN},
+      {'content-type': 'application/json', origin: server.url},
+      {'content-type': 'application/json'},
+      {'content-type': 'application/json; charset=utf-8', origin: STUDIO_ORIGIN},
+    ]
+    for (const [index, headers] of accepted.entries()) {
+      const response = await forgedCommit(server, headers, `ok-${index}`)
+      expect(response.status).toBe(200)
+    }
+  })
+
+  it('leaves the read routes alone', async () => {
+    const server = await boot(await makeRoot())
+    const response = await fetch(`${server.url}/resolve`, {
+      method: 'POST',
+      headers: {origin: STUDIO_ORIGIN},
+      body: JSON.stringify({ids: ['article-1']}),
+    })
+    expect(response.status).toBe(200)
+  })
+
+  it('gives an arbitrary origin no CORS grant and never advertises credentials', async () => {
+    const server = await boot(await makeRoot())
+    const denied = await fetch(`${server.url}/state`, {headers: {origin: EVIL_ORIGIN}})
+    expect(denied.headers.get('access-control-allow-origin')).toBeNull()
+    expect(denied.headers.get('access-control-allow-credentials')).toBeNull()
+
+    const granted = await fetch(`${server.url}/state`, {headers: {origin: STUDIO_ORIGIN}})
+    expect(granted.headers.get('access-control-allow-origin')).toBe(STUDIO_ORIGIN)
+    expect(granted.headers.get('access-control-allow-credentials')).toBeNull()
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * A write that cannot be stored faithfully is never `committed: true`
+ * ------------------------------------------------------------------ *
+ *
+ * Review P2-5. Spike A carries its OWN copy of `parseSanityPath`
+ * (`overlayTranslate.ts`), so the defect is duplicated here and has to be closed
+ * here too — two implementations of one rule drift apart exactly when nobody
+ * tests both. `test/next-prototype-writes.test.ts` argues the reject-vs-store
+ * decision; this block pins that the spike reaches the same answer.
+ */
+describe('a §35.14 prototype key never produces a silent success', () => {
+  for (const spelling of [
+    '__proto__',
+    '__proto__.polluted',
+    'a.__proto__.b',
+    'constructor.prototype.x',
+    'prototype',
+    'list[0].__proto__',
+  ]) {
+    it(`parseSanityPath refuses ${JSON.stringify(spelling)}`, () => {
+      expect(() => parseSanityPath(spelling)).toThrowError(/prototype|__proto__|constructor/i)
+    })
+  }
+
+  it('still parses the paths Studio actually emits', () => {
+    expect(parseSanityPath('constructorName')).toEqual(['constructorName'])
+    expect(parseSanityPath('items[_key=="__proto__"].label')).toEqual([
+      'items',
+      {_key: '__proto__'},
+      'label',
+    ])
+  })
+
+  it('declares the refusal on /commit rather than reporting a committed no-op', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+    const {json} = await postCommit(server, {
+      idempotencyKey: 'proto-1',
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.edit',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+          patch: {set: {'__proto__.polluted': 'yes'}},
+        },
+      ],
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    expect(json.committed).not.toBe(true)
+    expect(String((json.unsupported as string[]).join(' '))).toMatch(/__proto__/)
+    await expect(readIntent(root, 'article-1')).rejects.toThrow()
+    expect((Object.prototype as any).polluted).toBeUndefined()
+  })
+
+  it('reads no record off the prototype chain for a wire-supplied document id', async () => {
+    /* Same class, on the document-action path: the restore step looked its
+     * target up with a bare `state.documents[…]`, so `"__proto__"` resolved to
+     * `Object.prototype` and the `record.local` read threw an uncoded 500 —
+     * unattributable to the caller (review P3-10). */
+    const server = await boot(await makeRoot())
+    for (const id of ['__proto__', 'constructor', 'toString', 'valueOf']) {
+      const {status, json} = await postCommit(server, {
+        idempotencyKey: `proto-action-${id}`,
+        kind: 'documentActions',
+        payload: [
+          {
+            actionType: 'sanity.action.document.replaceDraft',
+            publishedId: id,
+            attributes: {_id: id, _type: 'article', title: 'x'},
+          },
+        ],
+      })
+      expect(status).not.toBe(500)
+      if (json.ok === false) expect((json.error as any).code).not.toBe('INTERNAL')
+    }
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * GET /state reports the conflict set (§13.1, §13.3, §17.11, §28.1-§28.3)
+ * ------------------------------------------------------------------ *
+ *
+ * Two servers with different `/state` shapes is how this class of gap recurs, so
+ * the spike answers the same contract `sanity-overlay-next` does. The reasoning
+ * — why three states rather than two, why the summary is top-level, and why
+ * reading the persisted set is both correct and free — is stated once, in
+ * `test/next-state-conflicts.test.ts`.
+ */
+describe('GET /state reports conflicts, and says so even when there are none', () => {
+  /** Upstream moved on the SAME path the branch touched → §17.4. */
+  const BASE_TITLE_MOVED = {...BASE_ARTICLE, _rev: 'lake-rev-2', title: 'Upstream title'}
+  /** Upstream moved on a path the branch never touched → no conflict. */
+  const BASE_OTHER_MOVED = {...BASE_ARTICLE, _rev: 'lake-rev-3', editor: 'Grace'}
+
+  async function commitEdit(
+    server: Booted,
+    key: string,
+    title: string,
+    base: Record<string, unknown>,
+  ): Promise<void> {
+    const {status} = await postCommit(server, {
+      idempotencyKey: key,
+      kind: 'actions',
+      payload: editAction(title),
+      baseDocuments: [base],
+    })
+    expect(status).toBe(200)
+  }
+
+  it('an empty overlay reports an all-zero summary, not an absent one', async () => {
+    const body = await getState(await boot(await makeRoot()))
+    expect(body.documents).toEqual([])
+    expect(body.conflictSummary).toEqual({total: 0, hard: 0, soft: 0})
+  })
+
+  it('a clean branch carries an explicit empty array per document', async () => {
+    const server = await boot(await makeRoot())
+    await commitEdit(server, 'c1', 'Branch title', BASE_ARTICLE)
+
+    const body = await getState(server)
+    expect(body.conflictSummary).toEqual({total: 0, hard: 0, soft: 0})
+    expect(body.documents[0].conflicts).toEqual([])
+  })
+
+  it('stays clean when upstream moves on an untouched path', async () => {
+    const server = await boot(await makeRoot())
+    await commitEdit(server, 'c1', 'Branch title', BASE_ARTICLE)
+    await commitEdit(server, 'c2', 'Branch title again', BASE_OTHER_MOVED)
+
+    const body = await getState(server)
+    expect(body.conflictSummary).toEqual({total: 0, hard: 0, soft: 0})
+    expect(body.documents[0].conflicts).toEqual([])
+  })
+
+  it('reports a real conflict on the document and in the summary', async () => {
+    const server = await boot(await makeRoot())
+    await commitEdit(server, 'c1', 'Branch title', BASE_ARTICLE)
+    await commitEdit(server, 'c2', 'Branch title again', BASE_TITLE_MOVED)
+
+    const body = await getState(server)
+    expect(body.conflictSummary.total).toBeGreaterThan(0)
+    expect(body.conflictSummary.total).toBe(body.conflictSummary.hard + body.conflictSummary.soft)
+
+    const entry = body.documents.find((document: any) => document.logicalId === 'article-1')
+    expect(entry.conflicts.length).toBeGreaterThan(0)
+    expect(typeof entry.conflicts[0].id).toBe('string')
+    expect(['soft', 'hard']).toContain(entry.conflicts[0].severity)
+  })
+
+  it('carries the §28.2 per-document facts the conflict list renders', async () => {
+    const server = await boot(await makeRoot())
+    await commitEdit(server, 'c1', 'Branch title', BASE_ARTICLE)
+
+    const entry = (await getState(server)).documents[0]
+    expect(entry.baseRevisionAtFirstTouch).toBe('lake-rev-1')
+    expect(entry.currentBaseRevision).toBe('lake-rev-1')
+    expect(entry.origin).toBe('base')
+    expect(entry.baseStatus).toBe('present')
+  })
+})

@@ -44,7 +44,9 @@ import {
   deleteDocument,
   discardDraft,
   duplicate,
+  getRecord,
   isSyntheticRev,
+  overlayConflictSummary,
   overlayDocumentIds,
   publish,
   resolveDocumentBatch,
@@ -60,6 +62,12 @@ import {
 } from '../../../packages/sanity-overlay-store-fs/src/index.ts'
 import {translateDocumentActions, translateInterceptedWrite} from './overlayTranslate.ts'
 import {deriveReadQuery, evaluateReadQuery} from './readQueries.ts'
+import {loadExplicitEnv} from '../../explicitEnv.mjs'
+import {
+  DECLARED_STUDIO_IDENTITY,
+  STUDIO_IDENTITY_KEYS,
+  studioIdentity,
+} from '../studioIdentity.mjs'
 
 /* ------------------------------------------------------------------ *
  * Defaults
@@ -213,12 +221,33 @@ async function hydrateState(store, manifest) {
  * materialized draft and published documents exactly as Studio addresses them
  * (PRD §13.9 `_id` rule). A tombstoned perspective is `null`, which is how the
  * echo layer learns to hide a locally deleted document.
+ *
+ * `conflicts` is ALWAYS present, and `[]` means clean. The absence of the key is
+ * a different fact — "this server cannot tell you" — and §28.1 forbids
+ * collapsing the two. While this projection omitted it, the Studio's conflict
+ * action was permanently disabled with "Conflict state unknown" and nothing said
+ * why: core detected, persisted and counted the conflicts, and the one surface
+ * the UI reads never carried them.
+ *
+ * Nothing is recomputed. §17.11 makes the COMMIT the detection point, so
+ * `record.conflicts` is already the answer; `hydrateState` reads it back from
+ * disk at boot. Re-detecting here is not merely expensive, it is impossible —
+ * core never fetches base (§16.1) and `/state` is handed no base documents — so
+ * the persisted set is the only honest answer, and reading it is free.
+ *
+ * This projection must stay byte-equivalent to `sanity-overlay-next`'s
+ * `hydrationDocuments`. Two servers with divergent `/state` shapes is how this
+ * class of gap recurs; the Studio cannot tell which one it is talking to.
  */
 function hydrationDocuments(state) {
   return Object.keys(state.documents)
     .sort()
     .map((logicalId) => {
       const record = state.documents[logicalId]
+      const base = record.base
+      const capturedRevision = base?.published?.revision ?? base?.draft?.revision
+      const observedRevision =
+        base?.lastObservedPublishedRevision ?? base?.lastObservedDraftRevision
       return {
         logicalId,
         schemaType: record.schemaType,
@@ -230,6 +259,14 @@ function hydrationDocuments(state) {
         published: record.local.publishedTombstone
           ? null
           : (record.local.published?.materialized ?? null),
+        conflicts: record.conflicts,
+        origin: record.origin,
+        baseStatus: base?.baseStatus ?? null,
+        /* §5.5: omitted rather than filled in. A branch-created document has no
+         * merge ancestor, and a plausible placeholder in a reviewer-facing
+         * column is exactly the filler that section rules out. */
+        ...(capturedRevision === undefined ? {} : {baseRevisionAtFirstTouch: capturedRevision}),
+        ...(observedRevision === undefined ? {} : {currentBaseRevision: observedRevision}),
       }
     })
 }
@@ -254,12 +291,28 @@ export async function startOverlayServer(options = {}) {
   /* `hooks` is the store's own fault-injection surface (`beforeRename`). It is
    * threaded through so a test can hold a commit open inside the store and prove
    * that neither the HTTP response nor `close()` runs ahead of the disk write. */
+  /* `base` is stamped into `.sanity-overlay/manifest.json`, which is a COMMITTED
+   * artefact: it is how a branch overlay records which dataset it is a branch
+   * of. So the identity behind it is read from the declared source and an
+   * ambient value that disagrees is refused — a shell must not be able to put a
+   * foreign project id into this repository's history. Everything else below
+   * (`SPIKE_OVERLAY_*`) selects behaviour on this machine and is read ambiently
+   * on purpose. */
+  const declared = studioIdentity(
+    loadExplicitEnv({
+      dirs: [DEFAULT_ROOT],
+      keys: STUDIO_IDENTITY_KEYS,
+      defaults: DECLARED_STUDIO_IDENTITY,
+      who: 'spike-a overlay server',
+    }),
+  )
+
   const store = new FsOverlayStore({root, now, hooks: options.hooks})
   const opened = await openOverlay(store, {
     overlayId: options.overlayId ?? process.env.SPIKE_OVERLAY_ID ?? 'spike-a-local-echo',
     base: options.base ?? {
-      projectId: process.env.SANITY_STUDIO_PROJECT_ID ?? 'b1n03q3z',
-      dataset: process.env.SANITY_STUDIO_DATASET ?? 'parity',
+      projectId: declared.projectId,
+      dataset: declared.dataset,
       apiVersion: '2025-02-19',
     },
     source: options.source ?? {
@@ -645,7 +698,12 @@ export async function startOverlayServer(options = {}) {
     let index = 0
     for (const step of translated.steps) {
       if (step.type === 'restore') {
-        const record = state.documents[toPublishedId(step.id)]
+        /* core's `getRecord`, not a bare `state.documents[…]`. `step.id` comes
+         * off the wire, and a plain-object map answers `"__proto__"` /
+         * `"constructor"` / `"toString"` from the prototype chain — so the
+         * lookup returned `Object.prototype` and the `record.local` read below
+         * threw an uncoded 500 (review P3-10). */
+        const record = getRecord(state, step.id) ?? undefined
         const tombstoned =
           record !== undefined &&
           ((step.target !== 'published' && record.local.draftTombstone) ||
@@ -968,7 +1026,66 @@ export async function startOverlayServer(options = {}) {
       headers['access-control-allow-headers'] = 'content-type'
       headers['access-control-max-age'] = '600'
     }
+    /* `access-control-allow-credentials` is deliberately never emitted: this
+     * server carries no ambient credential, and reflecting an origin alongside
+     * that header is how a local dev server becomes an exfiltration endpoint for
+     * everything it serves — here, the whole branch. */
     return headers
+  }
+
+  /**
+   * Refuse a forged cross-site write (PRD §5.5 security review P2-4).
+   *
+   * `POST` + `Content-Type: text/plain` is CORS-SAFELISTED, so it fires no
+   * preflight and any page the developer has open could drive `/commit`. A
+   * loopback bind is no defence — a page in the developer's own browser is on
+   * loopback. Requiring a JSON content type takes the request out of the
+   * safelisted set, which is what forces the preflight the allowlist above then
+   * answers; `Sec-Fetch-Site` covers the case where `Origin` is absent; and the
+   * origin check treats same-origin structurally rather than by listing it.
+   *
+   * An absent `Origin` stays allowed: curl and the CLI carry no ambient browser
+   * credential and are not the actor this exists for.
+   *
+   * The policy is stated once, at `sanity-overlay-next`'s `assertWriteIsNotForged`.
+   * This is the same policy; the two servers must not diverge.
+   */
+  function assertWriteIsNotForged(request) {
+    const contentType = String(request.headers['content-type'] ?? '')
+      .split(';')[0]
+      .trim()
+      .toLowerCase()
+    if (contentType !== 'application/json') {
+      throw new HttpError(
+        415,
+        'UNSUPPORTED_MEDIA_TYPE',
+        'a state-changing request must declare `content-type: application/json`, which is what ' +
+          'forces a CORS preflight and closes the forged simple-request path',
+      )
+    }
+
+    const site = request.headers['sec-fetch-site']
+    const forbidden = () =>
+      new HttpError(
+        403,
+        'FORBIDDEN_ORIGIN',
+        'this request did not come from an origin the overlay server grants; a state-changing ' +
+          'request must be same-origin or from a configured origin',
+      )
+
+    if (site === 'cross-site') throw forbidden()
+
+    const origin = request.headers.origin
+    if (typeof origin !== 'string' || origin === '') return
+    if (allowedOrigins.has(origin) || allowedOrigins.has('*')) return
+    if (site === 'same-origin') return
+    try {
+      const self = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
+      if (self.origin === origin) return
+    } catch {
+      /* An unparseable request line cannot establish same-origin. */
+    }
+    throw forbidden()
   }
 
   function send(request, response, status, payload) {
@@ -1049,6 +1166,10 @@ export async function startOverlayServer(options = {}) {
         overlayId,
         root,
         revision: state.revision,
+        /* Top-level, because an overlay with ZERO documents has no per-document
+         * field to read: without this, "empty branch" and "cannot tell you" are
+         * indistinguishable. §13.1 already fixes the shape. */
+        conflictSummary: overlayConflictSummary(state),
         documents: hydrationDocuments(state),
       })
       return
@@ -1121,6 +1242,20 @@ export async function startOverlayServer(options = {}) {
     }
 
     if (request.method === 'POST' && route === '/commit') {
+      /* BEFORE the body is read, so a forged request is refused without the
+       * server doing any work on its behalf. */
+      try {
+        assertWriteIsNotForged(request)
+      } catch (error) {
+        request.resume()
+        log('error', `overlay commit refused [${error.code}]: ${error.message}`)
+        send(request, response, error.status, {
+          ok: false,
+          error: {code: error.code, message: error.message},
+        })
+        return
+      }
+
       const body = await jsonBody('commit')
       if (body === undefined) return
 

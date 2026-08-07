@@ -61,9 +61,21 @@ export function createOverlayState(options: CreateOverlayStateOptions = {}): Ove
   }
 }
 
-/** Look up a document record by logical ID (`drafts.` prefixes are normalized away). */
+/**
+ * Look up a document record by logical ID (`drafts.` prefixes are normalized away).
+ *
+ * `hasOwnProperty`, not a bare `[[Get]]`. `documents` is a plain-object map keyed
+ * by an ID the caller supplies, so `"__proto__"`, `"constructor"` and
+ * `"toString"` would otherwise resolve through the prototype chain and hand back
+ * `Object.prototype`, the `Object` constructor or a function as if it were a
+ * record — which downstream reads as "this document exists" and then crashes on
+ * a field it does not have (security review 2026-08-06 P3-10). "Not a key of
+ * this map" is the only correct answer.
+ */
 export function getRecord(state: OverlayState, id: string): OverlayDocumentRecord | null {
-  return state.documents[toPublishedId(id)] ?? null
+  const logicalId = toPublishedId(id)
+  if (!Object.prototype.hasOwnProperty.call(state.documents, logicalId)) return null
+  return state.documents[logicalId] ?? null
 }
 
 /** Return a copy of `state` with one document record replaced. */

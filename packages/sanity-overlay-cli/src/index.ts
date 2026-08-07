@@ -51,3 +51,66 @@ export type {VersionKind} from './records'
 
 export {formatPath, plural, table} from './render'
 export {collectSecrets, redact, REDACTED} from './redact'
+
+/* PRD §37 Phase 6 CI — the checklist as data, the checks, and the PR reporting
+ * decisions. Exported so the suite asserts on them directly and a consuming
+ * project can compose them into its own gate. */
+export {
+  CI_CHECKS,
+  PHASE_6_CI_DISCHARGE,
+  PHASE_6_CI_TASKS,
+  resultOf,
+  skipped,
+  taskFor,
+} from './ci/checks'
+export type {
+  CiCheckId,
+  CiCheckResult,
+  CiDischarge,
+  CiDischargeKind,
+  CiFinding,
+  CiReport,
+  CiStatus,
+  Phase6CiTask,
+} from './ci/checks'
+
+export {
+  CHECKPOINT_POLICIES,
+  baseDriftCheck,
+  branchSchemaCheck,
+  checkpointPolicyCheck,
+  conflictSummaryCheck,
+  overlaySchemasCheck,
+  strongReferencesCheck,
+} from './ci/overlayChecks'
+export type {CheckpointPolicy} from './ci/overlayChecks'
+
+export {
+  UNSUPPORTED_HOSTED_NAMES,
+  UNSUPPORTED_PLUGIN_MODULES,
+  UNSUPPORTED_PLUGIN_SYMBOLS,
+  extractEnvNames,
+  scanForUnsupportedPlugins,
+  scanForWriteTokens,
+} from './ci/scan'
+
+export {CONFLICT_COMMENT_MARKER, renderCiText, renderConflictMarkdown} from './ci/report'
+
+export {
+  COMMIT_STATUS_CONTEXT,
+  countsEqual,
+  createHttpGitHubClient,
+  parseRepository,
+  planCommitStatus,
+  planConflictComment,
+  publishPrReport,
+} from './ci/github'
+export type {
+  CommentPlan,
+  CommitStatusPlan,
+  CommitStatusState,
+  ConflictCounts,
+  GitHubClient,
+  GitHubIssueComment,
+  PrTarget,
+} from './ci/github'

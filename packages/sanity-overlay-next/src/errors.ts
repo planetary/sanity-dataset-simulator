@@ -12,6 +12,16 @@ export type OverlayApiErrorCode =
   | 'INVALID_JSON'
   | 'PAYLOAD_TOO_LARGE'
   | 'UNSUPPORTED_QUERY'
+  /**
+   * A state-changing request did not declare `application/json` (415).
+   *
+   * Distinct from `INVALID_REQUEST` on purpose: it is not a malformed body, it
+   * is a request shape that would have skipped the CORS preflight — so the
+   * caller's fix is a header, not a payload.
+   */
+  | 'UNSUPPORTED_MEDIA_TYPE'
+  /** A state-changing request came from an origin this API does not grant (403). */
+  | 'FORBIDDEN_ORIGIN'
   | 'NOT_FOUND'
   | 'INTERNAL'
 

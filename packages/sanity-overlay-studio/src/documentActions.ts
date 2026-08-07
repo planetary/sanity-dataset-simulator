@@ -51,6 +51,7 @@ import {
   type StudioRebaseMode,
 } from './operations'
 import {toPublishedId} from '../../sanity-overlay-core/src/index'
+import type {OverlayConflict} from '../../sanity-overlay-core/src/index'
 import type {OverlayHydrationDocument, OverlayTransport} from './client/transport'
 
 /* ------------------------------------------------------------------ *
@@ -110,6 +111,16 @@ export interface OverlayActionController {
   describe(context: OverlayActionContext): OverlayActionDescription | null
   /** Conflict action only: the §28.3 panel models for one document. */
   conflictPanel?(documentId: string): ConflictPanelModel[]
+  /**
+   * Conflict action only: the raw §13.11 conflicts for one document.
+   *
+   * A `ConflictPanelModel` is already a projection — labels and four value rows
+   * — and `resolvedPreviewValue` / `planConflictResolution` both need the record
+   * itself. A renderer that only had the model would have to re-derive the
+   * conflict to preview a button, which is the second, weaker copy of the
+   * decision this package exists to avoid.
+   */
+  conflictsFor?(documentId: string): readonly OverlayConflict[]
   /** Conflict action only: drive one §28.3 action. */
   resolve?(input: ConflictResolutionInput & {conflictId: string; documentId: string}):
     Promise<ConflictResolutionOutcome>
@@ -373,10 +384,12 @@ export function createOverlayActionController(
    * The conflict panel half
    * ---------------------------------------------------------------- */
 
+  function conflictsFor(documentId: string): readonly OverlayConflict[] {
+    return conflicts().byDocument[toPublishedId(documentId)] ?? []
+  }
+
   function conflictPanel(documentId: string): ConflictPanelModel[] {
-    const logicalId = toPublishedId(documentId)
-    const found = conflicts().byDocument[logicalId] ?? []
-    return found.map((conflict) => conflictPanelModel(conflict))
+    return conflictsFor(documentId).map((conflict) => conflictPanelModel(conflict))
   }
 
   async function resolve(
@@ -417,7 +430,7 @@ export function createOverlayActionController(
       return () => listeners.delete(listener)
     },
     describe,
-    ...(options.kind === 'conflictResolution' ? {conflictPanel, resolve} : {}),
+    ...(options.kind === 'conflictResolution' ? {conflictPanel, conflictsFor, resolve} : {}),
   }
 
   return controller

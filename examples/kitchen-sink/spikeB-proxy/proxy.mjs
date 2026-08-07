@@ -30,7 +30,9 @@
  * Env (CLI defaults; every one is overridable through createProxyServer options):
  *   PROXY_PORT=3999                       listen port
  *   PROXY_BIND=<addr>                     bind address (default: all interfaces, v4+v6)
- *   SANITY_API_HOST=https://b1n03q3z.api.sanity.io   upstream origin
+ *   SANITY_API_HOST=https://b1n03q3z.api.sanity.io   upstream origin — declare it
+ *                                         in examples/kitchen-sink/.env, not in
+ *                                         your shell; see resolveProxyConfig
  *   PROXY_BLOCK_WRITES=1                  enable the overlay write guard
  *   PROXY_DERIVE_PROJECT_HOST=0           disable `<project>.localhost` -> `<project>.api.sanity.io`
  *   PROXY_FORWARD_ORIGIN=1                forward browser Origin/Referer upstream (default: strip)
@@ -54,8 +56,25 @@ import {
   isOriginModeRequested,
   isOriginWriteRoute,
 } from './originSafety.mjs'
+import {loadExplicitEnv} from '../../explicitEnv.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+/** The example this spike belongs to — where its `.env` files live. */
+const STUDIO_DIR = join(HERE, '..')
+
+/**
+ * The upstream this spike is pointed at, declared in code.
+ *
+ * `SANITY_API_HOST` is the single most expensive ambient read in `examples/`,
+ * because Mode 1 forwards Studio's REAL traffic — session cookie and bearer
+ * token included — to whatever it names. An exported value from another project
+ * would not misread content; it would post this developer's credentials to a
+ * host they never typed. So it is resolved from `examples/kitchen-sink/.env`
+ * (or this constant) and a disagreeing ambient value is refused.
+ */
+const DECLARED_UPSTREAM = Object.freeze({
+  SANITY_API_HOST: 'https://b1n03q3z.api.sanity.io',
+})
 
 /** RFC 7230 §6.1 hop-by-hop headers — must not be forwarded in either direction. */
 const HOP_BY_HOP = new Set([
@@ -240,11 +259,36 @@ function parseStatusCode(chunk) {
  * second. Options exist so the proxy can be started in-process (tests, a future
  * `sanity-overlay` CLI) without mutating `process.env`; the CLI path below keeps
  * behaving exactly as documented in README.md.
+ *
+ * ONE VALUE IS TREATED DIFFERENTLY. Ports, bind addresses, log paths and the
+ * four `PROXY_*` switches select behaviour on this machine, and reading them
+ * from the shell is what they are for. `SANITY_API_HOST` names the host that
+ * receives Studio's authenticated traffic, which is not a switch — see
+ * `DECLARED_UPSTREAM` above.
  */
 export function resolveProxyConfig(options = {}) {
   const env = options.env || process.env
+  /**
+   * The upstream is resolved from the DECLARED source, not from `env`.
+   *
+   * An injected `options.env` is explicit by construction — an in-process
+   * caller typed that map — so it is treated as declared and checked against
+   * nothing. The bare-CLI path (`node proxy.mjs`, no options) is the one that
+   * inherits a shell, and there the declared files plus `DECLARED_UPSTREAM`
+   * decide, with a disagreeing ambient `SANITY_API_HOST` refused outright.
+   */
+  const declaredUpstream = options.env
+    ? {...DECLARED_UPSTREAM, ...options.env}
+    : loadExplicitEnv({
+        /* The Studio's own directory, and only it: one declared location for
+         * the whole kitchen-sink example, which is the one the READMEs name. */
+        dirs: [STUDIO_DIR],
+        keys: Object.keys(DECLARED_UPSTREAM),
+        defaults: DECLARED_UPSTREAM,
+        who: 'spike-b proxy',
+      })
   const upstream = new URL(
-    options.upstream || env.SANITY_API_HOST || 'https://b1n03q3z.api.sanity.io',
+    options.upstream || declaredUpstream.SANITY_API_HOST || DECLARED_UPSTREAM.SANITY_API_HOST,
   )
   /**
    * MODE 2 (origin). Explicit opt-in only — see `originSafety.mjs`. In Mode 2

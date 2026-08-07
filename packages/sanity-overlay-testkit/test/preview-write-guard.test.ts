@@ -4,7 +4,7 @@
  * `test/write-guard.test.ts` runs `runWriteGuardContract` against
  * `examples/kitchen-sink/spikeB-proxy/writeGuard.mjs` — a local Node process
  * that **does not exist in a deployed preview**. This file runs the identical
- * 236-case contract against `sanity-overlay-client`'s packaged classifier, the
+ * contract against `sanity-overlay-client`'s packaged classifier, the
  * one a deployment's own origin can actually import and run server-side.
  *
  * Two implementations, one contract. The contract is the oracle for both, so

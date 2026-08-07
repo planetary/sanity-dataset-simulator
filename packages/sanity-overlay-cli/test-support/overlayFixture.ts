@@ -16,6 +16,7 @@ import {
   persistConflicts,
   type CreateConflictInput,
   type OverlayActor,
+  type OverlayManifest,
   type SanityDocument,
 } from '../../sanity-overlay-core/src/index'
 import {FsOverlayStore} from '../../sanity-overlay-store-fs/src/index'
@@ -88,6 +89,17 @@ export interface OverlayFixtureOptions {
   readonly overlayId?: string
   /** Create the directory but seed nothing, so there is no `.sanity-overlay/`. */
   readonly empty?: boolean
+  /**
+   * PRD §13.1 `manifest.source`, in full.
+   *
+   * `seedOverlay` accepts only `{repositoryId, branch}`, which leaves
+   * `schemaCommitSha` — the PRD §20.1 "[MUST] Store schema commit SHA in the
+   * overlay manifest" field — unreachable from a fixture. Given here, the
+   * overlay is created through the store's own `createOverlay` FIRST and
+   * `seedOverlay` then extends it, so the manifest is still written by the real
+   * adapter and nothing is hand-built on disk.
+   */
+  readonly source?: OverlayManifest['source']
 }
 
 export interface OverlayFixture {
@@ -116,6 +128,17 @@ export async function createOverlayFixture(
   roots.push(root)
   const overlayId = options.overlayId ?? FIXTURE_OVERLAY_ID
   if (options.empty) return {root, overlayId}
+
+  if (options.source !== undefined) {
+    const now = fixedClock()
+    await new FsOverlayStore({root, now}).createOverlay({
+      overlayId,
+      base: {projectId: 'proj-cli', dataset: 'production', apiVersion: '2024-10-01'},
+      source: options.source,
+      actor: CONFLICT_ACTOR,
+      ifNotExists: true,
+    })
+  }
 
   await seedOverlay({
     root,

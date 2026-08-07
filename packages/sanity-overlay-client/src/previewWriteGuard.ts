@@ -14,8 +14,10 @@
  * This is that classifier as a package export, so the deployment's own origin
  * can run the identical policy server-side. It is behaviourally pinned to the
  * example by `runWriteGuardContract` (`sanity-overlay-testkit`), the same
- * 236-case contract the proxy passes: two implementations, one contract, no
- * room for them to drift apart quietly.
+ * contract the proxy passes: two implementations, one contract, no room for
+ * them to drift apart quietly. P1-1 is why that matters — the truncation bug
+ * was present in both, identically, and only a shared contract case could have
+ * caught it in both.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * THE POLICY: DEFAULT-DENY
@@ -161,8 +163,33 @@ function resolveDotSegments(path: string): {path: string; sawDotSegment: boolean
  * `//data/mutate/ds` is treated as a duplicated slash, NOT as a protocol-relative
  * URL: the input is a proxy request line, where `//x` is a path, and reading it
  * as an authority would silently discard the endpoint.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CUT ONCE, ON THE RAW LINE (security review 2026-08-06, P1-1)
+ *
+ * This function used to re-cut at `?`/`#` after every decode pass, claiming that
+ * repeated decoding could "only ever make the guard stricter". A percent-encoded
+ * `?` is a PATH CHARACTER (RFC 3986 §3.3), so decoding it and cutting there
+ * discards path — including the `..` segments `readReason` step 0 exists to
+ * refuse. `POST /data/query%3F/../actions/<ds>` classified as a GROQ read while
+ * `remove_dot_segments` over the untouched request line resolves it to
+ * `/data/actions/<ds>`.
+ *
+ * That mattered most HERE. In a deployed preview there is no proxy behind this
+ * classifier — `preview-write-impossibility.md` §6 nominates it as the only
+ * door — so the cut now happens exactly once, against the bytes as received.
+ *
+ * A literal `#` is still cut (the independent audit allowlist cuts there too),
+ * but the truncation itself is recorded: `#` is not legal in an origin-form
+ * request target, servers relay it verbatim, and the discarded tail can carry
+ * `../data/mutate/<ds>`. A `#` after a `?` is inside the query string, reaches
+ * nobody's path, and is left alone.
  */
-function analysePath(rawUrl: unknown): {path: string; dotSegments: boolean} {
+function analysePath(rawUrl: unknown): {
+  path: string
+  dotSegments: boolean
+  fragmentTruncated: boolean
+} {
   let path = typeof rawUrl === 'string' ? rawUrl : String(rawUrl ?? '')
 
   /* Absolute URL: drop scheme + authority, keep the path. */
@@ -173,15 +200,19 @@ function analysePath(rawUrl: unknown): {path: string; dotSegments: boolean} {
     path = firstSlash === -1 ? '/' : afterScheme.slice(firstSlash)
   }
 
+  /* The ONE cut, on the raw request line. */
+  const hashIndex = path.indexOf('#')
+  const queryIndex = path.indexOf('?')
+  const fragmentTruncated = hashIndex !== -1 && (queryIndex === -1 || hashIndex < queryIndex)
   path = cutAt(cutAt(path, '#'), '?')
 
-  /* Decode to a fixed point (bounded), re-cutting each pass so an encoded `?`
-   * or `#` cannot smuggle path text past the first cut. Repeated decoding can
-   * only ever reveal more path, so it can only ever make the guard stricter. */
+  /* Decode to a fixed point (bounded). NOTHING is cut again: a delimiter that
+   * only appears after decoding was percent-encoded on the wire, which makes it
+   * an ordinary path character to everyone downstream. */
   for (let pass = 0; pass < 5; pass++) {
     const decoded = safeDecode(path)
     if (decoded === path) break
-    path = cutAt(cutAt(decoded, '#'), '?')
+    path = decoded
   }
 
   if (!path.startsWith('/')) path = `/${path}`
@@ -196,7 +227,7 @@ function analysePath(rawUrl: unknown): {path: string; dotSegments: boolean} {
   }
 
   if (path.length > 1) path = path.replace(/\/+$/, '') || '/'
-  return {path, dotSegments: resolved.sawDotSegment}
+  return {path, dotSegments: resolved.sawDotSegment, fragmentTruncated}
 }
 
 /** The canonical path alone: lower-case, rooted, version-stripped. */
@@ -239,8 +270,18 @@ function isAgentWriteAction(path: string): boolean {
  * `null` when it is not — and "not" is the answer for every path this function
  * has never been told about.
  */
-function readReason(verb: string, path: string, dotSegments: boolean): string | null {
+function readReason(
+  verb: string,
+  path: string,
+  dotSegments: boolean,
+  fragmentTruncated: boolean,
+): string | null {
   if (verb === 'OPTIONS') return 'CORS preflight is never a write'
+
+  /* 0a. A request line whose PATH was truncated at a literal `#` is never a
+   *     read: this classifier saw the head, the server relays the whole thing,
+   *     and the tail is free to carry `../data/mutate/<ds>`. */
+  if (fragmentTruncated) return null
 
   /* 0. A path that needed `.`/`..` resolved is never a read.
    *
@@ -305,17 +346,28 @@ export interface PreviewGuardVerdict {
  */
 export function classifyPreviewRequest(request: PreviewGuardRequest): PreviewGuardVerdict {
   const verb = String(request?.method ?? '').toUpperCase()
-  const {path, dotSegments} = analysePath(request?.url)
-  const reason = readReason(verb, path, dotSegments)
+  const {path, dotSegments, fragmentTruncated} = analysePath(request?.url)
+  const reason = readReason(verb, path, dotSegments, fragmentTruncated)
   if (reason !== null) return {write: false, path, reason}
-  return {
-    write: true,
-    path,
-    reason: dotSegments
-      ? 'path carries "." or ".." segments, so the proxy and Content Lake could ' +
-        'read it differently — never a read (default-deny)'
-      : 'not on the read allowlist (default-deny)',
+  if (dotSegments) {
+    return {
+      write: true,
+      path,
+      reason:
+        'path carries "." or ".." segments, so the proxy and Content Lake could ' +
+        'read it differently — never a read (default-deny)',
+    }
   }
+  if (fragmentTruncated) {
+    return {
+      write: true,
+      path,
+      reason:
+        'the request line carries a literal "#" in its path, so the guard and the ' +
+        'upstream see different paths — never a read (default-deny)',
+    }
+  }
+  return {write: true, path, reason: 'not on the read allowlist (default-deny)'}
 }
 
 /** Does this request write to Content Lake? Default-deny by construction. */

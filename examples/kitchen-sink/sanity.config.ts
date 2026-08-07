@@ -32,6 +32,7 @@ import {createClient} from '@sanity/client'
 import {defineConfig} from 'sanity'
 import {structureTool} from 'sanity/structure'
 import {schemaTypes} from './schemaTypes'
+import {studioIdentity} from './studioIdentity.mjs'
 import {spikeClientFactory} from './spikeA/instrumentedClient'
 import {defineOverlayConfig} from '../../packages/sanity-overlay-studio/src/config'
 import {createOverlayStatusLayout} from '../../packages/sanity-overlay-studio/src/ui/statusLayout'
@@ -57,8 +58,12 @@ function spikePathRequested(): boolean {
 const workspace = {
   name: 'kitchen-sink',
   title: 'Kitchen Sink (overlay test target)',
-  projectId: process.env.SANITY_STUDIO_PROJECT_ID || 'b1n03q3z',
-  dataset: process.env.SANITY_STUDIO_DATASET || 'parity',
+  /* `SANITY_STUDIO_PROJECT_ID` / `SANITY_STUDIO_DATASET` still configure this
+   * Studio, from this directory's `.env` — see `studioIdentity.mjs`. What
+   * changed is that `sanity.cli.ts` has already refused to start if the shell
+   * disagreed with that file, so a value arriving here was declared on purpose
+   * rather than inherited from whatever the terminal was last used for. */
+  ...studioIdentity(process.env as Record<string, string | undefined>),
   plugins: [structureTool()],
   schema: {types: schemaTypes},
 }
@@ -68,6 +73,12 @@ export default spikePathRequested()
     defineConfig({...workspace, unstable_clientFactory: spikeClientFactory})
   : // Product path — the one line `sanity-overlay-studio` exists to make possible.
     defineOverlayConfig(workspace, {
+      /* The WHOLE ambient environment, deliberately. Nothing the plugin reads
+       * out of it points at a project — it reads `OVERLAY_MODE`, `OVERLAY_API_URL`
+       * and friends, which select behaviour inside this repository — and one
+       * thing it does with it is SCAN for a write token under any spelling
+       * (`options.ts` → `assertNoWriteToken`). Handing that scan a filtered map
+       * would blind the safety check to exactly the variable it exists to find. */
       env: process.env as Record<string, string | undefined>,
       createClient: (options) => createClient(options as never) as unknown as object,
       layout: createOverlayStatusLayout({createElement, useEffect, useState}),

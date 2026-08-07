@@ -101,6 +101,17 @@ function asArray(payload: unknown): unknown[] {
 /* -------------------------------------------------------------- path parsing */
 
 /**
+ * PRD §35.14 — keys that can never be own keys of canonical overlay JSON.
+ *
+ * Re-declared rather than imported from `sanity-overlay-core`'s `serialize.ts`,
+ * for the same reason the mutation types above are: this module has to load in a
+ * browser bundle with no core dependency. `core-serializer-golden.test.ts` owns
+ * the authoritative list; the duplication is three frozen strings and drift
+ * would show up as a translator that accepts what core then refuses.
+ */
+const FORBIDDEN_FIELD_NAMES = new Set(['__proto__', 'constructor', 'prototype'])
+
+/**
  * Parse a Sanity patch path (`body[_key=="a"].children[0].text`) into a PRD §13.6
  * overlay path.
  *
@@ -108,6 +119,13 @@ function asArray(payload: unknown): unknown[] {
  * indexes (including the `-1` append anchor) and `_key` predicates. Anything else
  * (`[]`, slices, filters) throws, and the caller records it in `unsupported`
  * rather than guessing at semantics.
+ *
+ * A field segment spelling a §35.14 prototype key throws for the same reason it
+ * does in `sanity-overlay-next`'s translator: the path names a member canonical
+ * JSON cannot hold, and a plain assignment to `__proto__` runs the prototype
+ * SETTER — so the write vanishes while the server answers success (security
+ * review 2026-08-06 P2-5). A `_key` PREDICATE spelling the same word is
+ * untouched; that is a value, not a property name.
  */
 export function parseSanityPath(path: string): OverlayPath {
   if (typeof path !== 'string' || path.length === 0) {
@@ -146,6 +164,13 @@ export function parseSanityPath(path: string): OverlayPath {
     while (cursor < path.length && path[cursor] !== '.' && path[cursor] !== '[') cursor += 1
     const field = path.slice(index, cursor)
     if (field.length === 0) throw new Error(`empty segment in path ${JSON.stringify(path)}`)
+    if (FORBIDDEN_FIELD_NAMES.has(field)) {
+      throw new Error(
+        `segment ${JSON.stringify(field)} in path ${JSON.stringify(path)} is a ` +
+          'prototype-polluting key and cannot be a document field (PRD §35.14); the write is ' +
+          'refused rather than stored as something else',
+      )
+    }
     segments.push(field)
     index = cursor
   }

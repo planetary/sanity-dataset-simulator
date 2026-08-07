@@ -91,12 +91,6 @@ export interface OverlayResolveRequest {
   types?: string[]
 }
 
-export interface OverlayQueryRequest {
-  query: string
-  params?: Rec
-  perspective?: string
-}
-
 /**
  * One §21.7 overlay operation — a rebase, a conflict resolution, a checkpoint.
  *
@@ -115,11 +109,32 @@ export interface OverlayOperationRequest {
   actor?: unknown
 }
 
+/**
+ * The overlay endpoints a Studio session can reach.
+ *
+ * THERE IS NO `query()`, DELIBERATELY. `POST /query` is one half of a two-party
+ * protocol (`sanity-overlay-next` `queries.ts`): the overlay derives a §22.6
+ * candidate plan, the CALLER fetches those base documents — it is the only
+ * party holding a Sanity credential — and the overlay evaluates the query over
+ * the branch plus the documents it was handed.
+ *
+ * A `query(request)` method used to sit here. Nothing ever called it, and it
+ * could not have worked: it sent `{query, params}` with no `queryId`, so the
+ * endpoint could only recognise the text by checksum against the §22.5 registry
+ * and answered a Studio-composed query with `400 UNSUPPORTED_QUERY`; and it
+ * sent no `baseDocuments`, so a query that DID match was evaluated against an
+ * empty base and answered `[]` — a silent approximation, which §5.5 forbids and
+ * which no error would have surfaced. Studio reads therefore evaluate in the
+ * browser, in `client/reads.ts`, where the credential is.
+ *
+ * If a server-side read is ever wanted, it is two calls (`/query/plan`, then a
+ * base fetch through the wrapped client, then `/query` carrying the result) —
+ * not a method on this interface pretending to be one.
+ */
 export interface OverlayTransport {
   commit(commit: OverlayCommit, context: OverlayCommitContext): Promise<OverlayTransportResult>
   operation(request: OverlayOperationRequest): Promise<OverlayTransportResult>
   resolve(request: OverlayResolveRequest): Promise<OverlayTransportResult>
-  query(request: OverlayQueryRequest): Promise<OverlayTransportResult>
   state(): Promise<OverlayTransportResult>
   /** The URL every call in this transport is anchored to. */
   apiUrl: string
@@ -349,7 +364,6 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
         ),
       ),
     resolve: (request) => call('/resolve', {method: 'POST', body: request}, 'read'),
-    query: (request) => call('/query', {method: 'POST', body: request}, 'read'),
     state: () => call('/state', {method: 'GET'}, 'read'),
   }
 }

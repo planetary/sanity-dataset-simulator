@@ -58,12 +58,14 @@ import {
   createOverlayState,
   deleteDocument,
   discardDraft,
+  isForbiddenKey,
   publish,
   resolveVersionBatch,
   toPublishedId,
   unpublish,
 } from '../../../packages/sanity-overlay-core/src/index.ts'
 import {FsOverlayStore} from '../../../packages/sanity-overlay-store-fs/src/index.ts'
+import {isLoopbackBind} from './originSafety.mjs'
 
 /* ------------------------------------------------------------------ *
  * the synthetic identity
@@ -168,6 +170,119 @@ async function readJson(request) {
 }
 
 /* ------------------------------------------------------------------ *
+ * cross-site request forgery, and who may read the branch
+ * ------------------------------------------------------------------ *
+ *
+ * Mode 2's identity is synthetic and FULLY GRANTED (`originSafety.mjs`), so
+ * there is no authentication anywhere behind `/data/mutate` and `/data/actions`.
+ * That is only safe while a request has to come from somewhere trusted, and
+ * until the 2026-08-06 security review (P2-4) nothing checked. `POST` +
+ * `Content-Type: text/plain` is CORS-SAFELISTED, so it fires no preflight: any
+ * page the developer had open could drive a write. The loopback bind — which is
+ * otherwise sound — stops a LAN attacker and nothing else, because a page in the
+ * developer's own browser is on loopback by definition.
+ *
+ * WHY LOOPBACK ORIGINS ARE THE ALLOWLIST
+ * Mode 2 refuses to bind anything but loopback, and its one browser client is a
+ * local dev server whose port cannot be known in advance (`3333` for `sanity
+ * dev`, `5173` for a bare Vite, whatever `--port` said). So the grant is derived
+ * from the same structural predicate the bind check uses, rather than from a
+ * list that would have to be guessed or configured. A page at
+ * `https://evil.example` is refused — including one whose DNS has been rebound
+ * to 127.0.0.1, because rebinding changes where a name resolves and not what a
+ * page's ORIGIN is.
+ */
+
+/** Is `value` an origin Mode 2 will talk to? */
+function isGrantedOrigin(value, allowed) {
+  if (typeof value !== 'string' || value === '') return false
+  if (allowed.has('*') || allowed.has(value)) return true
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    /* The SAME predicate `assertLoopbackBind` uses, deliberately: one definition
+     * of "loopback" for the socket and for the caller. `Origin: null` — a
+     * sandboxed iframe or a `data:` document — fails `new URL` and is refused,
+     * which is right: it is not a name that can be granted. */
+    return isLoopbackBind(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Refuse a forged cross-site state-changing request.
+ *
+ * Three clauses. The JSON content type is the one that closes the CLASS: it
+ * takes the request out of the CORS-safelisted set, so a cross-origin browser
+ * must preflight first. `Sec-Fetch-Site` is what still holds when `Origin` is
+ * absent — browsers set it and page JS cannot forge it. The origin check is the
+ * backstop for a caller that sends `Origin` and nothing else.
+ *
+ * An ABSENT `Origin` is allowed: curl, the recorded-session replays and any
+ * non-browser client carry no ambient browser credential and are not the actor
+ * this control exists for.
+ */
+function assertWriteIsNotForged(request, allowed) {
+  const contentType = String(request.headers['content-type'] ?? '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase()
+  if (contentType !== 'application/json') {
+    throw new OriginError(
+      415,
+      'OVERLAY_ORIGIN_UNSUPPORTED_MEDIA_TYPE',
+      'a state-changing request must declare `content-type: application/json`, which is what ' +
+        'forces a CORS preflight and closes the forged simple-request path. Mode 2 has no ' +
+        'authentication behind this route, so the request has to prove where it came from.',
+    )
+  }
+
+  const site = request.headers['sec-fetch-site']
+  const origin = request.headers.origin
+  const forbidden = () =>
+    new OriginError(
+      403,
+      'OVERLAY_ORIGIN_FORBIDDEN_ORIGIN',
+      `Mode 2 does not accept a state-changing request from ${JSON.stringify(origin ?? '(cross-site)')}. ` +
+        'It serves a synthetic full-grant identity from a loopback socket, so only a loopback ' +
+        'origin — or one named explicitly — may drive a write.',
+      {origin: origin ?? null},
+    )
+
+  if (site === 'cross-site') throw forbidden()
+  if (typeof origin !== 'string' || origin === '') return
+  if (isGrantedOrigin(origin, allowed)) return
+  throw forbidden()
+}
+
+/** Header names the transport owns and Mode 2 will not pass on unearned. */
+const CORS_GRANT_HEADERS = ['access-control-allow-origin', 'access-control-allow-credentials']
+
+/**
+ * Strip a CORS grant this origin would not have issued.
+ *
+ * `corsHeaders` is computed in `proxy.mjs` and reflects the request `Origin`
+ * verbatim with `Access-Control-Allow-Credentials: true` — which is the standard
+ * way a local dev server becomes an exfiltration endpoint, and here the thing
+ * exfiltrated is the whole branch, every unpublished draft included. Mode 2
+ * cannot fix the transport, but every byte of branch content leaves through
+ * THIS module, so it refuses to carry a grant it disagrees with. A caller that
+ * sent no `Origin` is left alone: there is no browser to protect.
+ */
+function grantedCorsHeaders(request, cors, allowed) {
+  const origin = request.headers.origin
+  if (typeof origin !== 'string' || origin === '') return cors
+  if (isGrantedOrigin(origin, allowed)) return cors
+  const stripped = {}
+  for (const [name, value] of Object.entries(cors)) {
+    if (CORS_GRANT_HEADERS.includes(name.toLowerCase())) continue
+    stripped[name] = value
+  }
+  return stripped
+}
+
+/* ------------------------------------------------------------------ *
  * path shape
  * ------------------------------------------------------------------ */
 
@@ -200,6 +315,16 @@ function splitApiPath(pathname) {
  * appears in the recorded Studio traffic, and each carries real semantics that
  * an approximation would get subtly wrong. So the unsupported shapes raise —
  * a 400 naming the path is recoverable, a silently mis-applied patch is not.
+ *
+ * A field segment spelling a §35.14 prototype key raises for exactly that
+ * reason. `__proto__`, `constructor` and `prototype` can never be own keys of
+ * canonical overlay JSON, and a plain assignment to the first runs the prototype
+ * SETTER — so the write vanishes while the caller is answered a `transactionId`
+ * (security review 2026-08-06 P2-5). Mode 2 has no upstream, so a discarded
+ * write is not a divergence from staging: it is content that exists nowhere.
+ * Core refuses it too, but a 409 from the mutation engine is a worse answer than
+ * a 400 that names the path. A `_key` PREDICATE spelling the same word is
+ * untouched — that is a value, not a property name.
  */
 export function parseSanityPath(input) {
   if (typeof input !== 'string' || input.length === 0) {
@@ -235,6 +360,12 @@ export function parseSanityPath(input) {
     const next = input.slice(index).search(/[.[]/)
     const segment = next === -1 ? input.slice(index) : input.slice(index, index + next)
     if (segment === '') fail('empty path segment')
+    if (isForbiddenKey(segment)) {
+      fail(
+        `prototype-polluting segment ${JSON.stringify(segment)} cannot be a document field ` +
+          '(PRD §35.14); the write is refused rather than stored as something else',
+      )
+    }
     path.push(segment)
     index = next === -1 ? input.length : index + next
   }
@@ -751,6 +882,9 @@ async function resolveTextQueries(tree, params, documents, evaluateNode) {
  * @param {string} [options.overlayId]
  * @param {() => string} [options.now] injected clock
  * @param {(level: string, message: string) => void} [options.log]
+ * @param {readonly string[]} [options.origins] extra browser origins allowed to
+ *   write and to read cross-origin. Loopback origins are always allowed — see
+ *   `isGrantedOrigin` — so this exists for the unusual case, not the normal one.
  */
 export async function createOriginHandler(options = {}) {
   const rootInput = options.root ?? process.cwd()
@@ -760,6 +894,7 @@ export async function createOriginHandler(options = {}) {
   const overlayId = options.overlayId ?? 'overlay-origin-local'
   const now = options.now ?? (() => new Date().toISOString())
   const log = options.log ?? (() => {})
+  const allowedOrigins = new Set(options.origins ?? [])
 
   const store = new FsOverlayStore({root, now})
 
@@ -1065,6 +1200,8 @@ export async function createOriginHandler(options = {}) {
   const REDUCERS = {publish, unpublish, discardDraft, delete: deleteDocument}
 
   async function handleMutate(request, url) {
+    /* Before the body is read, so a forged request costs the server nothing. */
+    assertWriteIsNotForged(request, allowedOrigins)
     const body = await readJson(request)
     const {mutations, unsupported} = translateMutations(body.mutations)
     if (unsupported.length > 0) {
@@ -1111,6 +1248,8 @@ export async function createOriginHandler(options = {}) {
   }
 
   async function handleActions(request) {
+    /* Before the body is read, so a forged request costs the server nothing. */
+    assertWriteIsNotForged(request, allowedOrigins)
     const body = await readJson(request)
     const {steps, unsupported} = translateActions(body.actions ?? body.action ?? [])
     if (unsupported.length > 0) {
@@ -1459,7 +1598,9 @@ export async function createOriginHandler(options = {}) {
    * ---------------------------------------------------------------- */
 
   async function handle(request, response, context) {
-    const cors = context?.cors ?? {}
+    /* Sanitised once, so the success path, the stream path and the error path
+     * cannot disagree about who was granted what. */
+    const cors = grantedCorsHeaders(request, context?.cors ?? {}, allowedOrigins)
     try {
       const answer = await route(request, {
         pathname: context?.pathname ?? request.url ?? '/',

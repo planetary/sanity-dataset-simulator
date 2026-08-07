@@ -38,7 +38,7 @@ PROXY_BLOCK_WRITES=1 node examples/kitchen-sink/spikeB-proxy/proxy.mjs
 |---|---|---|
 | `PROXY_PORT` | `3999` | Listen port. |
 | `PROXY_BIND` | all interfaces (v4+v6) | Bind address. Leave unset so both `127.0.0.1` and `::1` work — Chrome may resolve `*.localhost` to either. |
-| `SANITY_API_HOST` | `https://b1n03q3z.api.sanity.io` | Upstream origin. |
+| `SANITY_API_HOST` | `https://b1n03q3z.api.sanity.io` | Upstream origin. **Declared source only** — put it in `examples/kitchen-sink/.env`, not in your shell. Mode 1 forwards Studio's real session cookie and bearer token to whatever this names, so an exported value from another project would not misread content, it would post your credentials to a host you never typed. An ambient value that disagrees with the declared one is refused at startup. |
 | `PROXY_BLOCK_WRITES` | off | `1` enables the write guard (below). |
 | `PROXY_DERIVE_PROJECT_HOST` | on | Maps `<label>.localhost` → `<label>.api.sanity.io`. See "Project-hostname trap". |
 | `PROXY_FORWARD_ORIGIN` | off (stripped) | `1` forwards the browser `Origin`/`Referer` upstream. Default strips them so Sanity sees a server-side call and does not apply its own CORS-origin allowlist. |

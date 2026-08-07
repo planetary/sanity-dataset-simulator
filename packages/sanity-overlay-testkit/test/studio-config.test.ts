@@ -104,9 +104,38 @@ describe('defineOverlayConfig — the consumer’s one line', () => {
     const actions = (config.document as Rec).actions as (
       prev: {action?: string}[],
     ) => {action?: string}[]
-    expect(actions([{action: 'publish'}, {action: 'schedule'}]).map((a) => a.action)).toEqual([
+    const resolved = actions([{action: 'publish'}, {action: 'schedule'}]).map((a) => a.action)
+    expect(resolved).toContain('publish')
+    expect(resolved).not.toContain('schedule')
+  })
+
+  /*
+   * The assertion this file used to make here was `toEqual(['publish'])` — that
+   * the resolver's whole output was the surviving built-in. It was true, and it
+   * was the bug: the overlay's own §21.7 actions defaulted to nothing, so a
+   * workspace built through this module had no rebase, no resolve-conflict and
+   * no checkpoint, and this test pinned that as correct. See
+   * `test/studio-document-action-delivery.test.ts` for the seam it hid.
+   */
+  it('the root action resolver also APPENDS the overlay’s own three', () => {
+    const config = defineOverlayConfig(BASE, {env: ENV}) as Rec
+    const actions = (config.document as Rec).actions as (
+      prev: {action?: string}[],
+    ) => {action?: string}[]
+    expect(actions([{action: 'publish'}]).map((a) => a.action)).toEqual([
       'publish',
+      'overlayRebase',
+      'overlayResolveConflict',
+      'overlayCheckpoint',
     ])
+  })
+
+  it('takes `documentActions: []` as a deliberate opt-out, not as an omission', () => {
+    const config = defineOverlayConfig(BASE, {env: ENV, documentActions: []}) as Rec
+    const actions = (config.document as Rec).actions as (
+      prev: {action?: string}[],
+    ) => {action?: string}[]
+    expect(actions([{action: 'publish'}]).map((a) => a.action)).toEqual(['publish'])
   })
 
   it('composes with a consumer’s own tools resolver instead of replacing it', () => {
@@ -132,8 +161,14 @@ describe('defineOverlayConfig — the consumer’s one line', () => {
       prev: {action?: string}[],
     ) => {action?: string}[]
     /* The consumer added `schedule` back; the overlay resolver still runs after
-     * them and takes it out. Ordering, not luck. */
-    expect(actions([{action: 'publish'}]).map((a) => a.action)).toEqual(['publish'])
+     * them and takes it out. Ordering, not luck. And it still appends its own
+     * three after theirs — composing must not cost the overlay its actions. */
+    expect(actions([{action: 'publish'}]).map((a) => a.action)).toEqual([
+      'publish',
+      'overlayRebase',
+      'overlayResolveConflict',
+      'overlayCheckpoint',
+    ])
   })
 })
 

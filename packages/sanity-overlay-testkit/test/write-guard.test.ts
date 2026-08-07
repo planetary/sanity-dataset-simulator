@@ -23,7 +23,7 @@ import {
   spikeFAttackVectors,
   spikeFWitnesses,
 } from '../src/writeGuardContract'
-import type {WriteGuardRequest} from '../src/writeGuardContract'
+import type {WriteGuardCase, WriteGuardRequest} from '../src/writeGuardContract'
 
 runWriteGuardContract('spikeB-proxy writeGuard.isWriteRequest', isWriteRequest)
 
@@ -144,6 +144,190 @@ describe('write-guard · dot segments can never launder a write into a read', ()
     // "anything ending in /ping is a write".
     expect(isWriteRequest({method: 'GET', url: '/v2025-02-19/ping'})).toBe(false)
     expect(isWriteRequest({method: 'POST', url: '/v2025-02-19/data/query/parity'})).toBe(false)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * P1-1 — delimiter truncation, and why the generated cases are real
+ * ------------------------------------------------------------------ *
+ * The security review of 2026-08-06 found that `analysePath` re-cut the path at
+ * `?`/`#` after every decode pass, so a percent-encoded `?` deleted the `..`
+ * segments that `readReason` step 0 exists to refuse, and a write classified as
+ * a read.
+ *
+ * A generated case set is only worth anything if the vectors it generates are
+ * genuinely dangerous, so this block does not take the contract's word for it.
+ * `removeDotSegments` below is RFC 3986 §5.2.4 written out from the RFC — an
+ * oracle that shares no code with the guard — and it is used to prove that the
+ * RAW request line of every generated vector resolves to a write endpoint.
+ * Without that, "these 250 URLs are writes" would be an assertion about a
+ * string-building helper rather than about routing.
+ */
+
+/**
+ * RFC 3986 §5.2.4 `remove_dot_segments`, transcribed from the RFC.
+ *
+ * `#` is treated as an ordinary path character on purpose: `proxy.mjs` relays
+ * `pathname + search`, `splitPath` only cuts at `?`, and Node's HTTP parser
+ * hands a literal `#` through in an origin-form request target unchanged
+ * (verified). So this is what the bytes on the wire mean to a router that does
+ * not special-case it — which is exactly the second meaning default-deny exists
+ * to refuse.
+ */
+function removeDotSegments(path: string): string {
+  let input = path
+  let output = ''
+  while (input.length > 0) {
+    if (input.startsWith('../')) input = input.slice(3)
+    else if (input.startsWith('./')) input = input.slice(2)
+    else if (input.startsWith('/./')) input = `/${input.slice(3)}`
+    else if (input === '/.') input = '/'
+    else if (input.startsWith('/../')) {
+      input = `/${input.slice(4)}`
+      output = output.slice(0, Math.max(0, output.lastIndexOf('/')))
+    } else if (input === '/..') {
+      input = '/'
+      output = output.slice(0, Math.max(0, output.lastIndexOf('/')))
+    } else if (input === '.' || input === '..') input = ''
+    else {
+      const next = input.indexOf('/', input.startsWith('/') ? 1 : 0)
+      const segment = next === -1 ? input : input.slice(0, next)
+      output += segment
+      input = next === -1 ? '' : input.slice(next)
+    }
+  }
+  return output
+}
+
+/**
+ * Endpoints that write to Content Lake, spelled independently of the guard:
+ * the global data plane, an Agent Action, and `resourceDataBase()`'s
+ * resource-scoped data plane, which mutates without a `/data/` prefix at all.
+ */
+const WRITE_ENDPOINT_PATTERNS = [
+  /^\/data\/(?:mutate|actions)\//,
+  /^\/agent\/action\/(?:patch|generate|transform|translate|prompt)\//,
+  /^\/projects\/[^/]+\/datasets\/[^/]+\/(?:mutate|actions)$/,
+]
+
+const resolvesToWriteEndpoint = (path: string) =>
+  WRITE_ENDPOINT_PATTERNS.some((pattern) => pattern.test(path))
+
+describe('write-guard · encoded/raw delimiter truncation (P1-1)', () => {
+  const truncationCases: WriteGuardCase[] = WRITE_GUARD_CASES.filter(
+    (c) => c.group === 'encoded-delimiter' && c.write,
+  )
+
+  it('has a generated corpus to work with', () => {
+    expect(truncationCases.length).toBeGreaterThanOrEqual(200)
+  })
+
+  it.each(truncationCases)(
+    'the RAW request line of $method $url resolves to a write endpoint',
+    ({url}) => {
+      // Independent oracle: no decoding at all, because `query%3F` is simply a
+      // segment to be popped. This is the meaning a CDN or origin router that
+      // applies RFC 3986 to the bytes it received will arrive at.
+      const resolved = removeDotSegments(url)
+      expect(
+        resolvesToWriteEndpoint(resolved),
+        `${url} resolves to ${resolved}, which is not a write endpoint — the vector is not dangerous`,
+      ).toBe(true)
+    },
+  )
+
+  it.each(truncationCases)('$method $url is classified as a write', ({method, url}) => {
+    expect(isWriteRequest({method, url})).toBe(true)
+  })
+
+  it('refuses because the path is ambiguous, not merely unrecognised', () => {
+    // The RIGHT REASON check. A guard that happened to block these by failing
+    // the allowlist lookup would be blocking them for the wrong reason and
+    // would fall over on the next spelling.
+    for (const {method, url} of truncationCases) {
+      const verdict = classifyRequest({method, url}) as {write: boolean; reason: string}
+      expect(verdict.write, `${method} ${url}`).toBe(true)
+      // The two ambiguity rulings, and nothing else: a `..` the two ends would
+      // resolve differently, or a `#` only one end will cut at. "Not on the
+      // allowlist" here would mean the guard got the right answer by accident.
+      expect(verdict.reason, `${method} ${url}`).toMatch(/"\." or "\.\."|literal "#"/)
+    }
+  })
+})
+
+/**
+ * The RED baseline for P1-1, kept forever — the same device the pre-Spike-F
+ * guard gets above.
+ *
+ * `truncatingNormaliser` is the shipped normaliser with the defect reinstated:
+ * cut, decode, re-cut. Pinning it here means the contract can never be edited
+ * back into a shape the broken normaliser would pass, which is precisely how
+ * the 236-case suite came to have only the safe direction of this rule.
+ */
+function truncatingNormaliser(rawUrl: string): string {
+  const cut = (value: string, marker: string) => {
+    const index = value.indexOf(marker)
+    return index === -1 ? value : value.slice(0, index)
+  }
+  const safeDecode = (value: string) => {
+    try {
+      return decodeURIComponent(value)
+    } catch {
+      return value
+    }
+  }
+  let path = cut(cut(rawUrl, '#'), '?')
+  for (let pass = 0; pass < 5; pass++) {
+    const decoded = safeDecode(path)
+    if (decoded === path) break
+    path = cut(cut(decoded, '#'), '?') // <- the defect
+  }
+  if (!path.startsWith('/')) path = `/${path}`
+  return path.replace(/\/{2,}/g, '/').toLowerCase().replace(/^\/v[^/]*(?=\/|$)/, '') || '/'
+}
+
+describe('write-guard · the P1-1 RED baseline, kept', () => {
+  const truncationCases = WRITE_GUARD_CASES.filter(
+    (c) => c.group === 'encoded-delimiter' && c.write,
+  )
+
+  it('the truncating normaliser collapses every vector onto a path with no dot segments', () => {
+    // This is the bug, stated as a property: after the buggy normaliser runs,
+    // there is nothing left for `readReason` step 0 to refuse.
+    const survived = truncationCases.filter((c) => truncatingNormaliser(c.url).includes('..'))
+    expect(survived.map((c) => c.url)).toEqual([])
+  })
+
+  it('the shipped normaliser lands on the SAME path RFC 3986 does', () => {
+    /* For every vector whose delimiter is percent-encoded, the guard is allowed
+     * to see the whole request line, so its canonical path must equal what
+     * `remove_dot_segments` makes of the raw bytes. Equality against an
+     * independent implementation is the strongest available statement that the
+     * truncation is gone: a normaliser that still cut early would land on the
+     * read prefix instead, and a normaliser that over-corrected would land
+     * somewhere neither of us expects. */
+    const encoded = truncationCases.filter((c) => !c.url.includes('#'))
+    expect(encoded.length).toBeGreaterThanOrEqual(150)
+    const disagreements = encoded
+      .filter((c) => normalizePath(c.url) !== removeDotSegments(c.url))
+      .map((c) => `${c.url}: guard=${normalizePath(c.url)} rfc=${removeDotSegments(c.url)}`)
+    expect(disagreements).toEqual([])
+  })
+
+  it('a RAW "#" is cut, and the cut itself is what makes the request ambiguous', () => {
+    /* The raw `#` is the one spelling the guard must keep cutting: `readAllowlist.mjs`
+     * and every URL parser cut there too, so refusing to cut would put the two
+     * classifiers into disagreement. What the guard must NOT do is treat the
+     * truncated remainder as an ordinary read, because `proxy.mjs` forwards
+     * `pathname + search` and `splitPath` never cuts at `#` — so the discarded
+     * text really does reach the upstream. */
+    const rawFragment = truncationCases.filter((c) => c.url.includes('#'))
+    expect(rawFragment.length).toBeGreaterThanOrEqual(40)
+    for (const c of rawFragment) {
+      const canonical = normalizePath(c.url) as string
+      expect(canonical.includes('#'), `${c.url} -> ${canonical}`).toBe(false)
+      expect(isWriteRequest({method: c.method, url: c.url}), c.url).toBe(true)
+    }
   })
 })
 

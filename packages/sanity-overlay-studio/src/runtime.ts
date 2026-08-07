@@ -65,6 +65,17 @@ export interface OverlayRuntime {
    * fetched separately. Addresses, not bodies: the question is membership.
    */
   branch(): OverlayBranchView
+  /**
+   * The branch inventory, as the overlay API last described it.
+   *
+   * {@link OverlayRuntime.branch} answers "which addresses does the branch own?"
+   * — membership, for diagnosis. This answers "what does it hold?", which is
+   * what `planRebase` and `planCheckpoint` read: they need each document's
+   * `schemaType`, `runtimeRevision` and conflict flag to say what a rebase would
+   * discard. Fed by the same `/state` and commit-hydration answers as `branch()`
+   * so the two cannot disagree.
+   */
+  documents(): readonly OverlayHydrationDocument[]
   subscribe(listener: () => void): () => void
   /** Poll the overlay API once, updating connection, revision and conflicts. */
   refresh(): Promise<void>
@@ -259,6 +270,12 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
     conflicts: () => conflictReport,
     messages: () => messages.slice(),
     reads: () => readRecords.slice(),
+    /* Sorted by logical id, so a document action's confirmation message lists
+     * the same documents in the same order on every render. */
+    documents: () =>
+      [...hydration.values()].sort((left, right) =>
+        left.logicalId < right.logicalId ? -1 : left.logicalId > right.logicalId ? 1 : 0,
+      ),
     branch: () => {
       const view = overlaySource()
       return {

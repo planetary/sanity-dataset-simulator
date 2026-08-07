@@ -24,7 +24,6 @@
  * see `plugin.ts`.
  */
 
-import {createElement, useEffect, useState} from 'react'
 import {createClient} from '@sanity/client'
 
 import {
@@ -32,14 +31,30 @@ import {
   overlayWorkspacePatch as overlayWorkspacePatchInternal,
   type DefineOverlayConfigOptions,
 } from './config'
-import {createOverlayStatusLayout} from './ui/statusLayout'
 
-/** The banner, bound to the host Studio's React. */
-export const OverlayStatusLayout = createOverlayStatusLayout({createElement, useEffect, useState})
+/*
+ * The banner, the conflict panel and the three §21.7 actions, bound to the
+ * host's React. RE-EXPORTED, not rebuilt: `config.ts` defaults to these same
+ * objects, and a second binding here would give the two paths two sets of
+ * components with different identities — which Studio compares by reference.
+ */
+export {
+  HOST_REACT,
+  OverlayConflictPanel,
+  OverlayDocumentActions,
+  OverlayStatusLayout,
+} from './bindings'
 
+/**
+ * The one thing this entry point still supplies that `config.ts` cannot:
+ * `@sanity/client`.
+ *
+ * The banner and the actions moved down into `bindings.ts` because omitting them
+ * was silent. Omitting `createClient` is not — `config.ts` installs a factory
+ * that throws with the reason — so it stays here, where the peer dependency is.
+ */
 function withDefaults(options: DefineOverlayConfigOptions): DefineOverlayConfigOptions {
   return {
-    layout: OverlayStatusLayout,
     createClient: (clientOptions) => createClient(clientOptions as never) as unknown as object,
     ...options,
   }
@@ -233,4 +248,40 @@ export type {StudioReadDerivation, StudioReadPlan} from './client/readPlan'
 export {createBranchCandidateSource, overlaySourceFromBranch} from './client/readSource'
 export {classifyWriteEndpoint, normalizeRequestPath} from './client/writeGuard'
 export {createOverlayStatusLayout, overlayBannerViewModel} from './ui/statusLayout'
+export type {OverlayBannerViewModel, OverlayLayoutProps, ReactLike} from './ui/statusLayout'
+
+/* ── The §28.3 panel, rendered. `conflictPanelView` is the pure half: a host
+ * that wants its own surface builds it on the same decisions rather than
+ * re-deriving which button is enabled and why. */
+export {
+  EMPTY_CONFLICT_PANEL_UI,
+  confirmKey,
+  conflictPanelView,
+  createOverlayConflictPanel,
+  parseManualEditSource,
+} from './ui/conflictPanel'
+export type {
+  ConflictPanelActionView,
+  ConflictPanelRowView,
+  ConflictPanelUiState,
+  ConflictPanelView,
+  ConflictPanelViewInput,
+  ManualEditParse,
+  OverlayConflictPanelProps,
+} from './ui/conflictPanel'
+
+/* ── The §21.7 actions as components, plus the React-free controller wiring. */
+export {
+  OVERLAY_ACTION_NAMES,
+  createOverlayActionControllers,
+  createOverlayDocumentActions,
+} from './ui/documentActions'
+export type {
+  CreateOverlayDocumentActionsOptions,
+  OverlayActionControllersOptions,
+  OverlayControllerSet,
+  OverlayDocumentActionComponent,
+  OverlayDocumentActionProps,
+} from './ui/documentActions'
+
 export type {DefineOverlayConfigOptions} from './config'

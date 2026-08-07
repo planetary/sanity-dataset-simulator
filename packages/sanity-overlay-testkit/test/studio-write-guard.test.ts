@@ -182,7 +182,12 @@ describe('namespaceMethodKind — anything not declared a read is a write', () =
     ['releases', 'get', 'read'],
     ['projects', 'list', 'read'],
     ['users', 'getById', 'read'],
-    ['live', 'events', 'read'],
+    /* Not `read` — the one method whose DELEGATION is the defect rather than
+     * its effect. Sanity Live streams a Content-Lake-evaluated result over the
+     * top of the overlay-resolved render (PRD §23.3, §37 Phase 5), and it
+     * mutates nothing, so neither existing answer fitted. See
+     * `studio-live-bypass.test.ts` for the class. */
+    ['live', 'events', 'push'],
     ['mediaLibrary.video', 'getPlaybackInfo', 'read'],
   ])('classifies %s.%s as a %s', (namespace, method, kind) => {
     expect(namespaceMethodKind(namespace, method)).toBe(kind)

@@ -68,8 +68,8 @@ Flags (each also readable from the environment):
 | `--root=<dir>` | `OVERLAY_ROOT` | `examples/kitchen-sink` — the dir that *contains* `.sanity-overlay/` |
 | `--port=<n>` | `PROXY_PORT` | `3999` |
 | `--bind=<addr>` | `PROXY_BIND` | `127.0.0.1` — non-loopback is refused |
-| `--project=<id>` | `SANITY_STUDIO_PROJECT_ID` | `b1n03q3z` |
-| `--dataset=<name>` | `SANITY_STUDIO_DATASET` | `parity` |
+| `--project=<id>` | `SANITY_STUDIO_PROJECT_ID` in `examples/kitchen-sink/.env` — **not** the shell | `b1n03q3z` |
+| `--dataset=<name>` | `SANITY_STUDIO_DATASET` in `examples/kitchen-sink/.env` — **not** the shell | `parity` |
 | `--overlay=<id>` | `OVERLAY_ID` | `overlay-origin-local` |
 | `--log=<path>` | `PROXY_LOG` | `./proxy-log.jsonl` |
 

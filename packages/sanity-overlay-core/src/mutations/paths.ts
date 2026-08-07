@@ -15,6 +15,7 @@
  */
 import {OverlayPathError} from '../errors'
 import {encodeOverlayPath} from '../encoding'
+import {isForbiddenKey} from '../serialize'
 import {isKeySegment, type OverlayPath, type OverlayPathSegment} from '../types/path'
 
 /* ------------------------------------------------------------------ *
@@ -25,12 +26,35 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** Structural deep clone of JSON-shaped data. Keeps the engine free of shared state. */
+/**
+ * Structural deep clone of JSON-shaped data. Keeps the engine free of shared state.
+ *
+ * A §35.14 forbidden own key is COPIED, not assigned. `out['__proto__'] = …` runs
+ * `Object.prototype`'s `__proto__` **setter**, which swaps the clone's prototype
+ * instead of creating an own property: the value is destroyed, and — worse —
+ * `serialize()`'s `assertNoForbiddenKeys` then finds nothing to refuse, so the
+ * write is silently approximated rather than rejected (PRD §5.5; security review
+ * 2026-08-06 P2-5). `defineProperty` writes the own key, so a forbidden key
+ * survives the clone and reaches the one place that already knows to refuse it.
+ * Cloning is not the place to make that decision.
+ */
 export function deepClone<T>(value: T): T {
   if (Array.isArray(value)) return value.map((item) => deepClone(item)) as unknown as T
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {}
-    for (const key of Object.keys(value)) out[key] = deepClone(value[key])
+    for (const key of Object.keys(value)) {
+      const cloned = deepClone(value[key])
+      if (isForbiddenKey(key)) {
+        Object.defineProperty(out, key, {
+          value: cloned,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        })
+        continue
+      }
+      out[key] = cloned
+    }
     return out as unknown as T
   }
   return value

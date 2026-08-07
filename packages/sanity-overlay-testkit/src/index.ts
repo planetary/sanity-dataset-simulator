@@ -56,6 +56,27 @@ export type {
 } from './writeGuardContract'
 
 /**
+ * The shared failure-injection and work-accounting harness (PRD §33, §35.15,
+ * §5.4). One instrument on the store's `beforeRename` hook: it injects a failure
+ * at the instant the bytes are staged and not yet visible, and it counts the
+ * writes and bytes that a §5.4 budget is gated on.
+ */
+export {
+  createFailureLedger,
+  endsWith,
+  errnoError,
+  settle,
+  underDir,
+  until,
+} from './failureInjection'
+export type {
+  AtomicWriteRecord,
+  FailureLedger,
+  HeldWrite,
+  PathMatch,
+} from './failureInjection'
+
+/**
  * The suite-wide outbound-request monitor, installed by `vitest.setup.ts` into
  * every test file: no non-GET request may reach a Sanity host from anywhere in
  * the suite (owner ruling, 2026-08-05).

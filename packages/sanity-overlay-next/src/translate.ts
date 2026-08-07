@@ -24,6 +24,7 @@
  * reached the server and vanished without a word is the one failure mode the
  * local API must never have.
  */
+import {isForbiddenKey} from '../../sanity-overlay-core/src/index'
 import type {
   OverlayMutation,
   OverlayOperation,
@@ -151,6 +152,15 @@ function str(value: unknown): string | undefined {
  * that selects a SET of positions — `[]`, a slice, a filter — throws, because
  * collapsing it to a single path would write to the wrong element and look like
  * it worked. The caller records the throw in `unsupported`.
+ *
+ * A field segment spelling a §35.14 prototype key throws for the same reason.
+ * `__proto__`, `constructor` and `prototype` can never be own keys of canonical
+ * overlay JSON, so such a path names a member the format cannot hold — and the
+ * one thing it must not do is look like it worked. Before this check it did
+ * exactly that: `set` at `__proto__.polluted` was answered `committed: true`
+ * and stored nothing, because a plain assignment to that key runs the prototype
+ * SETTER (security review 2026-08-06 P2-5). A `_key` PREDICATE spelling the same
+ * word is untouched — that is a value, not a property name.
  */
 export function parseSanityPath(path: string): OverlayPath {
   if (typeof path !== 'string' || path.length === 0) {
@@ -188,6 +198,13 @@ export function parseSanityPath(path: string): OverlayPath {
     while (end < path.length && path[end] !== '.' && path[end] !== '[') end += 1
     const field = path.slice(cursor, end)
     if (field.length === 0) throw new Error(`empty segment in path ${JSON.stringify(path)}`)
+    if (isForbiddenKey(field)) {
+      throw new Error(
+        `segment ${JSON.stringify(field)} in path ${JSON.stringify(path)} is a ` +
+          'prototype-polluting key and cannot be a document field (PRD §35.14); the write is ' +
+          'refused rather than stored as something else',
+      )
+    }
     segments.push(field)
     cursor = end
   }

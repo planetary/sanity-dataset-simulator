@@ -33,7 +33,9 @@ import {
   deleteDocument,
   discardDraft,
   duplicate,
+  getRecord,
   isSyntheticRev,
+  overlayConflictSummary,
   overlayDocumentIds,
   publish,
   resolveDocumentBatch,
@@ -44,6 +46,7 @@ import {
 } from '../../sanity-overlay-core/src/index'
 import type {
   OverlayActor,
+  OverlayConflict,
   OverlayDocumentRecord,
   OverlayState,
   SanityDocument,
@@ -91,6 +94,26 @@ export interface OverlayHydrationDocument {
   publishedTombstone: boolean
   draft: Rec | null
   published: Rec | null
+  /**
+   * The unresolved-and-resolved conflict records this document currently carries
+   * (PRD §13.3, §17.11, §28.1-§28.3).
+   *
+   * ALWAYS PRESENT, and `[]` means clean. The ABSENCE of this key is a different
+   * fact — "this API cannot tell you" — and §28.1 forbids collapsing the two: a
+   * consumer that reads a missing field as zero is hiding conflicts, and one
+   * that reads an empty array as unknown disables its own resolution UI forever.
+   * That second failure is not hypothetical; it is what happened while `/state`
+   * omitted the key and only `/resolve` computed it.
+   */
+  conflicts: OverlayConflict[]
+  /** §17.2 precedence: `branch` means the document exists nowhere upstream. */
+  origin: 'base' | 'branch'
+  /** §16.4. `null` when the document has no base block at all. */
+  baseStatus: 'present' | 'deleted' | 'unknown' | null
+  /** §13.4 — the revision the merge ancestor was captured at, when there is one. */
+  baseRevisionAtFirstTouch?: string
+  /** §13.4 — the most recent base revision this overlay observed. */
+  currentBaseRevision?: string
 }
 
 export interface OverlayApiOptions {
@@ -238,12 +261,30 @@ async function hydrateState(
  * materialized draft and published bodies exactly as Studio addresses them
  * (§13.9). A tombstoned perspective is `null`, which is how a client learns to
  * hide a locally deleted document.
+ *
+ * The §28.2 review columns ride along, because they are facts the record already
+ * holds and a reviewer needs them on the same screen as the conflict itself. An
+ * absent base revision is OMITTED rather than filled with a placeholder (§5.5):
+ * a branch-created document has no merge ancestor, and inventing a plausible one
+ * in a reviewer-facing column is exactly the filler that section rules out.
+ *
+ * NOTHING IS RECOMPUTED HERE. §17.11 makes the commit the detection point, so
+ * `record.conflicts` is already the answer — written by `persistConflicts` at
+ * commit and read back from disk by `hydrateState` at boot. Re-detecting would
+ * anyway be impossible: core never fetches base (§16.1) and this endpoint is
+ * handed no `baseDocuments`, so the persisted set is the only honest answer
+ * there is. That is what makes the Studio's 5-second `/state` poll free — an
+ * array read and an O(documents) count, no merge, no I/O.
  */
 function hydrationDocuments(state: OverlayState): OverlayHydrationDocument[] {
   return Object.keys(state.documents)
     .sort()
     .map((logicalId) => {
       const record = state.documents[logicalId]!
+      const base = record.base
+      const capturedRevision = base?.published?.revision ?? base?.draft?.revision
+      const observedRevision =
+        base?.lastObservedPublishedRevision ?? base?.lastObservedDraftRevision
       return {
         logicalId,
         schemaType: record.schemaType,
@@ -257,6 +298,11 @@ function hydrationDocuments(state: OverlayState): OverlayHydrationDocument[] {
         published: record.local.publishedTombstone
           ? null
           : ((record.local.published?.materialized ?? null) as Rec | null),
+        conflicts: record.conflicts,
+        origin: record.origin,
+        baseStatus: base?.baseStatus ?? null,
+        ...(capturedRevision === undefined ? {} : {baseRevisionAtFirstTouch: capturedRevision}),
+        ...(observedRevision === undefined ? {} : {currentBaseRevision: observedRevision}),
       }
     })
 }
@@ -659,7 +705,12 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     let index = 0
     for (const step of translated.steps) {
       if (step.type === 'restore') {
-        const record = state.documents[toPublishedId(step.id)]
+        /* core's `getRecord`, not a bare `state.documents[…]`. `step.id` comes
+         * off the wire, and a plain-object map answers `"__proto__"` /
+         * `"constructor"` / `"toString"` from the prototype chain — so the
+         * lookup returned `Object.prototype` and the `record.local` read below
+         * threw an uncoded 500 (review P3-10). */
+        const record = getRecord(state, step.id) ?? undefined
         const tombstoned =
           record !== undefined &&
           ((step.target !== 'published' && record.local.draftTombstone) ||
@@ -904,7 +955,82 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
       headers['access-control-allow-headers'] = 'content-type'
       headers['access-control-max-age'] = '600'
     }
+    /* `access-control-allow-credentials` is deliberately NEVER emitted. This API
+     * carries no ambient credential, and reflecting an origin alongside that
+     * header is the standard way a local dev server becomes an exfiltration
+     * endpoint for everything it serves — which here is the whole branch. Not
+     * emitting it means a future widening of `origins` cannot resurrect that. */
     return headers
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Cross-site request forgery — PRD §5.5 security review P2-4
+   * ---------------------------------------------------------------- *
+   *
+   * The overlay API has no authentication, by design: it is a local development
+   * surface. That is only safe while a request has to COME FROM somewhere
+   * trusted, and nothing enforced that. `POST` + `Content-Type: text/plain` is
+   * CORS-SAFELISTED, so it fires no preflight — any page the developer happens
+   * to have open could drive `/commit` and mutate the branch. A loopback bind is
+   * no defence: a page in the developer's own browser is on loopback.
+   *
+   * Three clauses, each doing a job the others cannot:
+   *
+   *   1. JSON CONTENT TYPE. This alone removes the request from the safelisted
+   *      set, so a cross-origin browser must preflight — and the preflight is
+   *      answered by the allowlist above, which grants nothing by default. It is
+   *      the clause that closes the class rather than an instance, and it is
+   *      applied regardless of who is asking, or the safelisted shape stays
+   *      reachable from an allowlisted origin.
+   *   2. `Sec-Fetch-Site`. Browsers set it and page JS cannot forge it (it is a
+   *      forbidden header name). It is what still holds when `Origin` is absent.
+   *   3. THE ORIGIN ALLOWLIST, with same-origin recognised structurally rather
+   *      than listed. An App Router mounting is same-origin by construction and
+   *      names no origins; requiring it to list its own deployment URL would be
+   *      a footgun that fails closed in production only.
+   *
+   * An ABSENT `Origin` is allowed. curl, the CLI and a server-side client carry
+   * no ambient browser credential and are not the actor this control exists for;
+   * refusing them buys nothing and breaks every non-browser caller.
+   */
+  const JSON_CONTENT_TYPE = 'application/json'
+
+  function assertWriteIsNotForged(request: Request): void {
+    const contentType = (request.headers.get('content-type') ?? '')
+      .split(';')[0]!
+      .trim()
+      .toLowerCase()
+    if (contentType !== JSON_CONTENT_TYPE) {
+      throw new OverlayApiError(
+        415,
+        'UNSUPPORTED_MEDIA_TYPE',
+        `a state-changing request must declare \`content-type: ${JSON_CONTENT_TYPE}\`, which ` +
+          'is what forces a CORS preflight and closes the forged simple-request path',
+      )
+    }
+
+    const forbidden = (): OverlayApiError =>
+      new OverlayApiError(
+        403,
+        'FORBIDDEN_ORIGIN',
+        'this request did not come from an origin the overlay API grants; a state-changing ' +
+          'request must be same-origin or from a configured `origins` entry',
+      )
+
+    if (request.headers.get('sec-fetch-site') === 'cross-site') throw forbidden()
+
+    const origin = request.headers.get('origin')
+    if (origin === null) return
+    if (allowedOrigins.has(origin) || allowedOrigins.has('*')) return
+    /* A proxy that rewrites `Origin` cannot rewrite `Sec-Fetch-Site`, so an
+     * explicit same-origin claim from the browser is honoured on its own. */
+    if (request.headers.get('sec-fetch-site') === 'same-origin') return
+    try {
+      if (new URL(request.url).origin === origin) return
+    } catch {
+      /* An unparseable request URL cannot establish same-origin. */
+    }
+    throw forbidden()
   }
 
   function json(request: Request, status: number, payload: unknown): Response {
@@ -1015,6 +1141,15 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
         ok: true,
         overlayId,
         revision: state.revision,
+        /*
+         * TOP-LEVEL, and not merely a convenience over the per-document arrays.
+         * An overlay with ZERO documents has no per-document field to read, so a
+         * documents-only contract makes "empty branch" and "this server cannot
+         * tell you" indistinguishable — the same defect one level down. Its
+         * presence is the unambiguous statement that this API computes
+         * conflicts; §13.1 already defines the shape.
+         */
+        conflictSummary: overlayConflictSummary(state),
         documents: hydrationDocuments(state),
       })
     }
@@ -1026,6 +1161,9 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     if (request.method === 'POST' && route === 'commit') {
       let body: unknown
       try {
+        /* BEFORE the body is read, so a forged request is refused without the
+         * server doing any work on its behalf. */
+        assertWriteIsNotForged(request)
         body = await readJsonBody(request, 'commit')
       } catch (error) {
         return failure(request, error, 'commit')

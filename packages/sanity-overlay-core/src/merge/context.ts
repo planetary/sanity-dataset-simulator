@@ -47,7 +47,11 @@ export function valueEquals(a: unknown, b: unknown): boolean {
 export function childValue(node: unknown, segment: OverlayPathSegment): unknown {
   if (node === undefined || node === null) return undefined
   if (typeof segment === 'string') {
-    return isPlainObject(node) ? node[segment] : undefined
+    /* `hasOwnProperty`, not a bare `[[Get]]`: a segment spelling `__proto__` or
+     * `constructor` would otherwise read off the prototype chain and the merge
+     * would compare a function against branch content. Absent is absent. */
+    if (!isPlainObject(node)) return undefined
+    return Object.prototype.hasOwnProperty.call(node, segment) ? node[segment] : undefined
   }
   if (typeof segment === 'number') {
     return Array.isArray(node) ? node[segment] : undefined

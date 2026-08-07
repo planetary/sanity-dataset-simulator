@@ -96,6 +96,22 @@ function declaredImports(): Map<string, string[]> {
     for (const pattern of patterns) {
       for (const match of text.matchAll(pattern)) {
         const specifier = match[1]
+        /*
+         * Path specifiers are skipped HERE because this function's job is to
+         * map bare specifiers onto manifest entries, and a path is not one.
+         *
+         * That skip used to mean the class went unchecked entirely, and it is
+         * why the describe block below — "the package can actually be installed
+         * and resolved" — was green while this package could not be installed
+         * at all: 30 of its imports reach out through `../../../` into sibling
+         * package directories that exist only in this checkout.
+         *
+         * It is checked now, in `test/repo-manifests.test.ts` ("no package
+         * imports its way out of its own directory"), which owns it for the
+         * whole workspace rather than for this package alone and reads sources
+         * with a position-aware lexer rather than the anchored regexes here.
+         * The 85 that remain are pinned there as a blocked-work ledger.
+         */
         if (specifier.startsWith('.') || specifier.startsWith('/')) continue
         if (specifier.startsWith('node:')) continue
         const parts = specifier.split('/')

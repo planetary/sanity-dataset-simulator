@@ -327,6 +327,74 @@ describe('divergence detection — corrupt input fails clearly (PRD §29.7 step 
     expect(outcome.repairable).toBe(false)
   })
 
+  /**
+   * The same rule, applied to the ONE part of a snapshot that is not base
+   * document content: its §13.4 capture metadata.
+   *
+   * This is deliberately the pair of the test above, because the two together
+   * close a design that looks available and is not. §14.3 is explicit that a
+   * stale stored checksum over a file that still *validates* is repairable
+   * metadata, not corruption — so it is a reasonable expectation that a snapshot
+   * differing only in `capturedAt`/`firstTouchedAt` is likewise "the same
+   * snapshot with stale metadata", and that the content address could therefore
+   * be narrowed to the base document alone with the timestamps riding along
+   * beside it in the file.
+   *
+   * It cannot. The address is the checksum of the file's ENTIRE canonical
+   * content, capture metadata included, and `verifyCheckpoint` classifies any
+   * divergence from it as corrupt and NOT repairable. There is no seam inside a
+   * snapshot file for "addressed" versus "unaddressed" bytes: narrowing the
+   * address while leaving the timestamps in the file would make every snapshot
+   * in every checkpoint report as corrupt here, and narrowing it by removing
+   * them from the file would delete the only committed copy of them — record
+   * revisions live under `.runtime/` (§14.1), which is not committed.
+   *
+   * So this is the constraint that decides `baseSnapshotFrom`, and it is pinned
+   * rather than assumed.
+   */
+  it('refuses a snapshot whose capture metadata alone was edited', async () => {
+    const outcome = await corrupt((files, state) => {
+      const address = Object.keys(state.snapshots)[0]!
+      const path = `snapshots/${address}.json`
+
+      /* The base DOCUMENT is untouched — only `firstTouchedAt` moves, the field
+       * that records when the BRANCH first touched this document and says
+       * nothing at all about what the base contains. An independent oracle
+       * confirms that separation before the checkpoint is verified. */
+      handEdit(
+        files,
+        path,
+        `"firstTouchedAt": "${FIXED_NOW}"`,
+        '"firstTouchedAt": "2026-06-01T12:34:56.000Z"',
+      )
+      const before = state.snapshots[address]! as {
+        published?: {snapshot?: unknown; capturedAt?: unknown}
+      }
+      const after = parse(files.get(path)!) as {
+        firstTouchedAt?: unknown
+        published?: {snapshot?: unknown; capturedAt?: unknown}
+      }
+      expect(after.published?.snapshot).toEqual(before.published?.snapshot)
+      expect(after.published?.capturedAt).toBe(before.published?.capturedAt)
+      expect(after.firstTouchedAt).toBe('2026-06-01T12:34:56.000Z')
+
+      /* Keep the byte-checksum manifest in step, so the content address is the
+       * only rule the edit can still be breaking. */
+      const record = parse(files.get(CHECKPOINT_CHECKSUMS_FILE)!) as OverlayCheckpointChecksums
+      const next: OverlayCheckpointChecksums = {
+        ...record,
+        files: {...record.files, [path]: sha256Hex(files.get(path)!)},
+        checksum: '',
+      }
+      const {checksum: _drop, ...rest} = next
+      files.set(CHECKPOINT_CHECKSUMS_FILE, serialize({...next, checksum: checksum(rest)}))
+    })
+
+    /* Corrupt, not repairable: capture metadata is inside the address. */
+    expect(outcome.code).toBe('CHECKSUM_MISMATCH')
+    expect(outcome.repairable).toBe(false)
+  })
+
   it('refuses a checkpoint with no checksum manifest', async () => {
     const outcome = await corrupt((files) => {
       files.delete(CHECKPOINT_CHECKSUMS_FILE)

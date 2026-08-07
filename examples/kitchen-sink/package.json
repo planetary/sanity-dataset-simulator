@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "sanity dev",
     "build": "sanity build",
-    "overlay:server": "node --experimental-strip-types spikeA/runOverlayServer.mjs"
+    "overlay:server": "node overlayApiServer.mjs",
+    "overlay:server:spike": "node --experimental-strip-types spikeA/runOverlayServer.mjs"
   },
   "dependencies": {
     "react": "19.2.8",

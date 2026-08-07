@@ -137,9 +137,32 @@ with `"blocked":true`.
 | `SANITY_OVERLAY_PERSPECTIVE` | `drafts` | `published` or `drafts` (PRD §18.1–§18.2) |
 | `SITE_PORT` | `4000` | Listen port |
 | `SITE_BASE_DATASET` | `./base-dataset.ndjson` | NDJSON base dataset |
-| `SANITY_PROJECT_ID` + `SANITY_DATASET` | unset | Set both to read the **real** dataset over the hosted query API instead of the file |
+
+The five above select **behaviour on this machine** and are read from the shell,
+as flags or environment variables, in that order.
+
+The four below select **whose content is rendered**, and are read from
+`examples/local-site/.env` **only** — never from the shell:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SANITY_PROJECT_ID` + `SANITY_BASE_DATASET` | unset | Set **both** to read the real dataset over the hosted query API instead of the file. Setting one without the other is refused, not quietly ignored. |
 | `SANITY_API_VERSION` | `2025-02-19` | |
-| `SANITY_READ_TOKEN` | unset | Read token for a private dataset |
+| `SANITY_API_READ_TOKEN` | unset | Read token for a private dataset |
+
+These are the same names the repository's own root `.env` uses, so copying it
+here works. `SANITY_DATASET` and `SANITY_READ_TOKEN` are accepted as legacy
+spellings and print a line saying so; if a legacy and a declared spelling
+disagree, that is refused rather than ranked.
+
+`SANITY_PROJECT_ID=… pnpm dev` therefore does **nothing** except print a line on
+stderr saying it was ignored. That is deliberate. Exported Sanity variables are
+common — a second project, a `direnv`, a CI runner — and until this changed, one
+of them silently moved this site's reads onto that project's content with a read
+token attached, while every other signal said "local snapshot". A value that
+decides whose data is touched has to be declared somewhere someone chose, so put
+it in `examples/local-site/.env` (gitignored) and it is picked up. See
+`examples/explicitEnv.mjs`.
 
 `mode: off` is genuinely inert, not a flag consulted late: the client never calls
 the overlay port at all, which `test/client-modes.test.ts` proves by handing it a

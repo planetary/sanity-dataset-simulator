@@ -140,9 +140,33 @@ export function identityProofFrom(value: unknown): string | undefined {
   return typeof id === 'string' && id.length > 0 ? id : undefined
 }
 
+/**
+ * Three answers, not two.
+ *
+ * `read` / `write` was built to answer "does this call MUTATE?", which is the
+ * right question for every namespace method except one. `client.live.events()`
+ * mutates nothing and is unambiguously a read — and delegating it is itself the
+ * defect, because Sanity Live is a PUSH from the far side of the read pipeline:
+ * the Content Lake evaluates the query and streams the already-evaluated result
+ * to the subscriber, arriving AFTER the overlay-resolved render and replacing it
+ * with staging content (PRD §23.3, §37 Phase 5 "Disable native Sanity Live in
+ * overlay mode").
+ *
+ * Filing it under `write` would have produced the right refusal for the wrong
+ * stated reason: every message and CI report about it would then claim the
+ * overlay blocked an attempted mutation of the shared dataset, which is false
+ * and is the kind of false that sends the next person looking in the wrong
+ * place. Hence `push` — a read that must not be delegated.
+ */
 export interface NamespacePolicy {
   read: readonly string[]
   write: readonly string[]
+  /**
+   * Reads that STREAM from the Content Lake. Never delegated, never echoed;
+   * refused, because §5.5 forbids presenting an approximation as the real thing
+   * and a live stream that cannot see the branch is exactly that.
+   */
+  push?: readonly string[]
 }
 
 /**
@@ -174,21 +198,31 @@ export const CLIENT_NAMESPACE_POLICY: Readonly<Record<string, NamespacePolicy>> 
   },
   projects: {read: ['list', 'getById'], write: []},
   users: {read: ['getById'], write: []},
-  live: {read: ['events'], write: []},
+  /* `events` is the whole of `LiveClient` in `@sanity/client@7.26.0`, and it is
+   * the one method in this table that is neither delegated nor a write. */
+  live: {read: [], write: [], push: ['events']},
   mediaLibrary: {read: [], write: []},
   'mediaLibrary.video': {read: ['getPlaybackInfo'], write: []},
 })
 
+export type NamespaceMethodKind = 'read' | 'write' | 'push'
+
 /**
- * Read or write? **Anything not declared a read is a write.**
+ * Read, write, or push? **Anything not declared a read or a push is a write.**
  *
  * Deliberately asymmetric, and not a security stance: an unrecognised method
  * that is really a read fails loudly at one call site the first time it is used;
  * an unrecognised method that is really a write escapes the overlay silently and
  * the user loses an edit they were told was saved.
+ *
+ * `push` is checked FIRST so a future entry that appears in both lists cannot be
+ * read as an ordinary delegated read. Widening `push` can only ever refuse more;
+ * it can never let something through.
  */
-export function namespaceMethodKind(namespace: string, method: string): 'read' | 'write' {
-  return CLIENT_NAMESPACE_POLICY[namespace]?.read.includes(method) ? 'read' : 'write'
+export function namespaceMethodKind(namespace: string, method: string): NamespaceMethodKind {
+  const policy = CLIENT_NAMESPACE_POLICY[namespace]
+  if (policy?.push?.includes(method)) return 'push'
+  return policy?.read.includes(method) ? 'read' : 'write'
 }
 
 /** The namespaces the facade must descend into to reach the methods above. */

@@ -103,6 +103,7 @@ import {describe, expect, it} from 'vitest'
 /** The classes of defect this contract covers. */
 export type WriteGuardGroup =
   | 'url-normalisation'
+  | 'encoded-delimiter'
   | 'write-endpoints'
   | 'read-passthrough'
   | 'methods'
@@ -259,6 +260,170 @@ const NORMALISATION_NEGATIVE: WriteGuardCase[] = [
     url: '/datasets',
     write: false,
     why: '/datasets must not be confused with /data/... by prefix matching',
+  },
+]
+
+/* ------------------------------------------------------------------ *
+ * 1b. The DANGEROUS direction of delimiter truncation (P1-1)
+ * ------------------------------------------------------------------ *
+ * The security review of 2026-08-06 found that every guard in this project
+ * re-cut the path at `?`/`#` **after each decode pass**. A percent-encoded `?`
+ * is a path character (RFC 3986 §3.3), not a delimiter, so decoding it and
+ * cutting there does not reveal more path — it DISCARDS path, including the
+ * `..` segments the dot-segment rule exists to refuse:
+ *
+ *     POST /data/query%3F/../actions/<ds>
+ *          guard sees  /data/query           -> "GROQ over POST", ALLOWED
+ *          wire says   /data/query%3F/../actions/<ds>
+ *          RFC 3986 §5.2.4 resolves that to  /data/actions/<ds>   <- a write
+ *
+ * WHY THE CONTRACT DID NOT CATCH IT. `'/data/mutate/<ds>%3Ffake=1'` above
+ * asserts "a percent-encoded `?` must not hide the path" — but that is the
+ * SAFE direction: truncating a write path leaves a write path, so the case
+ * passes whether the bug is present or not. The dangerous direction, where
+ * truncation collapses a write onto an allowlisted read PREFIX, had no case at
+ * all. One direction of an asymmetric rule is not a test of the rule.
+ *
+ * So this group is generated as a cross product rather than enumerated: every
+ * allowlisted read prefix × every spelling of the delimiter × every write the
+ * `..` can climb back down to. A future normaliser that truncates anywhere
+ * after its decision point fails here by construction, not by luck.
+ *
+ * THE RAW `#` IS IN THE SET DELIBERATELY. Cutting at `#` is correct and stays —
+ * but `proxy.mjs` forwards `pathname + search`, and `splitPath` only cuts at
+ * `?`, so a literal `#` and everything after it is relayed to the upstream
+ * verbatim. Node's HTTP parser accepts `#` in an origin-form request target and
+ * hands it through unchanged, so the guard and Content Lake are again looking
+ * at two different strings. A `#` AFTER a `?` is harmless — it lives in the
+ * query, which never reaches the path — and the negatives below pin that, so
+ * the rule cannot be over-applied into blocking GROQ text.
+ */
+
+/** Allowlisted reads, with the verb that makes each one a read. */
+const TRUNCATION_READ_PREFIXES: [string, string][] = [
+  ['POST', '/data/query'],
+  ['GET', '/data/query/' + DS],
+  ['GET', '/data/doc/' + DS],
+  ['GET', '/data/listen/' + DS],
+  ['GET', '/data/history/' + DS],
+  ['POST', '/projects/' + PID + '/datasets/' + DS + '/query'],
+  ['GET', '/projects/' + PID + '/datasets/' + DS + '/acl'],
+  ['GET', '/ping'],
+  ['GET', '/users/me'],
+  ['GET', '/projects/' + PID],
+  ['GET', '/schedules/' + PID],
+  ['GET', '/journey/trial'],
+  ['GET', '/features'],
+  ['GET', '/socket/' + DS],
+  ['GET', '/assets/images/' + DS],
+]
+
+/** Every spelling of the delimiter that truncated the classified path. */
+const TRUNCATION_DELIMITERS: [string, string][] = [
+  ['%3f', 'percent-encoded "?", lower-case hex'],
+  ['%3F', 'percent-encoded "?", upper-case hex'],
+  ['%23', 'percent-encoded "#"'],
+  ['%253f', 'DOUBLE-encoded "?" — the decode loop only reaches it on pass 2'],
+  ['%25253F', 'TRIPLE-encoded "?" — pass 3'],
+  ['#', 'a RAW "#": the proxy relays it upstream, so only the guard is truncated'],
+]
+
+/** Where the `..` chain lands once the truncated prefix has been climbed out of. */
+const TRUNCATION_WRITE_TARGETS: [string, string][] = [
+  ['/data/mutate/' + DS, 'the Mutation API'],
+  ['/data/actions/' + DS, 'the Actions API'],
+  ['/agent/action/patch/' + DS, 'an Agent Action'],
+]
+
+/**
+ * `<read prefix><delimiter>` then enough `..` to climb back to the root, then
+ * the write. The guard truncates at the delimiter and sees the bare read
+ * prefix; RFC 3986 §5.2.4 `remove_dot_segments` — which needs no decoding at
+ * all, because `query%3F` is simply a segment to be popped — resolves the RAW
+ * request line to the write.
+ */
+export function encodedDelimiterVector(
+  readPrefix: string,
+  delimiter: string,
+  writeTarget: string,
+): string {
+  const depth = readPrefix.split('/').filter(Boolean).length
+  return `${readPrefix}${delimiter}${'/..'.repeat(depth)}${writeTarget}`
+}
+
+const ENCODED_DELIMITER: WriteGuardCase[] = TRUNCATION_READ_PREFIXES.flatMap(
+  ([method, readPrefix]) =>
+    TRUNCATION_DELIMITERS.flatMap(([delimiter, delimiterWhy]) =>
+      TRUNCATION_WRITE_TARGETS.map(([writeTarget, targetWhy]) => ({
+        group: 'encoded-delimiter' as const,
+        method,
+        url: encodedDelimiterVector(readPrefix, delimiter, writeTarget),
+        write: true,
+        why:
+          `${delimiterWhy} truncates the classified path to the allowlisted read ` +
+          `${readPrefix}, while the raw request line resolves to ${targetWhy}`,
+      })),
+    ),
+)
+
+/**
+ * The reviewer's five reproduced vectors, spelled exactly as reported, so the
+ * report and the suite can be read against each other line by line.
+ */
+const ENCODED_DELIMITER_REPORTED: WriteGuardCase[] = (
+  [
+    ['POST', '/data/query%3f/../actions/' + DS],
+    ['POST', '/data/query%3F/../mutate/' + DS],
+    ['POST', '/projects/p/datasets/d/query%3f/../mutate'],
+    ['GET', '/ping%3f/../data/mutate/' + DS],
+    ['POST', '/data/query%23/../actions/' + DS],
+  ] as [string, string][]
+)
+  /* `/ping%3f/../data/mutate/<ds>` is also produced by the generator above;
+   * keeping both would be a duplicate rather than a second assertion. */
+  .filter(([, url]) => !ENCODED_DELIMITER.some((generated) => generated.url === url))
+  .map(([method, url]) => ({
+    group: 'encoded-delimiter' as const,
+    method,
+    url,
+    write: true,
+    why: 'reproduced verbatim in docs/plans/evidence/phase-1/security-review-2026-08-06.md §P1-1',
+  }))
+
+/**
+ * The rule is "never discard path the wire still carries", NOT "anything with a
+ * `%` or a `#` in it is a write". These are the reads the fix must not eat —
+ * without them, the P1-1 fix could be "block everything containing %3F" and the
+ * contract would applaud.
+ */
+const ENCODED_DELIMITER_NEGATIVE: WriteGuardCase[] = [
+  {
+    group: 'encoded-delimiter',
+    method: 'GET',
+    url: '/v2025-02-19/data/query/' + DS + '?query=*&tag=x#frag',
+    write: false,
+    why: 'a `#` AFTER the `?` is inside the query, which never reaches the path — still a read',
+  },
+  {
+    group: 'encoded-delimiter',
+    method: 'POST',
+    url: '/v2025-02-19/data/query/' + DS + '?query=*[_id=="#anchor"]',
+    write: false,
+    why: 'GROQ text containing a raw `#` in the query string is still a read',
+  },
+  {
+    group: 'encoded-delimiter',
+    method: 'GET',
+    url: '/v2025-02-19/data/query/' + DS + '?query=*[slug.current=="a%3Fb"]',
+    write: false,
+    why: 'a percent-encoded `?` inside the QUERY STRING is not path text and must not block a read',
+  },
+  {
+    group: 'encoded-delimiter',
+    method: 'GET',
+    url: '/v2025-02-19/data/doc/' + DS + '/drafts.article-01',
+    write: false,
+    why: 'the plain document read, unchanged — the control for this whole group',
   },
 ]
 
@@ -826,6 +991,9 @@ export function spikeFAttackVectors(): WriteGuardCase[] {
 export const WRITE_GUARD_CASES: readonly WriteGuardCase[] = Object.freeze([
   ...NORMALISATION,
   ...NORMALISATION_NEGATIVE,
+  ...ENCODED_DELIMITER,
+  ...ENCODED_DELIMITER_REPORTED,
+  ...ENCODED_DELIMITER_NEGATIVE,
   ...WRITE_ENDPOINTS,
   ...READ_PASSTHROUGH,
   ...METHODS,
@@ -837,6 +1005,7 @@ export const WRITE_GUARD_CASES: readonly WriteGuardCase[] = Object.freeze([
 
 const GROUP_ORDER: WriteGuardGroup[] = [
   'url-normalisation',
+  'encoded-delimiter',
   'write-endpoints',
   'read-passthrough',
   'methods',
@@ -847,6 +1016,8 @@ const GROUP_ORDER: WriteGuardGroup[] = [
 
 const GROUP_TITLES: Record<WriteGuardGroup, string> = {
   'url-normalisation': 'URL normalisation class (Spike F gap 20)',
+  'encoded-delimiter':
+    'delimiter-truncation class, UNSAFE direction (P1-1, security review 2026-08-06)',
   'write-endpoints': 'write endpoint class (Spike F gaps 21, 23, 24)',
   'read-passthrough': 'read passthrough class (blocking these breaks the Studio)',
   methods: 'method class',
@@ -941,6 +1112,31 @@ export function runWriteGuardContract(name: string, isWrite: WriteGuardPredicate
           else answers.set(key, c.write)
         }
         expect(contradictions).toEqual([])
+      })
+
+      it('covers the UNSAFE direction of delimiter truncation, not only the safe one', () => {
+        /* P1-1's root cause: the one pre-existing case (`/data/mutate/<ds>%3Ffake=1`)
+         * asserted only that truncating a WRITE path leaves a write. That passes
+         * with the bug present. This pins the other direction as a floor so the
+         * group cannot be quietly emptied back to the asymmetry that hid it. */
+        const group = WRITE_GUARD_CASES.filter((c) => c.group === 'encoded-delimiter')
+        const unsafe = group.filter((c) => c.write)
+        expect(unsafe.length).toBeGreaterThanOrEqual(200)
+        for (const [delimiter, why] of TRUNCATION_DELIMITERS) {
+          expect(
+            unsafe.some((c) => c.url.includes(delimiter)),
+            `no unsafe-direction case spells the delimiter as ${delimiter} (${why})`,
+          ).toBe(true)
+        }
+        for (const [, readPrefix] of TRUNCATION_READ_PREFIXES) {
+          expect(
+            unsafe.some((c) => c.url.startsWith(readPrefix)),
+            `no unsafe-direction case truncates onto the read prefix ${readPrefix}`,
+          ).toBe(true)
+        }
+        /* And the mirror: the group keeps real reads, so "block anything with a
+         * % or a # in it" cannot pass for a fix. */
+        expect(group.filter((c) => !c.write).length).toBeGreaterThanOrEqual(4)
       })
 
       it('still carries a regression witness for every Spike F URL gap', () => {

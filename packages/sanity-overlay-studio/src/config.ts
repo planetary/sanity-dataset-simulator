@@ -26,12 +26,20 @@
  *     which the hosted plugins' contributions are visible.
  *  3. **Inert when off.** In `off` mode it returns the consumer's config
  *     untouched, so a single env var restores native Sanity exactly.
+ *  4. **Complete.** A workspace this module returns has the §21.3 banner and the
+ *     §21.7 actions in it. They used to default to "nothing", so a caller that
+ *     reached this module rather than the package entry point got a workspace
+ *     that installed cleanly and silently had no overlay actions at all — see
+ *     `bindings.ts`, which now owns the defaults for both.
  *
- * Dependency-free: it builds plain objects. `defineConfig` from `sanity` is an
- * identity function over the same shape, so it is not needed and not imported.
+ * `defineConfig` from `sanity` is an identity function over the same shape, so it
+ * is not needed and not imported. The only import with a runtime cost is
+ * `./bindings`, which binds the host's React for the two component defaults;
+ * every decision this module makes is still plain-object work.
  */
 
-import {resolveOverlayDocumentActions} from './actions'
+import {overlayDocumentActionsResolver} from './actions'
+import {OverlayDocumentActions, OverlayStatusLayout} from './bindings'
 import {installOverlayDevtools} from './devtools'
 import {filterHostedInspectors, filterHostedTools, overlayWorkspaceFeatureFlags} from './features'
 import {
@@ -52,8 +60,25 @@ export interface DefineOverlayConfigOptions extends OverlayStudioOptions {
   createClient?: (options: Rec) => object
   /** Injected `fetch`, for tests. */
   fetch?: typeof fetch
-  /** `studio.components.layout` — the status banner. Injected by the entry point. */
+  /**
+   * `studio.components.layout` — the §21.3 status banner.
+   *
+   * Defaults to the banner bound to the host's React (`bindings.ts`). Pass
+   * `null` to install none; pass your own to render the same runtime yourself.
+   */
   layout?: unknown
+  /**
+   * The overlay's own `document.actions` (§21.7 rebase, resolve conflicts,
+   * checkpoint).
+   *
+   * Defaults to the three bound to the host's React (`bindings.ts`). It used to
+   * default to *nothing*, which meant every caller that did not pass them — the
+   * kitchen-sink example among them — got a workspace with the §21.10
+   * availability filter and none of the overlay's own actions, silently.
+   *
+   * Passing `[]` still means "none": explicit is a decision, absent was a bug.
+   */
+  documentActions?: readonly {action?: string}[]
   /**
    * Where `__SANITY_OVERLAY__` is installed. Defaults to `globalThis`, which is
    * `window` in the Studio bundle. Injected so this module stays testable in
@@ -105,11 +130,17 @@ export function overlayWorkspacePatch(
   workspace: Rec,
   options: DefineOverlayConfigOptions = {},
 ): OverlayWorkspacePatch {
+  /* The two component defaults are applied HERE, not at the entry point, so a
+   * caller that reaches this module directly cannot end up with a workspace
+   * missing the banner or the §21.7 actions. Destructuring defaults fire on
+   * `undefined` only, which is what keeps `documentActions: []` and
+   * `layout: null` meaningful as deliberate opt-outs. */
   const {
     env,
     createClient,
     fetch: fetchImpl,
-    layout,
+    layout = OverlayStatusLayout,
+    documentActions = OverlayDocumentActions,
     devtoolsTarget,
     ...studioOptions
   } = options
@@ -175,10 +206,22 @@ export function overlayWorkspacePatch(
       document: {
         ...existingDocument,
         comments: {enabled: false},
-        actions: composeResolver(existingDocument.actions, resolveOverlayDocumentActions),
+        /* `overlayDocumentActionsResolver` runs `resolveOverlayDocumentActions`
+         * first — so §21.10's blocked actions are still removed — and then
+         * APPENDS the overlay's own three, skipping any already present. Append,
+         * never prepend: the first entry is Studio's primary button, and moving
+         * "Rebase" into it would make the most destructive action the one a
+         * reflex press hits. */
+        actions: composeResolver(
+          existingDocument.actions,
+          overlayDocumentActionsResolver(documentActions),
+        ),
         inspectors: composeResolver(existingDocument.inspectors, filterHostedInspectors),
       },
-      ...(layout === undefined
+      /* `null` is the opt-out; the default above means `undefined` never
+       * reaches here, so an absent banner is now always something a caller
+       * asked for rather than something they forgot. */
+      ...(layout === null || layout === undefined
         ? {}
         : {studio: {...studio, components: {...studioComponents, layout}}}),
     },
