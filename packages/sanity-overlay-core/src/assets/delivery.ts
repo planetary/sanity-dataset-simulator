@@ -48,8 +48,12 @@ import {isOverlayAssetDocumentId, parseOverlayAssetDocumentId} from './identity'
 /** A resolved delivery request: which asset, and whether transformations were asked for. */
 export interface OverlayAssetDeliveryRequest {
   assetDocumentId: string
-  /** `document` = the §24.7 route; `image-pipeline` = the `@sanity/image-url` shape. */
-  route: 'document' | 'image-pipeline'
+  /**
+   * `document` = the §24.7 route; `image-pipeline` = the `@sanity/image-url`
+   * shape; `file-pipeline` = the same idea for a `sanity.fileAsset`, whose
+   * hosted URL is `<cdn>/files/<projectId>/<dataset>/<sha1>.<ext>`.
+   */
+  route: 'document' | 'image-pipeline' | 'file-pipeline'
   /**
    * Present for `image-pipeline` requests that carried transformation parameters.
    * A conforming responder ignores them and serves the original bytes (§24.8).
@@ -135,10 +139,50 @@ export function parseOverlayImageDeliveryPath(url: string): OverlayAssetDelivery
   }
 }
 
-/** Either delivery shape, for a server that mounts one handler for both (§24.7). */
+/**
+ * The `sanity.fileAsset` sibling of route (b).
+ *
+ * A hosted file asset's `url` is `<cdn>/files/<projectId>/<dataset>/<sha1>.<ext>`
+ * — the same construction as the image route with the `<w>x<h>` segment absent,
+ * because a file has no dimensions. It is parsed here for the same reason the
+ * image route is: an overlay asset ID is recoverable from the path exactly, so a
+ * front end that built the URL from Sanity's own convention still reaches the
+ * bytes. Query parameters carry no meaning on this route and are reported as
+ * unsupported, exactly as they are for images (§24.8).
+ */
+const FILE_ROUTE_RE = /^\/files\/([^/]+)\/([^/]+)\/([a-f0-9]{40})\.([a-z0-9]+)$/
+
+/** Route (c), rendered: `/files/<projectId>/<dataset>/<sha1>.<ext>`. */
+export function overlayFileDeliveryPath(
+  assetDocumentId: string,
+  projectId: string,
+  dataset: string,
+): string | null {
+  const parsed = parseOverlayAssetDocumentId(assetDocumentId)
+  if (parsed === null || parsed.kind !== 'file') return null
+  return `/files/${projectId}/${dataset}/${parsed.sha1}.${parsed.extension}`
+}
+
+/** Route (c), parsed. Returns the `file-…` asset ID the path addresses. */
+export function parseOverlayFileDeliveryPath(url: string): OverlayAssetDeliveryRequest | null {
+  const [pathname, query] = pathnameAndQuery(url)
+  const match = FILE_ROUTE_RE.exec(pathname)
+  if (match === null) return null
+  return {
+    assetDocumentId: `file-${match[3]}-${match[4]}`,
+    route: 'file-pipeline',
+    unsupportedTransformParams: queryKeys(query),
+  }
+}
+
+/** Every delivery shape, for a server that mounts one handler for all (§24.7). */
 export function parseOverlayAssetRequest(
   url: string,
   basePath: string = OVERLAY_ASSET_BASE_PATH,
 ): OverlayAssetDeliveryRequest | null {
-  return parseOverlayAssetDeliveryPath(url, basePath) ?? parseOverlayImageDeliveryPath(url)
+  return (
+    parseOverlayAssetDeliveryPath(url, basePath) ??
+    parseOverlayImageDeliveryPath(url) ??
+    parseOverlayFileDeliveryPath(url)
+  )
 }

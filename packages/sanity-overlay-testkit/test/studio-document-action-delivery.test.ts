@@ -378,16 +378,33 @@ describe('a config a consumer writes delivers the §21.7 actions to Studio', () 
       expect.arrayContaining([expect.stringMatching(/rebase/i), expect.stringMatching(/checkpoint/i)]),
     )
 
-    /* Not merely present — live. A rebase offered on a document the branch does
-     * not hold would be disabled, which is the same invisibility one click in. */
-    const rebase = states.find((state) => state.action === 'overlayRebase')
-    expect(rebase?.disabled).toBe(false)
-    expect(typeof rebase?.onHandle).toBe('function')
-
-    /* The checkpoint reports the inventory the API sent, not a number this file
-     * computed: two documents. */
+    /* Not merely present — LIVE. A checkpoint offered on a branch the overlay
+     * holds must be clickable, or it is the same invisibility one click in. */
     const checkpoint = states.find((state) => state.action === 'overlayCheckpoint')
+    expect(checkpoint?.disabled).toBe(false)
+    expect(typeof checkpoint?.onHandle).toBe('function')
+    /* …and it reports the inventory the API sent, not a number this file
+     * computed: two documents. */
     expect(String(checkpoint?.title)).toContain('2 documents')
+
+    /*
+     * REBASE IS DELIVERED BUT DISABLED HERE, WITH A REASON, AND THAT IS CORRECT.
+     *
+     * §17 recomputes the merge against the base AS IT STANDS NOW, and §16.1
+     * keeps base fetching out of core and out of the overlay API — the Studio
+     * holds the only Sanity credential in the topology. This session has never
+     * read a base document (no pane has opened), so it cannot state one. The
+     * §5.5 answer is to refuse visibly; the failure mode being ruled out is an
+     * ENABLED action that silently does nothing, so the reason must be legible
+     * and `onHandle` must be absent rather than a no-op.
+     *
+     * `studio-operations-e2e.test.ts` drives the enabled path, against a real
+     * store, once the base HAS been read.
+     */
+    const rebase = states.find((state) => state.action === 'overlayRebase')
+    expect(rebase?.disabled).toBe(true)
+    expect(String(rebase?.title)).toMatch(/current base/i)
+    expect(rebase?.onHandle).toBeUndefined()
   })
 
   it('leaves the built-ins in place and puts the overlay’s three last', () => {

@@ -797,6 +797,7 @@ describe('no package imports its way out of its own directory', () => {
       'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-query/src/index',
       'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-store-fs/src/index',
       'packages/sanity-overlay-next/src/queries.ts -> ../../sanity-overlay-query/src/index',
+      'packages/sanity-overlay-next/src/rebase.ts -> ../../sanity-overlay-core/src/index',
       'packages/sanity-overlay-next/src/server.ts -> ../../sanity-overlay-store-fs/src/index',
       'packages/sanity-overlay-next/src/translate.ts -> ../../sanity-overlay-core/src/index',
     ],

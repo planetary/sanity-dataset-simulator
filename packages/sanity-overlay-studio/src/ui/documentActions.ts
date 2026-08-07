@@ -90,6 +90,9 @@ export function createOverlayActionControllers(
     refresh: () => runtime.refresh(),
     documents: () => runtime.documents(),
     conflicts: () => runtime.conflicts(),
+    /* §16.1: the Studio is the only party holding a Sanity credential, so it is
+     * the only party that can state the current base a §17 rebase needs. */
+    baseDocuments: (logicalIds: readonly string[]) => runtime.baseDocuments(logicalIds),
     ...(options.actor === undefined ? {} : {actor: options.actor}),
     ...(options.now === undefined ? {} : {now: options.now}),
   }

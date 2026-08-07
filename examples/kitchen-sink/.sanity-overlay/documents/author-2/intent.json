@@ -1,0 +1,43 @@
+{
+  "base": {
+    "publishedRevision": "V2rkHT6iCw5OR37gl8ZsX0",
+    "snapshotRef": "f638c6b67b720c899c76c685beac177ea3133be5b3ad71e548110a15465ccf72"
+  },
+  "checksum": "d0be6372633c72bfbe14020fa49cf49704b377ce85f22a9ea86b2635cf3a2d2a",
+  "conflicts": [],
+  "draft": {
+    "mode": "patch",
+    "overrides": [
+      {
+        "path": [
+          "portrait"
+        ],
+        "value": {
+          "_type": "image",
+          "_upload": {
+            "createdAt": "2026-08-07T03:26:20.938Z",
+            "file": {
+              "name": "overlay-test.png",
+              "type": "image/png"
+            },
+            "previewImage": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/4gHYSUNDX1BST0ZJTEUAAQEAAAHIAAAAAAQwAABtbnRyUkdCIFhZWiAH4AABAAEAAAAAAABhY3NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAA9tYAAQAAAADTLQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlkZXNjAAAA8AAAACRyWFlaAAABFAAAABRnWFlaAAABKAAAABRiWFlaAAABPAAAABR3dHB0AAABUAAAABRyVFJDAAABZAAAAChnVFJDAAABZAAAAChiVFJDAAABZAAAAChjcHJ0AAABjAAAADxtbHVjAAAAAAAAAAEAAAAMZW5VUwAAAAgAAAAcAHMAUgBHAEJYWVogAAAAAAAAb6IAADj1AAADkFhZWiAAAAAAAABimQAAt4UAABjaWFlaIAAAAAAAACSgAAAPhAAAts9YWVogAAAAAAAA9tYAAQAAAADTLXBhcmEAAAAAAAQAAAACZmYAAPKnAAANWQAAE9AAAApbAAAAAAAAAABtbHVjAAAAAAAAAAEAAAAMZW5VUwAAACAAAAAcAEcAbwBvAGcAbABlACAASQBuAGMALgAgADIAMAAxADb/2wBDAFA3PEY8MlBGQUZaVVBfeMiCeG5uePWvuZHI////////////////////////////////////////////////////2wBDAVVaWnhpeOuCguv/////////////////////////////////////////////////////////////////////////wAARCAB4AHgDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAT/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFgEBAQEAAAAAAAAAAAAAAAAAAAID/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AmAS2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAf/2Q==",
+            "progress": 2,
+            "updatedAt": "2026-08-07T03:26:20.938Z"
+          }
+        }
+      }
+    ]
+  },
+  "formatVersion": 1,
+  "logicalId": "author-2",
+  "tombstones": {
+    "draft": false,
+    "published": false
+  },
+  "touchedPaths": [
+    [
+      "portrait"
+    ]
+  ],
+  "type": "author"
+}

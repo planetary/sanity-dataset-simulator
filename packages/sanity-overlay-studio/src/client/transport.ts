@@ -107,6 +107,16 @@ export interface OverlayOperationRequest {
   payload: unknown
   idempotencyKey: string
   actor?: unknown
+  /**
+   * The base as it stands NOW, for the documents in scope (PRD §16.1).
+   *
+   * A rebase recomputes the merge against the current base, and neither core nor
+   * the overlay API may fetch it: the Studio holds the only Sanity credential in
+   * the topology. Sent for the same reason `commit` sends it — an operation the
+   * server had to guess an ancestor for is not the operation the editor asked
+   * for.
+   */
+  baseDocuments?: unknown[]
 }
 
 /**
@@ -358,6 +368,9 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
               kind: request.kind,
               payload: request.payload,
               ...(request.actor === undefined ? {} : {actor: request.actor}),
+              ...(request.baseDocuments === undefined
+                ? {}
+                : {baseDocuments: request.baseDocuments}),
             },
           },
           'write',

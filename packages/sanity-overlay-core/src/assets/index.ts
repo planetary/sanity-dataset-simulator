@@ -62,10 +62,12 @@ export {
 export type {AssetUploadPlan, PlanAssetUploadInput} from './upload'
 
 export {
+  overlayFileDeliveryPath,
   overlayImageDeliveryPath,
   overlayImageFilename,
   parseOverlayAssetDeliveryPath,
   parseOverlayAssetRequest,
+  parseOverlayFileDeliveryPath,
   parseOverlayImageDeliveryPath,
 } from './delivery'
 export type {OverlayAssetDeliveryRequest} from './delivery'

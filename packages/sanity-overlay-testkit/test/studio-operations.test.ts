@@ -311,6 +311,11 @@ function controllerFor(
     kind,
     transport,
     refresh,
+    /* §16.1: the Studio is the only party that can state the CURRENT base, so a
+     * rebase action with no base in hand disables itself. Every case below is
+     * about what happens once it HAS one; the refusal has its own test. */
+    baseDocuments: (logicalIds: readonly string[]) =>
+      logicalIds.map((logicalId) => ({_id: logicalId, _type: 'article', _rev: 'lake-rev-9'})),
     documents: DOCUMENTS,
     conflicts: readConflictReport({
       documents: [
@@ -337,6 +342,30 @@ describe('createOverlayActionController — OverlayRebaseAction', () => {
     const description = controller.describe({id: 'article-404', type: 'article'})
     expect(description!.disabled).not.toBe(false)
     expect(description!.title).toMatch(/overlay|branch|no local/i)
+  })
+
+  /**
+   * §16.1 / §17. The overlay API cannot fetch base — it holds no Sanity
+   * credential — so a Studio that has not read the current base cannot ask for a
+   * rebase onto it. Disabled with a reason is the honest answer; enabled and
+   * inert is the failure mode this whole file exists to stop.
+   */
+  it('disables itself, with a reason, when it has no current base to rebase onto', () => {
+    const transport = fakeTransport()
+    const controller = createOverlayActionController({
+      kind: 'rebase',
+      transport,
+      refresh: vi.fn(async () => {}),
+      documents: DOCUMENTS,
+      conflicts: readConflictReport({documents: []}),
+      baseDocuments: () => [],
+    } as never)
+
+    const description = controller.describe({id: 'article-1', type: 'article'})
+    expect(description!.disabled).toBe(true)
+    expect(description!.title).toMatch(/current base/i)
+    expect(description!.onHandle).toBeUndefined()
+    expect(transport.sent).toHaveLength(0)
   })
 
   /** The load-bearing one. */
@@ -393,6 +422,8 @@ describe('createOverlayActionController — OverlayRebaseAction', () => {
       refresh: async () => {},
       documents: DOCUMENTS,
       conflicts: readConflictReport({documents: []}),
+      baseDocuments: (logicalIds: readonly string[]) =>
+        logicalIds.map((logicalId) => ({_id: logicalId, _type: 'article', _rev: 'lake-rev-9'})),
     } as never)
     controller.describe({id: 'article-1', type: 'article'})!.onHandle!()
     await controller.describe({id: 'article-1', type: 'article'})!.dialog!.onConfirm()
@@ -407,6 +438,8 @@ describe('createOverlayActionController — OverlayRebaseAction', () => {
       refresh: async () => {},
       documents: DOCUMENTS,
       conflicts: readConflictReport({documents: []}),
+      baseDocuments: (logicalIds: readonly string[]) =>
+        logicalIds.map((logicalId) => ({_id: logicalId, _type: 'article', _rev: 'lake-rev-9'})),
     } as never)
     controller.describe({id: 'article-1', type: 'article'})!.onHandle!()
     await controller.describe({id: 'article-1', type: 'article'})!.dialog!.onConfirm()

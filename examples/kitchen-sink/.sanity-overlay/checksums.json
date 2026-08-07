@@ -1,0 +1,12 @@
+{
+  "algorithm": "sha256",
+  "checksum": "53cf67f9069589f90710e15d68935f8a084a870b7e92b329c6dd3e69142e5a3a",
+  "files": {
+    "documents/article-01/intent.json": "4be93ae6cb888b2c50c686c8477e28bc96d7702a9e590763b42690679cf66cef",
+    "documents/origin-proof-1/intent.json": "5861db9e5e4650ed702d5f8d3ee2789a223c90ef295b11e53ae07289c32e999b",
+    "manifest.json": "52ade485de7ffcfc88f117bce51300008a2f752e3b6eb3dd2aa65d66cfa63c54",
+    "snapshots/1d9bb293b1d4fa563677dbda88217fa00d460db463f77db5f8623961df9e8653.json": "1d9bb293b1d4fa563677dbda88217fa00d460db463f77db5f8623961df9e8653"
+  },
+  "formatVersion": 1,
+  "overlayId": "spike-a-local-echo"
+}

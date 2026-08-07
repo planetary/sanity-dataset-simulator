@@ -11,7 +11,7 @@
 import {createServer} from 'node:http'
 import type {IncomingMessage, Server, ServerResponse} from 'node:http'
 import {isAbsolute, resolve as resolvePath} from 'node:path'
-import {FsOverlayStore} from '../../sanity-overlay-store-fs/src/index'
+import {FsOverlayAssetStore, FsOverlayStore} from '../../sanity-overlay-store-fs/src/index'
 import type {FsOverlayStoreHooks} from '../../sanity-overlay-store-fs/src/index'
 import {createOverlayApi} from './api'
 import type {OverlayApi, OverlayApiOptions} from './api'
@@ -39,7 +39,7 @@ export const DEFAULT_STUDIO_ORIGIN = 'http://localhost:3333'
 const DEFAULT_WATCH_INTERVAL_MS = 250
 
 export interface StartOverlayApiServerOptions
-  extends Omit<OverlayApiOptions, 'store' | 'now'> {
+  extends Omit<OverlayApiOptions, 'store' | 'assetStore' | 'now'> {
   /**
    * The directory that CONTAINS `.sanity-overlay/` (PRD §14.1). Relative paths
    * resolve against the process cwd.

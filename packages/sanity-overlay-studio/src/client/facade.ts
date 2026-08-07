@@ -306,6 +306,55 @@ function namespaceRefusalReason(path: string): string {
 const PAIR_QUERY_RE = /^\*\[\s*_id\s+in\s+\$ids\s*\]$/
 
 /**
+ * Teach the echo what the branch holds, from an overlay hydration answer.
+ *
+ * ONE SPELLING, TWO FEEDS, AND THAT IS THE WHOLE POINT OF THIS FUNCTION. The
+ * overlay API states its inventory in exactly two places — the `documents` array
+ * on every `POST /commit` answer, and the same array on `GET /state` — and the
+ * document-by-id read tap (`tapRead`) can only substitute a body the echo has
+ * been told about.
+ *
+ * Only the commit feed was ever wired. A Studio session that had not yet written
+ * anything therefore had an EMPTY overlay-document map, so the pair listener's
+ * `getDocuments` snapshot — the value the edit form opens with — fell straight
+ * through to the base dataset while the list panes (fed from `/state` through
+ * `overlaySourceFromBranch`) showed the branch. The editor then edited the base
+ * body, and the overlay merged the result against an ancestor they were never
+ * shown. `runtime.ts` now feeds this from `/state` as well.
+ *
+ * A TOMBSTONE IS NOT AN ABSENT BODY. `draft: null` with `draftTombstone: true`
+ * means the branch removed that address; `draft: null` without it means the
+ * branch simply holds no local draft and base is the honest answer. Storing both
+ * as "forget this id" put deleted documents back in front of the editor.
+ */
+export function seedOverlayDocuments(
+  echo: Pick<OverlayEcho, 'setOverlayDocument' | 'setOverlaySuppressed'>,
+  documents: readonly OverlayHydrationDocument[],
+): void {
+  for (const document of documents) {
+    if (!isRec(document) || typeof document.logicalId !== 'string' || document.logicalId === '') {
+      continue
+    }
+    const draftId = `drafts.${document.logicalId}`
+    if (document.draft !== undefined) {
+      echo.setOverlayDocument(draftId, document.draft ?? null)
+    }
+    if (document.published !== undefined) {
+      echo.setOverlayDocument(document.logicalId, document.published ?? null)
+    }
+    /* `undefined` means this overlay API does not report tombstones at all, and
+     * §5.5 forbids reading silence as "clean" — so the flag is only ever CLEARED
+     * by an explicit `false`. */
+    if (document.draftTombstone !== undefined) {
+      echo.setOverlaySuppressed(draftId, document.draftTombstone === true)
+    }
+    if (document.publishedTombstone !== undefined) {
+      echo.setOverlaySuppressed(document.logicalId, document.publishedTombstone === true)
+    }
+  }
+}
+
+/**
  * The absolute URL a raw `request({url | uri})` would actually be sent to, using
  * the WRAPPED CLIENT'S OWN URL builder.
  *
@@ -507,14 +556,7 @@ function createFacade(options: OverlayFacadeOptions): {
       }
       if (result.outcome === 'degraded') committed = 'degraded'
       if (result.documents !== undefined) options.onHydration?.(result.documents)
-      for (const document of result.documents ?? []) {
-        if (document.draft !== undefined) {
-          echo.setOverlayDocument(`drafts.${document.logicalId}`, document.draft ?? null)
-        }
-        if (document.published !== undefined) {
-          echo.setOverlayDocument(document.logicalId, document.published ?? null)
-        }
-      }
+      seedOverlayDocuments(echo, result.documents ?? [])
       for (const entry of result.unsupported ?? []) {
         noteError(
           `[sanity-overlay-studio] the overlay could not represent ${entry}; the editor's view ` +
@@ -719,21 +761,25 @@ function createFacade(options: OverlayFacadeOptions): {
     const substitute = (value: unknown): unknown => {
       echo.seedFromResult(value, authoritative)
       if (Array.isArray(value)) {
-        return value.map((entry) => substituteOne(entry))
+        /* POSITIONAL. `getDocuments(ids)` answers an array aligned with `ids`
+         * (@sanity/client 7.26.0), and sanity 6.8.0's pair listener destructures
+         * it that way — `lib/datastores-DqFH7RLd.js:1727`. The requested id is
+         * therefore the only thing that identifies a slot whose base answer is
+         * `null`, which is exactly the branch-created document the form must
+         * still be able to open. */
+        return value.map((entry, index) => substituteOne(entry, requestedIds[index]))
       }
-      return substituteOne(value)
+      return substituteOne(value, requestedIds.length === 1 ? requestedIds[0] : undefined)
     }
 
-    const substituteOne = (value: unknown): unknown => {
-      if (!isRec(value) || typeof value._id !== 'string') {
-        /* `getDocument` on a missing document answers `undefined`; the overlay
-         * may still hold a branch-created body for the requested id. */
-        if (value === undefined && requestedIds.length === 1) {
-          return echo.getOverlayDocument(requestedIds[0]) ?? value
-        }
-        return value
-      }
-      return echo.getOverlayDocument(value._id) ?? value
+    const substituteOne = (value: unknown, requestedId: string | undefined): unknown => {
+      const id = isRec(value) && typeof value._id === 'string' ? value._id : requestedId
+      if (id === undefined) return value
+      /* The branch has DELETED this address (§18.6, §18.7). Falling through to
+       * the base body would put a document the branch removed back into the
+       * editor, which is the same silent approximation §5.5 forbids. */
+      if (echo.isOverlaySuppressed(id)) return null
+      return echo.getOverlayDocument(id) ?? value
     }
 
     if (isPromiseLike(result)) {
@@ -1324,6 +1370,44 @@ function createFacade(options: OverlayFacadeOptions): {
 
             const plane = classifyWriteEndpoint(url)
             const isWrite = plane !== undefined && method !== 'GET' && method !== 'HEAD'
+            /*
+             * ─────────────────────────────────────────────────────────────────
+             * A DOCUMENTED READ GAP, NOT AN OVERSIGHT. §5.5 forbids pretending.
+             *
+             * A raw `request({uri})` READ is delegated to the base dataset
+             * untouched, and some of those really do carry document content or
+             * document EXISTENCE. Transcribed from sanity 6.8.0, the ones that
+             * matter (`node_modules/sanity/lib/…`):
+             *
+             *   datastores-DqFH7RLd.js:249   `/data/doc/<ds>/<ids>?excludeContent=true`
+             *                                — preview availability: does this
+             *                                  document exist? A branch-created
+             *                                  document reads as missing.
+             *   datastores-DqFH7RLd.js:5533  `/data/doc/<ds>/<ids>`
+             *                                — validation's reference-exists probe.
+             *   datastores-DqFH7RLd.js:7122  `/data/history/<ds>/documents/…`
+             *   datastores-DqFH7RLd.js:7133  ditto — `getDocumentAtRevision`,
+             *                                  which feeds the diff view and
+             *                                  history restore.
+             *   useBundleDocuments…:5009     `/data/history/<ds>/events/documents/<id>`
+             *   useBundleDocuments…:5101     `/data/history/<ds>/documents/<id>?revision=`
+             *   structureTool-EN0gOzyJ.js:744, :761 — delete-confirm existence
+             *                                  probe and cross-dataset references.
+             *
+             * They are answered by the BASE DATASET, so anything a branch created
+             * looks absent to them and anything a branch deleted looks present.
+             * Intercepting them means teaching this facade the `/data/doc` and
+             * `/data/history` wire formats — a second, weaker copy of the overlay
+             * read path — so it is recorded here rather than half-done.
+             *
+             * Strictly worse, and genuinely UNREACHABLE from any client proxy:
+             * the timeline reads its transaction log with the GLOBAL `fetch()`,
+             * built from `client.getUrl()` + `client.config().token`
+             * (`datastores-DqFH7RLd.js:6876`, `:7097`;
+             * `useBundleDocuments…:4822`). No wrapper around a client method can
+             * see those at all.
+             * ─────────────────────────────────────────────────────────────────
+             */
             if (!isWrite) return tapReadErrors(fn.apply(t, args))
             if (plane !== 'documents') {
               return refuseUnechoable(kind, `request(${String(url)})`, UNECHOABLE_REASON[plane])

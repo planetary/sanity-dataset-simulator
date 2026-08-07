@@ -27,6 +27,7 @@
  * persistence is the store, GROQ is `sanity-overlay-query`.
  */
 import {
+  REBASE_MODES,
   applyTransaction,
   createBaseSource,
   createOverlayState,
@@ -52,6 +53,7 @@ import type {
   SanityDocument,
 } from '../../sanity-overlay-core/src/index'
 import type {
+  FsOverlayAssetStore,
   FsOverlayStore,
   OverlayWatchHandle,
 } from '../../sanity-overlay-store-fs/src/index'
@@ -61,8 +63,21 @@ import type {
   OverlayQueryRegistry,
   QueryPerspective,
 } from '../../sanity-overlay-query/src/index'
+import {
+  ASSET_UPLOAD_HEADER,
+  assertUploadIsNotForged,
+  assetBasePathFor,
+  assetRouteOf,
+  cdnFallthroughLocation,
+  deliverAsset,
+  putUploadedAsset,
+  uploadFilenameFrom,
+  uploadResponseBody,
+  withUrl,
+} from './assets'
 import {OverlayApiError} from './errors'
 import {evaluateRegisteredQuery, planRegisteredQuery} from './queries'
+import {runRebase as performRebase, type StudioRebaseMode} from './rebase'
 import {encodeSseFrame} from './sse'
 import {translateDocumentActions, translateInterceptedWrite} from './translate'
 
@@ -70,6 +85,17 @@ type Rec = Record<string, unknown>
 
 /** Studio autosaves on every keystroke burst; a runaway body is a bug, not content. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024
+
+/**
+ * The transport ceiling for an upload — PRD §24.5 "enforce size limits".
+ *
+ * SEPARATE FROM {@link MAX_BODY_BYTES}, because they bound different things: a
+ * JSON commit that big is a bug, an image that big is a photograph. This is the
+ * outer bound the SERVER will read at all; `FsOverlayAssetStore` applies the
+ * project's own (smaller, configurable) `maxBytes` afterwards, and its refusal is
+ * the one an editor sees. Kept in step with core's `DEFAULT_MAX_ASSET_BYTES`.
+ */
+const MAX_ASSET_BYTES = 20 * 1024 * 1024
 
 const DEFAULT_ACTOR: OverlayActor = {
   type: 'user',
@@ -119,6 +145,13 @@ export interface OverlayHydrationDocument {
 export interface OverlayApiOptions {
   /** An opened filesystem store. The API never constructs one for you. */
   store: FsOverlayStore
+  /**
+   * Branch-local asset storage (PRD §24.3). ABSENT MEANS THE ASSET ROUTES DO NOT
+   * EXIST, and that is a stated refusal rather than a silent 404: an upload to a
+   * server with no asset store is answered `501 ASSETS_NOT_CONFIGURED` with the
+   * reason, because §5.5 forbids letting a caller conclude anything from silence.
+   */
+  assetStore?: FsOverlayAssetStore
   overlayId?: string
   base?: {projectId: string; dataset: string; apiVersion: string}
   source?: {repositoryId: string; branch?: string}
@@ -756,6 +789,221 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     }
   }
 
+  /* ---------------------------------------------------------------- *
+   * §29.1 — checkpoint
+   * ---------------------------------------------------------------- *
+   *
+   * A CHECKPOINT CHANGES NO BRANCH STATE. It renders the review-facing tree —
+   * manifest, one intent per head, the base snapshots those intents name, and
+   * the §14.3 checksums — into a directory a human commits to Git. No
+   * transaction, no revision increment, nothing lost. `committed: false` in the
+   * answer is that fact, not a failure.
+   *
+   * `manifest.checkpoint` (§13.1) IS NOT STAMPED UNLESS THE CALLER NAMES A
+   * COMMIT. That field records `{overlayRevision, commitSha, createdAt}`, and a
+   * checkpoint written from a Studio has no commit SHA — the commit does not
+   * exist yet, by construction, since this is what produces the files that will
+   * be committed. Inventing one would put a fabricated SHA into the manifest
+   * that `sanity-overlay status` prints and CI's §29.6 policy trusts, which is
+   * precisely the silent approximation §5.5 forbids. A CI step that HAS the SHA
+   * passes `commitSha` and gets the marker; the browser gets the tree and is
+   * told, in `manifestMarked`, that the marker was not written and why.
+   */
+  async function commitCheckpoint(body: Rec): Promise<Rec> {
+    const payload = isRec(body.payload) ? body.payload : {}
+    const dir = typeof payload.dir === 'string' && payload.dir.length > 0 ? payload.dir : undefined
+    const commitSha =
+      typeof payload.commitSha === 'string' && payload.commitSha.trim().length > 0
+        ? payload.commitSha.trim()
+        : undefined
+
+    let manifestMarked = false
+    let markerReason =
+      'no `commitSha` was supplied, so PRD §13.1 `manifest.checkpoint` was not stamped — the ' +
+      'commit that will carry this checkpoint does not exist yet. Commit the tree and record ' +
+      'the SHA, or call this endpoint again with `commitSha` from CI.'
+
+    if (commitSha !== undefined) {
+      /* STAMPED BEFORE THE RENDER, deliberately. `exportCheckpoint` writes
+       * `manifest.json` and `checksums.json` together; marking the manifest
+       * afterwards would leave the tree's own checksum file describing bytes the
+       * tree no longer holds, and the next `importCheckpoint` would report it as
+       * divergence. */
+      const current = await store.readManifest(overlayId)
+      const marked = await store.writeManifestConditional(
+        overlayId,
+        {
+          ...current,
+          revision: current.revision + 1,
+          checkpoint: {
+            overlayRevision: current.revision + 1,
+            commitSha,
+            createdAt: now(),
+          },
+        },
+        current.revision,
+        {actor: normalizeActor(body.actor) ?? defaultActor},
+      )
+      state = {...state, revision: marked.revision}
+      manifestMarked = true
+      markerReason = ''
+    }
+
+    const exported = await store.exportCheckpoint(
+      overlayId,
+      dir === undefined ? {} : {dir},
+    )
+
+    return {
+      ok: true,
+      /* No transaction was recorded, so no `document.changed` is announced. */
+      committed: false,
+      replayed: false,
+      overlayId,
+      revision: state.revision,
+      checkpoint: {
+        dir: exported.dir,
+        files: exported.files,
+        checksum: exported.checksums.checksum,
+        overlayRevision: state.revision,
+        manifestMarked,
+        ...(manifestMarked ? {} : {manifestMarkerReason: markerReason}),
+      },
+      unsupported: [],
+      documents: hydrationDocuments(state),
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §17, §28.4, §28.5 — rebase
+   * ---------------------------------------------------------------- *
+   *
+   * `documents` in the answer is the PER-DOCUMENT OUTCOME, not the hydration
+   * array every other endpoint puts there. That is what
+   * `sanity-overlay-studio`'s `readRebaseOutcome` reads, and it exists because
+   * §28.5's four preconditions come back as `applied: false` with a `blockedBy`
+   * list rather than as an error: a 200 carrying a hydration array would be read
+   * as "the rebase happened" by a client that only checked the status code.
+   *
+   * NOTHING IS PARTIALLY APPLIED. If any in-scope document is blocked, the whole
+   * run is reported and no record is written — a half-rebased overlay has no
+   * spelling in §13.1 and no way back.
+   */
+  async function commitRebase(body: Rec): Promise<Rec> {
+    const idempotencyKey = body.idempotencyKey as string
+    const replayed = await store.getTransaction(overlayId, {idempotencyKey})
+    if (replayed !== null) return replayEnvelope(replayed.transactionId, [])
+
+    const payload = isRec(body.payload) ? body.payload : {}
+    const mode = typeof payload.mode === 'string' ? payload.mode : 'auto'
+    if (mode !== 'auto' && !(REBASE_MODES as readonly string[]).includes(mode)) {
+      throw new OverlayApiError(
+        400,
+        'INVALID_REQUEST',
+        `unknown rebase mode ${JSON.stringify(mode)}. PRD §28.4 defines ` +
+          `${REBASE_MODES.join(', ')}, and §28.5 adds "auto".`,
+      )
+    }
+
+    const requested = Array.isArray(payload.documentIds)
+      ? payload.documentIds.filter((id): id is string => typeof id === 'string')
+      : null
+    const scope = (requested === null ? overlayDocumentIds(state.documents) : requested).map(
+      toPublishedId,
+    )
+
+    const records = scope
+      .map((logicalId) => getRecord(state, logicalId))
+      .filter((record): record is OverlayDocumentRecord => record !== null && record !== undefined)
+
+    if (records.length === 0) {
+      return {
+        ok: true,
+        committed: false,
+        replayed: false,
+        overlayId,
+        revision: state.revision,
+        documents: [],
+        unsupported: ['the overlay holds no branch record for any requested document'],
+      }
+    }
+
+    /* §16.1 — core never fetches base, and this server holds no Sanity
+     * credential. The caller states the base or the rebase does not run. */
+    const currentBase = new Map<string, SanityDocument>()
+    for (const document of usableBaseDocuments(body.baseDocuments)) {
+      currentBase.set(toPublishedId(document._id), document)
+    }
+
+    const missing = records
+      .filter((record) => !currentBase.has(record.logicalId))
+      .map((record) => record.logicalId)
+    if (missing.length > 0) {
+      throw new OverlayApiError(
+        400,
+        'BASE_REQUIRED',
+        `a rebase recomputes against the CURRENT base, and this request carried no usable base ` +
+          `document for ${missing.join(', ')}. PRD §16.1 keeps base fetching out of the overlay, ` +
+          `so the caller must send the current base (as \`baseDocuments\`) — assuming the base ` +
+          `has not moved would report a rebase that never happened.`,
+      )
+    }
+
+    const actor = normalizeActor(body.actor) ?? defaultActor
+    const run = performRebase({
+      mode: mode as StudioRebaseMode,
+      records,
+      currentBase,
+      overlayRevision: state.revision,
+      now: now(),
+      actor,
+      transactionId: () => nextTransactionId(),
+    })
+
+    const blocked = run.outcomes.filter((outcome) => outcome.blockedBy.length > 0)
+    if (blocked.length > 0 || run.records.length === 0) {
+      return {
+        ok: true,
+        committed: false,
+        replayed: false,
+        overlayId,
+        revision: state.revision,
+        documents: run.outcomes,
+        unsupported: [],
+      }
+    }
+
+    const stored = await store.commitTransaction(overlayId, {
+      idempotencyKey,
+      actor,
+      /* Empty on purpose, matching `sanity-overlay rebase`: the post-state record
+       * IS the payload — there is no mutation that spells "the ancestor moved". */
+      mutations: [],
+      records: run.records,
+      expectedOverlayRevision: state.revision,
+    })
+
+    const documents: Record<string, OverlayDocumentRecord> = {...state.documents}
+    for (const record of run.records) documents[record.logicalId] = record
+    state = createOverlayState({
+      overlayId,
+      revision: stored.manifest.revision,
+      documents,
+    })
+
+    return {
+      ok: true,
+      committed: true,
+      replayed: stored.replayed,
+      overlayId,
+      revision: stored.manifest.revision,
+      transactionId: stored.transaction.transactionId,
+      affectedDocumentIds: run.records.map((record) => record.logicalId),
+      documents: run.outcomes,
+      unsupported: [],
+    }
+  }
+
   async function commit(body: unknown): Promise<Rec> {
     if (!isRec(body)) {
       throw new OverlayApiError(400, 'INVALID_REQUEST', 'commit body must be a JSON object')
@@ -770,10 +1018,12 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     }
     if (kind === 'documentActions') return commitDocumentActions(body)
     if (kind === 'actions' || kind === 'mutations') return commitMutations(body, kind)
+    if (kind === 'checkpoint') return commitCheckpoint(body)
+    if (kind === 'rebase') return commitRebase(body)
     throw new OverlayApiError(
       400,
       'INVALID_REQUEST',
-      'commit requires kind "actions", "mutations" or "documentActions"',
+      'commit requires kind "actions", "mutations", "documentActions", "checkpoint" or "rebase"',
     )
   }
 
@@ -1124,13 +1374,197 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     })
   }
 
+  /* ---------------------------------------------------------------- *
+   * Assets — PRD §24.3 steps 1-7, §24.7
+   * ---------------------------------------------------------------- *
+   *
+   * The routing decisions live in `assets.ts`; what is here is the HTTP
+   * envelope, the CSRF control and the ONE thing that must not be delegated:
+   * an accepted upload is committed into the overlay's document set as a
+   * synthetic `sanity.imageAsset` / `sanity.fileAsset` (§24.3 step 5), on the
+   * SAME mutex as `/commit`, so `asset._ref` resolves through the ordinary
+   * reference machinery and `assertAssetDeletable` can see who uses it.
+   *
+   * Bytes first, document second — the same ordering rule the store uses
+   * internally. A crash between them leaves an asset whose bytes exist and
+   * which nothing references; the reverse would leave a reference to nothing.
+   */
+  function assetsUnavailable(): OverlayApiError {
+    return new OverlayApiError(
+      501,
+      'ASSETS_NOT_CONFIGURED',
+      'this overlay API was created without an `assetStore`, so branch-local assets are not ' +
+        'available here (PRD §24.3). Nothing was stored and nothing was sent to Sanity.',
+    )
+  }
+
+  /** §24.3 step 5, as a transaction, so the asset is an ordinary overlay document. */
+  async function commitAssetDocument(document: SanityDocument): Promise<void> {
+    /* Already present — the same bytes under a second filename — so there is
+     * nothing to write and nothing to announce. */
+    if (state.documents[document._id] !== undefined) return
+
+    const idempotencyKey = `asset:${document._id}`
+    if ((await store.getTransaction(overlayId, {idempotencyKey})) !== null) return
+
+    const applied = applyTransaction(state, [{type: 'create', document}], {
+      transactionId: nextTransactionId(),
+      idempotencyKey,
+      actor: defaultActor,
+      now,
+    })
+    const records = applied.transaction.affectedDocumentIds
+      .map((logicalId) => applied.state.documents[logicalId])
+      .filter((record): record is OverlayDocumentRecord => record !== undefined)
+
+    const stored = await store.commitTransaction(overlayId, {
+      idempotencyKey,
+      actor: defaultActor,
+      mutations: [{type: 'create', document}],
+      records,
+    })
+    state = {...applied.state, revision: stored.manifest.revision}
+  }
+
+  async function handleAssetRequest(request: Request): Promise<Response | null> {
+    const route = assetRouteOf(request)
+    if (route === null) return null
+
+    const assetStore = options.assetStore
+    const basePath = assetBasePathFor(request)
+
+    if (route.kind === 'upload') {
+      if (request.method !== 'POST') {
+        return json(request, 405, {
+          ok: false,
+          error: {code: 'METHOD_NOT_ALLOWED', message: 'the upload route accepts POST'},
+        })
+      }
+      try {
+        /* BEFORE the body is read, so a forged request costs the server nothing. */
+        assertUploadIsNotForged(request, allowedOrigins)
+        if (assetStore === undefined) throw assetsUnavailable()
+
+        const declared = request.headers.get('content-length')
+        if (declared !== null && Number(declared) > MAX_ASSET_BYTES) {
+          throw new OverlayApiError(413, 'PAYLOAD_TOO_LARGE', 'asset body is too large')
+        }
+        const bytes = new Uint8Array(await request.arrayBuffer())
+        if (bytes.byteLength > MAX_ASSET_BYTES) {
+          throw new OverlayApiError(413, 'PAYLOAD_TOO_LARGE', 'asset body is too large')
+        }
+
+        const contentType = (request.headers.get('content-type') ?? '').split(';')[0]!.trim()
+        /* Serialised with `/commit`: the upload ends in a transaction, and two
+         * transactions racing on the manifest is the one thing the mutex exists
+         * to stop. `put` is inside the critical section too, so a crash cannot
+         * leave a blob the document step never got to name. */
+        const result = await enqueue(async () => {
+          const put = await putUploadedAsset(
+            {assetStore, overlayId},
+            {
+              bytes,
+              ...(uploadFilenameFrom(request) === undefined
+                ? {}
+                : {filename: uploadFilenameFrom(request)}),
+              ...(contentType === '' ? {} : {contentType}),
+              actor: defaultActor,
+            },
+          )
+          await commitAssetDocument(withUrl(put.document, basePath))
+          return put
+        })
+
+        emit('document.changed', {
+          overlayId,
+          revision: state.revision,
+          documentIds: [result.record.assetDocumentId],
+          origin: 'commit',
+          projection: 'current',
+        })
+        return json(request, 200, uploadResponseBody(result, overlayId, basePath))
+      } catch (error) {
+        return failure(request, error, 'asset upload')
+      }
+    }
+
+    /* Delivery. `GET`/`HEAD` only; the responder itself answers 405 otherwise. */
+    if (assetStore === undefined) {
+      return failure(request, assetsUnavailable(), 'asset delivery')
+    }
+
+    try {
+      const delivered = await deliverAsset({assetStore, overlayId}, request)
+      if (delivered !== null && delivered.status !== 404) {
+        return new Response(delivered.body === null ? null : (delivered.body as BodyInit), {
+          status: delivered.status,
+          headers: {...corsHeaders(request), ...delivered.headers},
+        })
+      }
+
+      /*
+       * §24.1 — an asset this branch does not hold is Sanity's, and Sanity's
+       * CDN is where it lives. Only the CDN-shaped routes fall through: the
+       * `<mount>/assets/<id>` route is this overlay's own namespace and a miss
+       * there is a genuine 404.
+       */
+      if (route.kind === 'cdn-fallthrough' && (request.method === 'GET' || request.method === 'HEAD')) {
+        const location = cdnFallthroughLocation(request)
+        if (location !== null) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              ...corsHeaders(request),
+              location,
+              'x-overlay-asset': 'base',
+            },
+          })
+        }
+      }
+
+      if (delivered !== null) {
+        return new Response(null, {
+          status: delivered.status,
+          headers: {...corsHeaders(request), ...delivered.headers},
+        })
+      }
+      return json(request, 404, {
+        ok: false,
+        error: {
+          code: 'NOT_FOUND',
+          message: `${request.url} is not a branch asset this overlay can serve`,
+        },
+      })
+    } catch (error) {
+      return failure(request, error, 'asset delivery')
+    }
+  }
+
   async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const route = routeOf(url.pathname)
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, {status: 204, headers: corsHeaders(request)})
+      return new Response(null, {
+        status: 204,
+        headers: {
+          ...corsHeaders(request),
+          /* The upload's custom header must survive the preflight, or the
+           * control above turns into a control that blocks the only caller. */
+          ...(corsHeaders(request)['access-control-allow-headers'] === undefined
+            ? {}
+            : {
+                'access-control-allow-headers': `content-type, ${ASSET_UPLOAD_HEADER}, x-overlay-asset-filename`,
+              }),
+        },
+      })
     }
+
+    /* Assets are matched FIRST: `routeOf` reads only the last path segment, and
+     * an asset ID is not one of its names, so `/assets/<id>` would otherwise
+     * fall straight through to the 404 below. */
+    const assetResponse = await handleAssetRequest(request)
+    if (assetResponse !== null) return assetResponse
 
     if (request.method === 'GET' && route === 'health') {
       return json(request, 200, {ok: true, overlayId, revision: state.revision})

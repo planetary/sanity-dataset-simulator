@@ -23,6 +23,17 @@ export type OverlayApiErrorCode =
   /** A state-changing request came from an origin this API does not grant (403). */
   | 'FORBIDDEN_ORIGIN'
   | 'NOT_FOUND'
+  /**
+   * A rebase arrived without the CURRENT base for a document in scope (400).
+   *
+   * Its own code rather than `INVALID_REQUEST` because the caller's fix is
+   * neither a header nor a malformed field: it is a READ they have to perform
+   * first. §16.1 keeps base fetching out of core and out of this API, so only
+   * the party holding a Sanity credential can state the base — and a client that
+   * cannot tell this apart from a bad payload will retry the same request
+   * forever.
+   */
+  | 'BASE_REQUIRED'
   | 'INTERNAL'
 
 export class OverlayApiError extends Error {

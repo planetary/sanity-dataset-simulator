@@ -140,6 +140,18 @@ export interface OverlayActionControllerOptions {
   rebaseMode?: StudioRebaseMode
   /** §28.1 — require no hard conflict before a checkpoint. */
   requireCleanConflicts?: boolean
+  /**
+   * The CURRENT base for the documents a rebase would touch (§16.1, §17).
+   *
+   * ABSENT MEANS "this Studio cannot state the base", and the rebase action then
+   * DISABLES ITSELF WITH A REASON rather than sending an operation the API would
+   * have to guess an ancestor for. §28.5 recomputes against the base as it
+   * stands now; an overlay API with no Sanity credential cannot fetch it, and a
+   * rebase against an assumed-unchanged base reports success for something that
+   * never happened — §5.5's silent approximation, in the one place it is least
+   * recoverable.
+   */
+  baseDocuments?: (logicalIds: readonly string[]) => readonly unknown[]
   actor?: unknown
   /** Monotonic counter for idempotency keys; injected so tests are deterministic. */
   now?: () => number
@@ -189,13 +201,17 @@ export function createOverlayActionController(
   const documents = (): readonly OverlayHydrationDocument[] => unwrap(options.documents)
   const conflicts = (): OverlayConflictReport => unwrap(options.conflicts)
 
-  async function send(command: OverlayOperationCommand): Promise<boolean> {
+  async function send(
+    command: OverlayOperationCommand,
+    baseDocuments?: readonly unknown[],
+  ): Promise<boolean> {
     setState({busy: true, error: undefined, result: undefined})
     const result = await options.transport.operation({
       kind: command.kind,
       payload: command,
       idempotencyKey: `studio-${command.kind}-${clock()}`,
       ...(options.actor === undefined ? {} : {actor: options.actor}),
+      ...(baseDocuments === undefined ? {} : {baseDocuments: [...baseDocuments]}),
     })
 
     if (result.outcome !== 'ok') {
@@ -232,8 +248,42 @@ export function createOverlayActionController(
     }
 
     await options.refresh()
-    setState({busy: false, dialogOpen: false, result: `${command.kind} applied`})
+    setState({busy: false, dialogOpen: false, result: outcomeMessage(command, result.body)})
     return true
+  }
+
+  /**
+   * What actually happened, in the operator's terms.
+   *
+   * "checkpoint applied" told an editor nothing they could act on, and a
+   * checkpoint's whole purpose is a set of files somebody now has to commit. So
+   * the answer names the directory the overlay API says it wrote to — and says
+   * out loud when §13.1's `manifest.checkpoint` marker was NOT stamped, because
+   * a checkpoint that CI will still count as "never checkpointed" is a different
+   * outcome from one that will not (§29.6).
+   */
+  function outcomeMessage(command: OverlayOperationCommand, body: unknown): string {
+    if (command.kind !== 'checkpoint') return `${command.kind} applied`
+    const report =
+      typeof body === 'object' && body !== null
+        ? ((body as Record<string, unknown>).checkpoint as Record<string, unknown> | undefined)
+        : undefined
+    if (report === undefined || typeof report.dir !== 'string') {
+      return 'checkpoint applied, but the overlay API did not say where it wrote it'
+    }
+    const files = Array.isArray(report.files) ? report.files.length : 0
+    const marker =
+      report.manifestMarked === true
+        ? ''
+        : ` The manifest checkpoint marker was not stamped: ${
+            typeof report.manifestMarkerReason === 'string'
+              ? report.manifestMarkerReason
+              : 'no reason given'
+          }`
+    return (
+      `Checkpoint written to ${report.dir} (${files} file${files === 1 ? '' : 's'}). ` +
+      `Commit that tree to Git.${marker}`
+    )
   }
 
   /* ---------------------------------------------------------------- *
@@ -254,6 +304,34 @@ export function createOverlayActionController(
     }
 
     const loss: OperationLoss = plan.ok ? plan.loss : plan.loss
+
+    /* §16.1 / §17: the merge is recomputed against the base AS IT STANDS NOW,
+     * and only this Studio can say what that is. If it has not read the base for
+     * every document in scope, the action refuses HERE — visibly disabled, with
+     * the reason in its tooltip — rather than sending an operation the API would
+     * answer with a 400 the editor never sees. */
+    const scoped = loss.documents.map((entry) => entry.logicalId)
+    const bases = options.baseDocuments?.(scoped) ?? []
+    const covered = new Set<string>()
+    for (const document of bases) {
+      const id = (document as {_id?: unknown})?._id
+      if (typeof id === 'string') covered.add(toPublishedId(id))
+    }
+    const uncovered = scoped.filter((logicalId) => !covered.has(logicalId))
+    if (uncovered.length > 0) {
+      return {
+        label: LABELS.rebase,
+        title:
+          `This Studio has not read the current base for ${uncovered.join(', ')}, so it cannot ` +
+          'rebase onto it. PRD §16.1 keeps base fetching out of the overlay, so the editor is ' +
+          'the only party that can state the current base — open the document so its base ' +
+          'snapshot is fetched, then try again. Rebasing against an assumed-unchanged base ' +
+          'would report a rebase that never happened.',
+        disabled: true,
+        dialog: false,
+      }
+    }
+
     const message =
       `${loss.summary}\n\n` +
       loss.documents
@@ -289,7 +367,13 @@ export function createOverlayActionController(
                   setState({dialogOpen: false, error: confirmed.reason})
                   return
                 }
-                await send(confirmed.command)
+                /* Re-read rather than reusing `bases` from the render: a base
+                 * snapshot that arrived while the confirmation was open is the
+                 * one §17 means by "current". */
+                await send(
+                  confirmed.command,
+                  options.baseDocuments?.(confirmed.command.documentIds) ?? [],
+                )
               },
               onCancel: () => setState({dialogOpen: false}),
             }

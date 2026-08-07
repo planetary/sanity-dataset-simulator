@@ -12,7 +12,7 @@
  */
 
 import {createOverlayEcho, type OverlayEcho} from './client/echo'
-import {wrapWithOverlay, type OverlayWriteRecord} from './client/facade'
+import {seedOverlayDocuments, wrapWithOverlay, type OverlayWriteRecord} from './client/facade'
 import {createStudioReader, type StudioReadRecord} from './client/reads'
 import {overlaySourceFromBranch} from './client/readSource'
 import {
@@ -76,6 +76,21 @@ export interface OverlayRuntime {
    * so the two cannot disagree.
    */
   documents(): readonly OverlayHydrationDocument[]
+  /**
+   * The CURRENT BASE for a set of logical ids, as this session actually read it.
+   *
+   * §17 recomputes the merge against the base as it stands now, and §16.1 keeps
+   * base fetching out of core and out of the overlay API — the Studio holds the
+   * only Sanity credential in the topology, so it is the only party that can
+   * state it. The source is the echo's revision store, which records the raw
+   * base body of the one authoritative read Studio performs (the pair listener's
+   * `getDocuments` snapshot) BEFORE the overlay substitutes anything into it.
+   *
+   * A document this session has never opened yields NOTHING, deliberately. An
+   * empty answer is what makes the rebase action disable itself with a reason
+   * instead of asking the API to rebase against an ancestor nobody checked.
+   */
+  baseDocuments(logicalIds: readonly string[]): Rec[]
   subscribe(listener: () => void): () => void
   /** Poll the overlay API once, updating connection, revision and conflicts. */
   refresh(): Promise<void>
@@ -141,9 +156,16 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
    * so the read view and the write echo agree by construction rather than by a
    * second translation that could drift.
    *
-   * The echo's own document map is NOT this: it stores `null` as a deletion of
-   * its own entry, which spells "the branch has no opinion" — the exact reading
-   * that would make every tombstoned document reappear in a list pane.
+   * The echo's own document map is NOT this, and the two answer different
+   * questions: this one answers GROQ (membership plus bodies, projected through
+   * the caller's query), the echo's answers document-BY-ID. `noteHydration`
+   * feeds both from the same array, because feeding only one is exactly how the
+   * list pane and the edit form came to disagree.
+   *
+   * The echo stores `null` as a deletion of its own entry — "the branch has no
+   * opinion, use base" — so a TOMBSTONE cannot be spelled that way; it travels
+   * on `setOverlaySuppressed` instead. Reading the two as the same thing is what
+   * made a deleted document reappear.
    * ---------------------------------------------------------------- */
   const hydration = new Map<string, OverlayHydrationDocument>()
   let overlayView = overlaySourceFromBranch([])
@@ -156,7 +178,17 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
       hydration.set(document.logicalId, document)
       changed = true
     }
-    if (changed) overlayViewStale = true
+    if (!changed) return
+    overlayViewStale = true
+    /* THE SECOND READ PATH. `overlaySource()` above answers GROQ — the list
+     * panes, previews, reference inputs. The document pair listener does NOT go
+     * through GROQ: sanity 6.8.0 fetches the form's opening value with
+     * `client.observable.getDocuments([publishedId, draftId])`
+     * (`lib/datastores-DqFH7RLd.js:1720`), which the facade answers from the
+     * ECHO's overlay-document map. Feeding only one of the two is how the list
+     * pane and the edit form came to disagree about the same document, with the
+     * form showing base content the editor then unknowingly merged against. */
+    seedOverlayDocuments(echo, documents)
   }
 
   function overlaySource(): ReturnType<typeof overlaySourceFromBranch> {
@@ -276,6 +308,25 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
       [...hydration.values()].sort((left, right) =>
         left.logicalId < right.logicalId ? -1 : left.logicalId > right.logicalId ? 1 : 0,
       ),
+    baseDocuments: (logicalIds) => {
+      const out: Rec[] = []
+      const seen = new Set<string>()
+      for (const logicalId of logicalIds) {
+        /* Both addresses: §17.1's ancestor may be the base PUBLISHED snapshot
+         * even when the branch edit lives on the draft. */
+        for (const address of [logicalId, `drafts.${logicalId}`]) {
+          if (seen.has(address)) continue
+          seen.add(address)
+          const docState = echo.getDocState(address)
+          /* `synthetic` marks a revision this overlay minted (§13.9). Sending one
+           * back as "the current base" would make the overlay its own ancestor. */
+          if (docState?.doc !== undefined && docState.synthetic !== true) {
+            out.push(docState.doc as Rec)
+          }
+        }
+      }
+      return out
+    },
     branch: () => {
       const view = overlaySource()
       return {

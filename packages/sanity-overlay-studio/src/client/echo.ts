@@ -113,6 +113,19 @@ export interface OverlayEcho {
   revisions(): Record<string, string | undefined>
   setOverlayDocument(id: string, document: Rec | null): void
   getOverlayDocument(id: string): Rec | undefined
+  /**
+   * Mark (or clear) an address the branch has TOMBSTONED — §18.6 delete, §18.7
+   * discard-draft, §18.5 unpublish.
+   *
+   * A separate channel from {@link OverlayEcho.setOverlayDocument} because the
+   * two say different things and only one of them can be spelled as a body.
+   * "The branch holds no body for this address" (no local edit yet) must fall
+   * through to base; "the branch has removed this address" must not. Collapsing
+   * them onto `null` — which is what storing `null` as *absence* did — put a
+   * document the editor had deleted back in front of them, silently.
+   */
+  setOverlaySuppressed(id: string, suppressed: boolean): void
+  isOverlaySuppressed(id: string): boolean
   subscribe(
     ids: readonly string[],
     handler: (event: OverlayMutationEvent) => void,
@@ -305,6 +318,8 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
   const docs = new Map<string, OverlayDocState>()
   /** Bodies the overlay API materialized, keyed as Studio addresses them. */
   const overlayDocs = new Map<string, Rec>()
+  /** Addresses the branch has tombstoned — see {@link OverlayEcho.setOverlaySuppressed}. */
+  const overlaySuppressed = new Set<string>()
   const listeners = new Set<{
     ids: Set<string>
     handler: (event: OverlayMutationEvent) => void
@@ -937,6 +952,11 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       else overlayDocs.set(id, document)
     },
     getOverlayDocument: (id) => overlayDocs.get(id),
+    setOverlaySuppressed: (id, suppressed) => {
+      if (suppressed) overlaySuppressed.add(id)
+      else overlaySuppressed.delete(id)
+    },
+    isOverlaySuppressed: (id) => overlaySuppressed.has(id),
     subscribe,
     subscriberCount: () => listeners.size,
     nextTransactionId: () => {

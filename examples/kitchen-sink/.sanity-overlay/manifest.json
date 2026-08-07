@@ -17,19 +17,36 @@
   },
   "documentHeads": {
     "article-01": {
-      "checksum": "7f8cf8d3693fc44ea2965b196bf9bf4bab0b2670406f6f2f6cbbfffc44e5036e",
+      "checksum": "5e0e709b88a3a97f6476722739fd879159ee5d8413c4399db4d41dd710d1e62f",
       "hasConflict": false,
       "hasDraft": true,
       "hasPublished": false,
       "logicalId": "article-01",
-      "runtimeRevision": "overlay.1.b46f2008f1eb",
+      "runtimeRevision": "overlay.7.e9cf21505d7a",
       "schemaType": "article",
       "state": "modified",
-      "storageRef": ".runtime/revisions/article-01/7f8cf8d3693fc44ea2965b196bf9bf4bab0b2670406f6f2f6cbbfffc44e5036e.json",
-      "updatedAt": "2026-08-04T22:42:12.812Z",
+      "storageRef": ".runtime/revisions/article-01/5e0e709b88a3a97f6476722739fd879159ee5d8413c4399db4d41dd710d1e62f.json",
+      "updatedAt": "2026-08-07T13:08:11.805Z",
       "updatedBy": {
-        "displayName": "Studio (spike A local echo)",
-        "id": "spike-a-studio",
+        "displayName": "Overlay local API",
+        "id": "overlay-local-api",
+        "type": "user"
+      }
+    },
+    "author-2": {
+      "checksum": "9f451f612c5738757f697fea81ebccd69d709f2e3c6f0212dbbb5a4e726cbad7",
+      "hasConflict": false,
+      "hasDraft": true,
+      "hasPublished": false,
+      "logicalId": "author-2",
+      "runtimeRevision": "overlay.6.1442e9cf263d",
+      "schemaType": "author",
+      "state": "modified",
+      "storageRef": ".runtime/revisions/author-2/9f451f612c5738757f697fea81ebccd69d709f2e3c6f0212dbbb5a4e726cbad7.json",
+      "updatedAt": "2026-08-07T03:26:21.941Z",
+      "updatedBy": {
+        "displayName": "Overlay local API",
+        "id": "overlay-local-api",
         "type": "user"
       }
     },
@@ -53,17 +70,17 @@
   },
   "formatVersion": 1,
   "overlayId": "spike-a-local-echo",
-  "revision": 2,
+  "revision": 7,
   "source": {
     "branch": "spike/a-local-echo",
     "repositoryId": "github:planetary/sanity-branch-overlay"
   },
   "status": "active",
-  "transactionHead": "tx-20260805134723836-000000-9c3df183",
-  "updatedAt": "2026-08-05T13:47:23.836Z",
+  "transactionHead": "tx-20260807130811807-000003-284d31d9",
+  "updatedAt": "2026-08-07T13:08:11.807Z",
   "updatedBy": {
-    "displayName": "Local Dev (Mode 2 origin)",
-    "id": "local-dev",
+    "displayName": "Overlay local API",
+    "id": "overlay-local-api",
     "type": "user"
   }
 }
