@@ -218,6 +218,27 @@ export type {OverlayTransport} from './client/transport'
 export {wrapWithOverlay} from './client/facade'
 export type {OverlayWriteRecord} from './client/facade'
 
+/* Branch-local assets (PRD §24). `assetOriginFor` is exported alongside the
+ * uploader because the two are one decision: where the bytes go, and where the
+ * image pipeline is told to look for them. A host that mounts the overlay API
+ * under a path prefix needs the refusal it returns, not a guess. */
+export {
+  DEFAULT_UPLOAD_TIMEOUT_MS,
+  OVERLAY_ASSET_TYPES,
+  assetOriginFor,
+  createOverlayAssetUploader,
+  uploadContentTypeOf,
+  uploadFilenameOf,
+} from './client/assets'
+export type {
+  CreateOverlayAssetUploaderOptions,
+  OverlayAssetOrigin,
+  OverlayAssetType,
+  OverlayAssetUploadOutcome,
+  OverlayAssetUploadRequest,
+  OverlayAssetUploader,
+} from './client/assets'
+
 /* The overlay-aware GROQ read path (PRD §22). Exported so a host can build its
  * own reader — the same three outcomes, its own policy for strict mode. */
 export {createStudioReader, OverlayReadRefusedError} from './client/reads'

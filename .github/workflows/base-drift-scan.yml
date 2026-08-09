@@ -1,0 +1,89 @@
+name: base drift scan
+
+# PRD §37 Phase 6:
+#   - "Schedule recurring base drift scan for open overlays."
+#   - "Refresh PR status when drift changes conflicts."
+#
+# PHASE_6_CI_DISCHARGE (packages/sanity-overlay-cli/src/ci/checks.ts) labels both
+# of these `configuration` rather than `ci-check`, and names THIS file and the
+# job id below. That label is load-bearing and is the reason this workflow
+# exists as a separate file: the SCAN is code (`baseDriftCheck`) and the
+# DECISION is code (`planCommitStatus`, a pure function over the previous and
+# current conflict summaries), both tested against an injected client with no
+# network. The SCHEDULE has no logic to test, because there is none -- it is the
+# cron line below. test/ci-repo-gates.test.ts asserts that this file exists and
+# that its cadence is the PRD §16.6 default of every 6 hours, so the one thing
+# `configuration` can be checked for is checked.
+#
+# ── WHAT THIS JOB HONESTLY CANNOT DO IN *THIS* REPOSITORY ────────────────────
+#
+# `base-drift` re-reads the CURRENT base and re-runs the §17.3 merge per touched
+# document. PRD §16.6 requires the scan to "treat direct base reads as
+# authoritative". In fs mode the CLI has no Content Lake connection, so the base
+# must be supplied as `--base <file.json>` -- and this repository commits no base
+# snapshot for examples/kitchen-sink. There is nothing to compare against.
+#
+# So `--allow-skip base-drift` is passed, and the run prints the skip and its
+# reason rather than a green tick that means nothing. It is NOT `--check`ed
+# silently and it is NOT quietly dropped: the report names the check, says it
+# was skipped, and says why, in the log and in the job summary.
+#
+# THIS IS THE HONEST STATE OF THE SCAN: the scheduling, the scan code and the
+# status-refresh decision all exist and are tested; the recurring run against a
+# live base does not, and cannot, until a project points this at one. A
+# consuming project makes it real by adding, to the step below:
+#
+#     --base <path/to/base-snapshot.json>
+#
+# and REMOVING `--allow-skip base-drift`. Nothing else changes.
+
+on:
+  schedule:
+    # PRD §16.6 default cadence: every 6 hours. Asserted by
+    # test/ci-repo-gates.test.ts, so this expression cannot drift from the spec
+    # without something going red.
+    - cron: '0 */6 * * *'
+  # So the scan can be run on demand while the schedule is the routine path.
+  # Deliberately NOT `pull_request`: this workflow is allowed to hold a secret
+  # (see the `workflow-secrets` gate in ci.yml), and a fork-reachable trigger
+  # would put that secret one pull request away from fork-authored code.
+  workflow_dispatch:
+
+concurrency:
+  group: base-drift-scan
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Refreshing the commit status when drift changes the conflict summary is the
+  # second checklist line this file discharges.
+  statuses: write
+  pull-requests: write
+
+jobs:
+  base-drift-scan:
+    name: base drift scan (PRD §16.6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # conflict-summary is NOT allow-skipped: it runs against the committed
+      # overlay and can genuinely fail, so this job is not purely decorative
+      # while the drift half waits on a base snapshot.
+      - name: recurring drift and conflict scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          node packages/sanity-overlay-cli/bin/sanity-overlay.mjs ci
+          --root examples/kitchen-sink
+          --check conflict-summary
+          --check base-drift
+          --allow-skip base-drift

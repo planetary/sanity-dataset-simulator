@@ -4,7 +4,7 @@
  *
  * ## Durability model
  *
- * Two rules give the store crash safety without a lock file or a journal.
+ * Three rules give the store crash safety and multi-writer safety.
  *
  * 1. **Every write is temp-file + rename** (§14.3 MUST). A reader therefore never
  *    observes a partially written file; it sees either the old bytes or the new
@@ -18,8 +18,21 @@
  *    A crash therefore lands in one of three states, none of them corrupt:
  *    before the manifest write → unreachable artifacts only, reclaimed by
  *    {@link FsOverlayStore.collectOrphans} (§15.3, §34.8); after the manifest
- *    write but before the projections → stale `intent.json`, rebuilt by
+ *    write but before the projections → stale or absent `intent.json`, rebuilt by
  *    {@link FsOverlayStore.revalidate}; after everything → committed.
+ * 3. **One writer at a time, across processes** (§35.7 "Concurrent stale write
+ *    rejection"). Rules 1 and 2 make a *crash* safe; they do nothing about two
+ *    writers, because `read manifest → check precondition → rename manifest` is a
+ *    read-modify-write and rename is only atomic with respect to *itself*. Two
+ *    stores on one root — two Studio tabs, a CLI beside a dev server, two
+ *    invocations on one volume — both passed the precondition and both renamed,
+ *    and the loser's head vanished from the manifest while its revision file
+ *    survived as an orphan. Every manifest-mutating entry point therefore runs
+ *    inside {@link FsOverlayStore.withOverlayLock}, an exclusive `.locks/` file
+ *    lock (§14.1 reserves the directory), and `#writeManifest` re-reads the
+ *    manifest immediately before its rename so a writer that never took the lock
+ *    — an agent editing files directly, per §14.4 — still cannot be overwritten
+ *    silently.
  *
  * ## Direct edits
  *
@@ -40,6 +53,7 @@
  */
 import {randomUUID} from 'node:crypto'
 import {mkdir, open, readFile, readdir, rename, rm, stat, writeFile} from 'node:fs/promises'
+import {hostname} from 'node:os'
 import {dirname, join, resolve as resolvePath} from 'node:path'
 import {
   CHECKPOINT_CHECKSUMS_FILE,
@@ -104,6 +118,7 @@ import type {
   OverlayResettableStore,
   OverlayRetentionPolicy,
   OverlayRevalidationFailure,
+  OverlayArtifactKind,
   OverlayRevalidationReport,
   OverlayStore,
   OverlayTransactionSelector,
@@ -123,6 +138,7 @@ import {
   OverlayNotFoundError,
   OverlayRetentionActiveError,
   OverlayStoreCorruptError,
+  OverlayStoreError,
   OverlayWriteConflictError,
 } from './errors'
 import {
@@ -141,6 +157,7 @@ import {
   GITATTRIBUTES_FILE,
   GITIGNORE_CONTENT,
   GITIGNORE_FILE,
+  LOCKS_DIR,
   OverlayLayout,
   README_CONTENT,
   README_FILE,
@@ -151,6 +168,13 @@ import {
 /* ------------------------------------------------------------------ *
  * Options
  * ------------------------------------------------------------------ */
+
+/**
+ * The writer lock, inside the `.locks/` directory PRD §14.1 reserves and
+ * `.gitignore`s. One lock for the whole overlay rather than one per document:
+ * the contended resource is `manifest.json`, which every commit rewrites.
+ */
+export const OVERLAY_LOCK_FILE = 'overlay.lock'
 
 export interface FsOverlayStoreHooks {
   /**
@@ -186,6 +210,39 @@ export interface FsOverlayStoreOptions {
    * state needs. Turn it on where the overlay is the system of record.
    */
   fsync?: boolean
+  /**
+   * How long a writer waits for the `.locks/` critical section before giving up
+   * with a retryable `OVERLAY_STORE_UNAVAILABLE`.
+   *
+   * A bound rather than an unbounded wait: a caller that can never proceed must
+   * be told so, not hang. Default 10 s — far longer than any commit, far shorter
+   * than a request timeout.
+   */
+  lockTimeoutMs?: number
+  /**
+   * Age at which a held lock is treated as abandoned and broken.
+   *
+   * A process killed inside its critical section cannot release its own lock
+   * (that is the definition of `SIGKILL`), so without this the overlay would be
+   * wedged until a human deleted a file. The window must exceed the longest
+   * legitimate critical section by a wide margin: breaking a live holder's lock
+   * reintroduces exactly the lost update the lock exists to prevent. Default 30 s.
+   *
+   * The age check is only the fallback. A lock written by a process on THIS host
+   * is probed by pid first, so the common case — a killed dev server, a `^C`d
+   * CLI — is recovered immediately and exactly rather than after a timeout.
+   */
+  staleLockMs?: number
+  /**
+   * Age at which `collectOrphans` reclaims a `.tmp-` staging file.
+   *
+   * A process killed mid-write cannot unlink its own staging file, so real
+   * crashes leave litter that nothing else reclaims. It must never be reclaimed
+   * eagerly: a file young enough to belong to a writer that is still running
+   * would turn a healthy commit into an `ENOENT` at its rename — cleanup causing
+   * the corruption it exists to prevent. Default 60 s.
+   */
+  staleTempMs?: number
 }
 
 /* ------------------------------------------------------------------ *
@@ -223,6 +280,50 @@ export interface ImportCheckpointToStoreOptions {
    */
   onDivergence?: 'repair' | 'reject'
   expectOverlayId?: string
+}
+
+/** A regenerable artifact that could not be written. Never a reason to fail a commit. */
+export interface OverlayProjectionFailure {
+  /** Path relative to `.sanity-overlay/`. */
+  ref: string
+  logicalId?: string
+  /** `errno` code where the OS supplied one. */
+  code?: string
+  message: string
+}
+
+/**
+ * `commitTransaction`'s result, widened with what happened AFTER the commit point.
+ *
+ * PRD §33 "Local disk write fails" pairs an OS error with a *save failure
+ * banner*, and a banner is only honest if the save really did not happen. Once
+ * `manifest.json` has been renamed the transaction is durable and visible: a
+ * later `EACCES` writing `documents/<id>/intent.json` has not un-committed it,
+ * and reporting that as a failed save would tell the editor to retry work that
+ * is already saved — which the idempotency pointer would then refuse to redo.
+ *
+ * So the store draws the line at the commit point. Everything before it can
+ * fail the call; nothing after it does. What did fail is named here instead, and
+ * every artifact after the commit point is regenerable — `revalidate` and the
+ * document read path rebuild a missing `intent.json` from the head's immutable
+ * revision (§34.2: deleting a local file is not a content change).
+ */
+export interface FsOverlayCommitResult extends OverlayCommitResult {
+  /** Empty on a fully clean commit. */
+  projectionFailures: OverlayProjectionFailure[]
+}
+
+/**
+ * `revalidate`'s report, widened with the projections it rebuilt.
+ *
+ * A missing `intent.json` behind a live manifest head is recoverable — the head
+ * names an immutable revision and the intent is a pure function of it — so it is
+ * repaired rather than reported as corruption. It is still *named*: silent
+ * self-healing would hide a disk that is quietly failing every projection write.
+ */
+export interface FsOverlayRevalidationReport extends OverlayRevalidationReport {
+  /** Paths, relative to `.sanity-overlay/`, rebuilt from a manifest head. */
+  regenerated: string[]
 }
 
 export interface FsCheckpointImportResult {
@@ -398,7 +499,30 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   readonly #now: OverlayClock
   readonly #hooks: FsOverlayStoreHooks
   readonly #fsync: boolean
+  readonly #lockTimeoutMs: number
+  readonly #staleLockMs: number
+  readonly #staleTempMs: number
   readonly #newTransactionId: NonNullable<FsOverlayStoreOptions['newTransactionId']>
+
+  /**
+   * In-process serialization of the critical section.
+   *
+   * The `.locks/` file excludes other PROCESSES; it cannot exclude two concurrent
+   * calls on one store instance, because `open(…, 'wx')` from the process that
+   * already holds the lock fails with `EEXIST` and the second caller would spin
+   * against itself until it timed out. This queue makes same-instance callers
+   * wait their turn instead. Rejections are swallowed here and only here: the
+   * chain is a scheduler, and the caller still receives its own error.
+   */
+  #critical: Promise<unknown> = Promise.resolve()
+  /**
+   * Revision the manifest held when the in-flight critical section read it.
+   *
+   * `#writeManifest` compares this against disk immediately before its rename, so
+   * a manifest that moved underneath an unlocked external writer is refused
+   * rather than clobbered. `null` outside a manifest-mutating call.
+   */
+  #manifestBaseRevision: number | null = null
 
   /** Last valid parse of each canonical file, retained across malformed edits (§14.3). */
   #lastValidManifest: OverlayManifest | null = null
@@ -418,7 +542,149 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     this.#now = options.now
     this.#hooks = options.hooks ?? {}
     this.#fsync = options.fsync ?? false
+    this.#lockTimeoutMs = options.lockTimeoutMs ?? 10_000
+    this.#staleLockMs = options.staleLockMs ?? 30_000
+    this.#staleTempMs = options.staleTempMs ?? 60_000
     this.#newTransactionId = options.newTransactionId ?? defaultTransactionId
+  }
+
+  /* ---------------------------------------------------------------- *
+   * §35.7 "Concurrent stale write rejection" — the writer critical section
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Run `body` as the overlay's only writer, excluding other processes.
+   *
+   * Public because a caller that composes several store calls into one logical
+   * change — read the manifest, decide, then commit — needs the same exclusion
+   * across the whole sequence, and re-deriving it outside the store would produce
+   * a second, differently-shaped lock over the same file.
+   *
+   * Not re-entrant, and deliberately so: a nested acquire would deadlock against
+   * the queue, and making it silently re-entrant would hand the lock to an
+   * unrelated concurrent caller that happened to run while it was held. No store
+   * method calls another locked store method.
+   */
+  async withOverlayLock<T>(body: () => Promise<T>): Promise<T> {
+    const run = this.#critical.then(
+      () => this.#runLocked(body),
+      () => this.#runLocked(body),
+    )
+    this.#critical = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
+  }
+
+  async #runLocked<T>(body: () => Promise<T>): Promise<T> {
+    const release = await this.#acquireLock()
+    this.#manifestBaseRevision = null
+    try {
+      return await body()
+    } finally {
+      this.#manifestBaseRevision = null
+      await release()
+    }
+  }
+
+  /**
+   * Take `.locks/overlay.lock`, waiting for a current holder.
+   *
+   * `open(path, 'wx')` is the primitive: exclusive create is atomic on every
+   * filesystem this runs on, including APFS and the network mounts a shared
+   * volume implies, and unlike an advisory `flock` it survives across processes
+   * that never opened the same descriptor.
+   *
+   * Staleness is measured from the lock file's own mtime with the WALL clock, not
+   * the injected `now`. The injected clock exists so file CONTENT is
+   * deterministic; a test that freezes it must not thereby make every lock look
+   * infinitely old and disable the exclusion under test.
+   */
+  async #acquireLock(): Promise<() => Promise<void>> {
+    const lockPath = this.layout.resolve(LOCKS_DIR, OVERLAY_LOCK_FILE)
+    await mkdir(dirname(lockPath), {recursive: true})
+    const deadline = Date.now() + this.#lockTimeoutMs
+
+    for (;;) {
+      try {
+        const handle = await open(lockPath, 'wx', 0o644)
+        try {
+          await handle.writeFile(
+            serialize({
+              acquiredAt: new Date().toISOString(),
+              host: hostname(),
+              pid: process.pid,
+            }),
+            'utf8',
+          )
+        } finally {
+          await handle.close()
+        }
+        let released = false
+        return async () => {
+          if (released) return
+          released = true
+          await rm(lockPath, {force: true}).catch(() => undefined)
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+
+      const age = await stat(lockPath)
+        .then((stats) => Date.now() - stats.mtimeMs)
+        .catch(() => null)
+      if (age === null) continue /* The holder released between the two calls. */
+      if (age > this.#staleLockMs || (await this.#holderIsGone(lockPath))) {
+        /* An abandoned lock. Removed by path, then retried through `wx`, so two
+         * breakers cannot both conclude they now hold it. */
+        await rm(lockPath, {force: true}).catch(() => undefined)
+        continue
+      }
+      if (Date.now() >= deadline) {
+        throw new OverlayStoreError(
+          'OVERLAY_STORE_UNAVAILABLE',
+          `Another writer has held the overlay lock at ${this.layout.relative(lockPath)} for ${this.#lockTimeoutMs} ms`,
+          {retryable: true, details: {lockPath: this.layout.relative(lockPath), ageMs: age}},
+        )
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+  }
+
+  /**
+   * Is the process that wrote this lock provably no longer running?
+   *
+   * `kill(pid, 0)` sends no signal; it asks the kernel whether the pid exists.
+   * That turns crash recovery from a 30-second guess into an exact answer for
+   * the case that actually happens — a killed dev server, an interrupted CLI,
+   * a test runner torn down mid-commit — which is worth having, because until
+   * the lock is broken the overlay accepts no writes at all.
+   *
+   * Answered only for a lock this host wrote. On a shared volume another host's
+   * pid is meaningless and could collide with a live local one, so those fall
+   * through to the age threshold. `EPERM` counts as ALIVE: the process exists
+   * and merely belongs to another user.
+   */
+  async #holderIsGone(lockPath: string): Promise<boolean> {
+    const read = await readFile(lockPath, 'utf8').catch(() => null)
+    if (read === null) return false
+    let holder: {host?: unknown; pid?: unknown}
+    try {
+      holder = parse(read) as {host?: unknown; pid?: unknown}
+    } catch {
+      /* A lock file that is not parseable was never written by this store, or
+       * was written partially. Age is the only safe judge of it. */
+      return false
+    }
+    if (holder.host !== hostname() || typeof holder.pid !== 'number') return false
+    if (holder.pid === process.pid) return false
+    try {
+      process.kill(holder.pid, 0)
+      return false
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH'
+    }
   }
 
   /* ---------------------------------------------------------------- *
@@ -426,6 +692,10 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
    * ---------------------------------------------------------------- */
 
   async createOverlay(input: CreateOverlayInput): Promise<OverlayManifest> {
+    return this.withOverlayLock(() => this.#createOverlayLocked(input))
+  }
+
+  async #createOverlayLocked(input: CreateOverlayInput): Promise<OverlayManifest> {
     const existing = await this.#readManifestFile()
     if (!existing.missing) {
       const stored = existing.value
@@ -496,6 +766,17 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     expectedRevision: number,
     options: WriteManifestOptions = {},
   ): Promise<OverlayManifest> {
+    return this.withOverlayLock(() =>
+      this.#writeManifestConditionalLocked(overlayId, next, expectedRevision, options),
+    )
+  }
+
+  async #writeManifestConditionalLocked(
+    overlayId: string,
+    next: OverlayManifest,
+    expectedRevision: number,
+    options: WriteManifestOptions,
+  ): Promise<OverlayManifest> {
     const current = await this.#loadManifest()
     this.#assertIdentity(overlayId, current)
 
@@ -528,6 +809,16 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     overlayId: string,
     record: OverlayDocumentRecord,
     options: PutDocumentRevisionOptions = {},
+  ): Promise<OverlayDocumentWriteResult> {
+    return this.withOverlayLock(() =>
+      this.#putDocumentRevisionLocked(overlayId, record, options),
+    )
+  }
+
+  async #putDocumentRevisionLocked(
+    overlayId: string,
+    record: OverlayDocumentRecord,
+    options: PutDocumentRevisionOptions,
   ): Promise<OverlayDocumentWriteResult> {
     const manifest = await this.#loadManifest()
     this.#assertIdentity(overlayId, manifest)
@@ -594,7 +885,14 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   async commitTransaction(
     overlayId: string,
     request: OverlayCommitRequest,
-  ): Promise<OverlayCommitResult> {
+  ): Promise<FsOverlayCommitResult> {
+    return this.withOverlayLock(() => this.#commitTransactionLocked(overlayId, request))
+  }
+
+  async #commitTransactionLocked(
+    overlayId: string,
+    request: OverlayCommitRequest,
+  ): Promise<FsOverlayCommitResult> {
     if (typeof request?.idempotencyKey !== 'string' || request.idempotencyKey.length === 0) {
       throw new OverlayInvalidRequestError(
         'commitTransaction requires a non-empty idempotencyKey (PRD §13.10, §34.6)',
@@ -621,6 +919,7 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
           .filter((head): head is OverlayDocumentHead => head !== undefined)
           .map(clone),
         replayed: true,
+        projectionFailures: [],
       }
     }
 
@@ -697,25 +996,73 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     )
     await this.#writeManifest(next)
 
+    /* ─────────────── PAST THE COMMIT POINT — NOTHING BELOW THROWS ─────────────
+     * The rename above made the transaction durable and visible. Every write
+     * that follows is regenerable, so a failure in one is a degraded projection,
+     * not a failed save, and is reported rather than raised: a caller told
+     * "failed" would retry a commit that already landed, and step 4 would then
+     * replay it away without ever repairing what actually broke.
+     * ───────────────────────────────────────────────────────────────────────── */
+    const projectionFailures: OverlayProjectionFailure[] = []
+
     /* Step 4 — the idempotency pointer. Written after the commit so it can never
      * name an uncommitted transaction; the crash window between the two costs at
      * most one replayed apply of byte-identical content-addressed artifacts. */
-    await this.#writeJson(this.layout.idempotencyPath(request.idempotencyKey), {
-      formatVersion: OVERLAY_FORMAT_VERSION,
-      idempotencyKey: request.idempotencyKey,
-      transactionId,
-      committedAt,
-    })
+    await this.#tolerate(
+      projectionFailures,
+      this.layout.idempotencyPath(request.idempotencyKey),
+      undefined,
+      () =>
+        this.#writeJson(this.layout.idempotencyPath(request.idempotencyKey), {
+          formatVersion: OVERLAY_FORMAT_VERSION,
+          idempotencyKey: request.idempotencyKey,
+          transactionId,
+          committedAt,
+        }),
+    )
 
     /* Step 5 — regenerable projections. */
-    for (const write of writes) await this.#writeProjections(write)
-    for (const id of removed) await this.#removeDocumentArtifacts(id)
+    for (const write of writes) {
+      await this.#tolerate(
+        projectionFailures,
+        this.layout.intentPath(write.logicalId),
+        write.logicalId,
+        () => this.#writeProjections(write),
+      )
+    }
+    for (const id of removed) {
+      await this.#tolerate(projectionFailures, this.layout.documentDir(id), id, () =>
+        this.#removeDocumentArtifacts(id).then(() => undefined),
+      )
+    }
 
     return {
       transaction: clone(transaction),
       manifest: clone(next),
       heads: writes.map((write) => clone(write.head)),
       replayed: false,
+      projectionFailures,
+    }
+  }
+
+  /** Run a post-commit-point write, recording rather than raising any failure. */
+  async #tolerate(
+    into: OverlayProjectionFailure[],
+    path: string,
+    logicalId: string | undefined,
+    write: () => Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await write()
+    } catch (error) {
+      const failure: OverlayProjectionFailure = {
+        ref: this.layout.relative(path),
+        message: (error as Error).message,
+      }
+      if (logicalId !== undefined) failure.logicalId = logicalId
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== undefined) failure.code = code
+      into.push(failure)
     }
   }
 
@@ -862,7 +1209,7 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     if (head === undefined) return null
 
     const record = await this.#readRecordByRef(head.storageRef)
-    const intent = await this.#loadIntent(normalized)
+    const intent = await this.#loadIntent(normalized, head)
     const snapshotRef = intent?.base.snapshotRef
     const baseSnapshot =
       snapshotRef === undefined ? null : await this.#readSnapshot(snapshotRef)
@@ -892,7 +1239,10 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
 
     for (const logicalId of Object.keys(manifest.documentHeads).sort()) {
       const head = manifest.documentHeads[logicalId]!
-      const intent = await this.#loadIntent(logicalId)
+      /* An absent intent is regenerated from the head's immutable revision
+       * before it is called corruption: a projection that failed to write, or a
+       * file a human deleted, is recoverable and must not block an export. */
+      const intent = await this.#loadIntent(logicalId, head)
       if (intent === null) {
         throw new OverlayStoreCorruptError(
           this.layout.relative(this.layout.intentPath(logicalId)),
@@ -937,6 +1287,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   async importCanonical(
     bundle: OverlayCanonicalBundle,
     options: ImportCanonicalOptions = {},
+  ): Promise<ImportCanonicalResult> {
+    return this.withOverlayLock(() => this.#importCanonicalLocked(bundle, options))
+  }
+
+  async #importCanonicalLocked(
+    bundle: OverlayCanonicalBundle,
+    options: ImportCanonicalOptions,
   ): Promise<ImportCanonicalResult> {
     assertFormatVersion(bundle?.formatVersion)
     if (options.verifyChecksum !== false) {
@@ -1087,6 +1444,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     dir: string,
     options: ImportCheckpointToStoreOptions = {},
   ): Promise<FsCheckpointImportResult> {
+    return this.withOverlayLock(() => this.#importCheckpointLocked(dir, options))
+  }
+
+  async #importCheckpointLocked(
+    dir: string,
+    options: ImportCheckpointToStoreOptions,
+  ): Promise<FsCheckpointImportResult> {
     const source = resolvePath(dir)
     const files = await readCheckpointDir(source)
     const parsed = parseCheckpoint(files, {
@@ -1146,6 +1510,10 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
    * ---------------------------------------------------------------- */
 
   async markClosed(overlayId: string, options: MarkClosedOptions = {}): Promise<OverlayManifest> {
+    return this.withOverlayLock(() => this.#markClosedLocked(overlayId, options))
+  }
+
+  async #markClosedLocked(overlayId: string, options: MarkClosedOptions): Promise<OverlayManifest> {
     const manifest = await this.#loadManifest()
     this.#assertIdentity(overlayId, manifest)
 
@@ -1164,6 +1532,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   }
 
   async markPromoted(
+    overlayId: string,
+    promotion: OverlayPromotionInput,
+  ): Promise<OverlayManifest> {
+    return this.withOverlayLock(() => this.#markPromotedLocked(overlayId, promotion))
+  }
+
+  async #markPromotedLocked(
     overlayId: string,
     promotion: OverlayPromotionInput,
   ): Promise<OverlayManifest> {
@@ -1207,6 +1582,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     overlayId: string,
     retention: OverlayRetentionPolicy,
   ): Promise<OverlayManifest> {
+    return this.withOverlayLock(() => this.#setRetentionLocked(overlayId, retention))
+  }
+
+  async #setRetentionLocked(
+    overlayId: string,
+    retention: OverlayRetentionPolicy,
+  ): Promise<OverlayManifest> {
     const manifest = await this.#loadManifest()
     this.#assertIdentity(overlayId, manifest)
 
@@ -1222,6 +1604,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   async deleteOverlay(
     overlayId: string,
     options: DeleteOverlayOptions = {},
+  ): Promise<DeleteOverlayResult> {
+    return this.withOverlayLock(() => this.#deleteOverlayLocked(overlayId, options))
+  }
+
+  async #deleteOverlayLocked(
+    overlayId: string,
+    options: DeleteOverlayOptions,
   ): Promise<DeleteOverlayResult> {
     const manifest = await this.#loadManifest()
     this.#assertIdentity(overlayId, manifest)
@@ -1260,6 +1649,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     overlayId: string,
     options: CollectOrphansOptions = {},
   ): Promise<OverlayOrphanReport> {
+    return this.withOverlayLock(() => this.#collectOrphansLocked(overlayId, options))
+  }
+
+  async #collectOrphansLocked(
+    overlayId: string,
+    options: CollectOrphansOptions,
+  ): Promise<OverlayOrphanReport> {
     const manifest = await this.#loadManifest()
     this.#assertIdentity(overlayId, manifest)
 
@@ -1268,7 +1664,7 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     const reachableKeys = new Set(heads.map((head) => documentKey(head.logicalId)))
     const reachableSnapshots = new Set<string>()
     for (const head of heads) {
-      const intent = await this.#loadIntent(head.logicalId)
+      const intent = await this.#loadIntent(head.logicalId, head)
       if (intent?.base.snapshotRef !== undefined) reachableSnapshots.add(intent.base.snapshotRef)
     }
 
@@ -1329,6 +1725,16 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       }
     }
 
+    /* Staging files a killed process could not unlink (§35.15 "Process stops
+     * during local temporary write"). Nothing else reclaims them: the revision
+     * and snapshot scans above only look at `.json`, and `documents/` only at
+     * directories, so litter is invisible rather than misread — but it is still
+     * disk that grows with every crash. */
+    for (const stale of await this.#staleStagingFiles()) {
+      scanned += 1
+      orphans.push(stale)
+    }
+
     const deleted: OverlayOrphanRef[] = []
     const failures: Array<{ref: string; reason: string}> = []
     if (options.dryRun !== true) {
@@ -1378,6 +1784,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   async pruneRuntimeHistory(
     overlayId: string,
     options: PruneRuntimeHistoryOptions = {},
+  ): Promise<RuntimeHistoryPruneReport> {
+    return this.withOverlayLock(() => this.#pruneRuntimeHistoryLocked(overlayId, options))
+  }
+
+  async #pruneRuntimeHistoryLocked(
+    overlayId: string,
+    options: PruneRuntimeHistoryOptions,
   ): Promise<RuntimeHistoryPruneReport> {
     const manifest = await this.#loadManifest()
     this.#assertIdentity(overlayId, manifest)
@@ -1606,10 +2019,11 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   async revalidate(
     overlayId: string,
     options: RevalidateOptions = {},
-  ): Promise<OverlayRevalidationReport> {
+  ): Promise<FsOverlayRevalidationReport> {
     const invalid: OverlayRevalidationFailure[] = []
     const changed: string[] = []
     const repairedChecksums: string[] = []
+    const regenerated: string[] = []
 
     /* Step 2-3 for the manifest itself. */
     const manifestRead = await this.#readManifestFile()
@@ -1645,6 +2059,7 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
         checked: 0,
         changed,
         repairedChecksums,
+        regenerated,
         invalid,
         manifestChanged,
       }
@@ -1659,16 +2074,35 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     let checked = 0
     for (const logicalId of logicalIds) {
       const path = this.layout.intentPath(logicalId)
-      const read = await this.#readJsonSoft<CheckpointDocumentIntent>(path)
+      let read = await this.#readJsonSoft<CheckpointDocumentIntent>(path)
       if (read.missing) {
-        invalid.push({
-          kind: 'intent',
-          ref: this.layout.relative(path),
-          logicalId,
-          code: 'OVERLAY_NOT_FOUND',
-          message: 'manifest head has no intent file (PRD §34.3)',
-        })
-        continue
+        /* Recovery, and it is reported rather than performed silently: a review
+         * surface that reappeared without explanation is indistinguishable from
+         * one that was never lost. `regenerated` names every file rebuilt. */
+        const head = manifest.documentHeads[logicalId]
+        const rebuilt = head === undefined ? null : await this.#regenerateIntent(head)
+        if (rebuilt === null) {
+          invalid.push({
+            kind: 'intent',
+            ref: this.layout.relative(path),
+            logicalId,
+            code: 'OVERLAY_NOT_FOUND',
+            message: 'manifest head has no intent file and no revision to rebuild it from',
+          })
+          continue
+        }
+        regenerated.push(this.layout.relative(path))
+        read = await this.#readJsonSoft<CheckpointDocumentIntent>(path)
+        if (read.missing) {
+          invalid.push({
+            kind: 'intent',
+            ref: this.layout.relative(path),
+            logicalId,
+            code: 'OVERLAY_NOT_FOUND',
+            message: 'manifest head has no intent file and it could not be rewritten',
+          })
+          continue
+        }
       }
       checked += 1
 
@@ -1720,12 +2154,17 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       checked,
       changed,
       repairedChecksums,
+      regenerated,
       invalid,
       manifestChanged,
     }
   }
 
   async repairChecksums(overlayId: string): Promise<RepairChecksumsResult> {
+    return this.withOverlayLock(() => this.#repairChecksumsLocked(overlayId))
+  }
+
+  async #repairChecksumsLocked(overlayId: string): Promise<RepairChecksumsResult> {
     const report = await this.verifyChecksums(overlayId)
     const repaired: string[] = []
     const unrepairable: OverlayChecksumIssue[] = []
@@ -1765,6 +2204,14 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     logicalId: string,
     options: {actor?: OverlayActor} = {},
   ): Promise<OverlayResetResult> {
+    return this.withOverlayLock(() => this.#resetDocumentLocked(overlayId, logicalId, options))
+  }
+
+  async #resetDocumentLocked(
+    overlayId: string,
+    logicalId: string,
+    options: {actor?: OverlayActor},
+  ): Promise<OverlayResetResult> {
     const manifest = await this.#loadManifest()
     this.#assertIdentity(overlayId, manifest)
     this.#assertWritable(manifest)
@@ -1791,6 +2238,13 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   }
 
   async resetOverlay(
+    overlayId: string,
+    options: ResetOverlayOptions,
+  ): Promise<OverlayResetResult> {
+    return this.withOverlayLock(() => this.#resetOverlayLocked(overlayId, options))
+  }
+
+  async #resetOverlayLocked(
     overlayId: string,
     options: ResetOverlayOptions,
   ): Promise<OverlayResetResult> {
@@ -1870,6 +2324,10 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
         this.layout.transactionsDir,
         this.layout.revisionsDir,
         this.layout.indexesDir,
+        /* §14.1 reserves `.locks/` and `.gitignore`s it; the writer critical
+         * section needs it to exist, so it is scaffolded rather than conjured on
+         * first contention. */
+        this.layout.resolve(LOCKS_DIR),
       ].map((dir) => mkdir(dir, {recursive: true})),
     )
     await Promise.all([
@@ -1892,7 +2350,11 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
    * any failure the temporary file is removed, so a failed write leaves neither a
    * partial target nor litter.
    */
-  async #writeText(targetPath: string, contents: string): Promise<void> {
+  async #writeText(
+    targetPath: string,
+    contents: string,
+    guard?: () => Promise<void>,
+  ): Promise<void> {
     const dir = dirname(targetPath)
     await mkdir(dir, {recursive: true})
     const tempPath = join(dir, `${TEMP_PREFIX}${randomUUID()}`)
@@ -1916,6 +2378,11 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       if (this.#hooks.beforeRename !== undefined) {
         await this.#hooks.beforeRename({tempPath, targetPath})
       }
+      /* Last statement before the atomic step, deliberately: a precondition
+       * checked any earlier is a precondition something can invalidate in the
+       * gap. Running it after the hook is what lets the §35.9 injection point
+       * script the very interleaving the guard exists to catch. */
+      if (guard !== undefined) await guard()
       await rename(tempPath, targetPath)
     } catch (error) {
       await rm(tempPath, {force: true}).catch(() => undefined)
@@ -1930,9 +2397,32 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     return text
   }
 
+  /**
+   * Publish a new manifest, refusing to overwrite one that moved underneath us.
+   *
+   * The `.locks/` critical section excludes every writer that goes through this
+   * store. It cannot exclude the writer PRD §14.4 explicitly invites — an agent
+   * or a Git merge rewriting the files directly — and it cannot exclude a process
+   * from an older build. So the revision the caller based its work on is
+   * re-read from disk here, immediately before the rename, and a mismatch is a
+   * write conflict rather than a silent overwrite.
+   *
+   * `#manifestBaseRevision` is set by `#loadManifest` inside a locked call and
+   * cleared when the lock is released, so an unlocked write path (there are none
+   * today) simply skips the check rather than comparing against a stale number.
+   */
   async #writeManifest(manifest: OverlayManifest): Promise<void> {
+    const expected = this.#manifestBaseRevision
     const text = serialize(manifest)
-    await this.#writeText(this.layout.manifestPath, text)
+    await this.#writeText(this.layout.manifestPath, text, async () => {
+      if (expected === null) return
+      const current = await this.#readManifestFile()
+      if (current.missing || !current.ok || typeof current.value?.revision !== 'number') return
+      if (current.value.revision !== expected) {
+        throw new OverlayWriteConflictError(manifest.overlayId, expected, current.value.revision)
+      }
+    })
+    this.#manifestBaseRevision = manifest.revision
     this.#cacheManifest(clone(manifest), text)
   }
 
@@ -1971,15 +2461,56 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       )
     }
     this.#cacheManifest(read.value, read.raw ?? null)
+    this.#manifestBaseRevision = read.value.revision
     return read.value
   }
 
+  /**
+   * Rebuild `documents/<id>/intent.json` from the head's immutable revision.
+   *
+   * The intent is a projection: `intentFromRecord` is a pure function of the
+   * content-addressed record the manifest head already names, so regenerating it
+   * cannot invent content. This is the recovery half of the commit-point rule —
+   * a projection write that failed, or a file a human deleted, is repaired from
+   * durable state rather than reported as corruption (§34.2 "deleting a local
+   * file alone does not represent a content delete").
+   *
+   * Only ever called when the file is ABSENT. A file that is present but
+   * different is a direct edit (§14.4) and belongs to `revalidate`, not here;
+   * overwriting it would silently discard an agent's work.
+   */
+  async #regenerateIntent(head: OverlayDocumentHead): Promise<CheckpointDocumentIntent | null> {
+    const record = await this.#readRecordByRef(head.storageRef).catch(() => null)
+    if (record === null) return null
+    const snapshot = baseSnapshotFrom(record)
+    const intent = intentFromRecord(
+      record,
+      snapshot === null ? {} : {snapshotRef: canonicalChecksum(snapshot)},
+    )
+    const logicalId = toPublishedId(record.logicalId)
+    const bytes = serialize(intent)
+    /* Best effort: a read must still answer if the disk is still unwritable. */
+    await this.#writeText(this.layout.intentPath(logicalId), bytes).catch(() => undefined)
+    this.#lastValidIntents.set(logicalId, {intent, bytes})
+    this.#conflictCounts.set(logicalId, countConflicts(intent))
+    return intent
+  }
+
   /** Same last-valid-state rule for the review-facing intent files. */
-  async #loadIntent(logicalId: string): Promise<CheckpointDocumentIntent | null> {
+  async #loadIntent(
+    logicalId: string,
+    head?: OverlayDocumentHead,
+  ): Promise<CheckpointDocumentIntent | null> {
     const normalized = toPublishedId(logicalId)
     const path = this.layout.intentPath(normalized)
     const read = await this.#readJsonSoft<CheckpointDocumentIntent>(path)
-    if (read.missing) return this.#lastValidIntents.get(normalized)?.intent ?? null
+    if (read.missing) {
+      if (head !== undefined) {
+        const regenerated = await this.#regenerateIntent(head)
+        if (regenerated !== null) return regenerated
+      }
+      return this.#lastValidIntents.get(normalized)?.intent ?? null
+    }
     if (!read.ok || read.value === undefined) {
       await this.#writeBrokenCopy(path, read.raw ?? '')
       return this.#lastValidIntents.get(normalized)?.intent ?? null
@@ -2116,9 +2647,12 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     const intent = intentFromRecord(write.record, options)
     const path = this.layout.intentPath(write.logicalId)
     const bytes = serialize(intent)
+    await Promise.all([this.#writeText(path, bytes), this.#writeMaterialized(write.record)])
+    /* Cached only once the bytes are on disk. Seeding the cache first would make
+     * the writing process serve an intent that no cold reader can see — the
+     * longest possible fuse on a projection that failed to write. */
     this.#lastValidIntents.set(write.logicalId, {intent, bytes})
     this.#conflictCounts.set(write.logicalId, countConflicts(intent))
-    await Promise.all([this.#writeText(path, bytes), this.#writeMaterialized(write.record)])
   }
 
   async #writeMaterialized(record: OverlayDocumentRecord): Promise<void> {
@@ -2151,6 +2685,47 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     this.#lastValidIntents.delete(logicalId)
     this.#conflictCounts.delete(logicalId)
     return removed
+  }
+
+  /**
+   * Every `.tmp-` staging file old enough to be certain no writer still holds it.
+   *
+   * Two guards, not one. The `.locks/` critical section this runs inside already
+   * excludes every writer that goes through a store, so a surviving staging file
+   * is almost certainly abandoned; the age threshold covers what the lock cannot
+   * — a writer from an older build, or one whose lock was broken as stale. The
+   * cost of being wrong is an `ENOENT` at a live writer's rename, so the check
+   * is deliberately conservative.
+   *
+   * The reported `kind` is the kind of artifact the file was on its way to
+   * becoming, which is what its directory says.
+   */
+  async #staleStagingFiles(): Promise<OverlayOrphanRef[]> {
+    const cutoff = Date.now() - this.#staleTempMs
+    const found: OverlayOrphanRef[] = []
+
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await readdirSafe(dir)) {
+        const path = join(dir, entry.name)
+        if (entry.isDirectory()) {
+          /* `.locks/` holds the live lock this very call is standing on. */
+          if (path === this.layout.resolve(LOCKS_DIR)) continue
+          await walk(path)
+          continue
+        }
+        if (!entry.name.startsWith(TEMP_PREFIX)) continue
+        const stats = await stat(path).catch(() => null)
+        if (stats === null || stats.mtimeMs > cutoff) continue
+        found.push({
+          kind: stagingArtifactKind(this.layout, path),
+          ref: this.layout.relative(path),
+          reason: 'staging file left by an interrupted atomic write',
+        })
+      }
+    }
+
+    await walk(this.layout.root)
+    return found
   }
 
   /** Recompute `manifest.conflictSummary` from every current document (PRD §13.1). */
@@ -2381,6 +2956,22 @@ async function readdirSafe(
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
     throw error
   }
+}
+
+/**
+ * What a staging file was on its way to becoming, from where it sits.
+ *
+ * `OverlayArtifactKind` has no `temp` member and adding one would break every
+ * exhaustive consumer of the contract for a purely cosmetic gain, so litter is
+ * reported as the kind of the artifact it belongs to; the `reason` string is
+ * what says it is a staging file.
+ */
+function stagingArtifactKind(layout: OverlayLayout, path: string): OverlayArtifactKind {
+  if (path.startsWith(layout.revisionsDir)) return 'revision'
+  if (path.startsWith(layout.snapshotsDir)) return 'snapshot'
+  if (path.startsWith(layout.materializedDir)) return 'materialized'
+  if (path.startsWith(layout.documentsDir)) return 'document'
+  return 'manifest'
 }
 
 /**

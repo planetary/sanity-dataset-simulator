@@ -34,6 +34,18 @@ export type OverlayApiErrorCode =
    * forever.
    */
   | 'BASE_REQUIRED'
+  /**
+   * This API was built without an `assetStore`, so the §24 asset routes have no
+   * storage behind them (501).
+   *
+   * A 5xx and NOT a 404, because the two say different things to the caller and
+   * only one of them is true: a 404 means "this overlay holds no such asset",
+   * which an image input reads as "the upload failed, try another file". This
+   * means "this deployment cannot hold assets at all", and the fix is the
+   * embedder's configuration rather than anything the editor can do. §5.5
+   * forbids letting a caller conclude the first from the second.
+   */
+  | 'ASSETS_NOT_CONFIGURED'
   | 'INTERNAL'
 
 export class OverlayApiError extends Error {

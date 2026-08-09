@@ -38,9 +38,9 @@ import {join} from 'node:path'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {checksum, parse, serialize} from '../../sanity-overlay-core/src/index'
 import type {OverlayDocumentRecord, OverlayManifest} from '../../sanity-overlay-core/src/index'
-import {FsOverlayStore, OverlayLayout} from '../../sanity-overlay-store-fs/src/index'
+import {FsOverlayStore, OverlayLayout, intentChecksum} from '../../sanity-overlay-store-fs/src/index'
 import type {CheckpointDocumentIntent} from '../../sanity-overlay-store-fs/src/index'
-import {createFailureLedger, endsWith, errnoError} from '../src/failureInjection'
+import {createFailureLedger, endsWith, errnoError, until} from '../src/failureInjection'
 import {
   CONTRACT_ACTOR,
   CONTRACT_BASE,
@@ -325,39 +325,29 @@ describe('§33 manifest corrupted — a fatal, read-only, restorable error', () 
 
 describe('§33 local disk write fails — the failure is reported and nothing partial survives', () => {
   /**
-   * ─────────────────────────────── DEFECT D-1 ────────────────────────────────
-   * A COMMIT REPORTED AS FAILED HAS ALREADY LANDED, AND CANNOT BE REPAIRED.
-   *
+   * ────────────────── THE COMMIT POINT IS WHERE FAILURE STOPS ─────────────────
    * `commitTransaction` writes in five steps (`fsStore.ts` §"commitTransaction"):
    *
    *   1. immutable revisions  → `.runtime/revisions/…`
    *   2. transaction record   → `.runtime/transactions/…`
    *   3. THE COMMIT POINT     → `manifest.json`
    *   4. idempotency pointer  → `.runtime/indexes/idempotency/…`
-   *   5. "regenerable projections" → `documents/<id>/intent.json`, materialized
+   *   5. regenerable projections → `documents/<id>/intent.json`, materialized
    *
-   * Step 5 is not regenerable. `documents/<id>/intent.json` is the §14.2
-   * review-facing canonical state, the surface §29.1 puts in Git — the store
-   * itself calls its absence corruption (`exportCanonical` raises
-   * `OVERLAY_STORE_CORRUPT`, "manifest head has no readable intent file (PRD
-   * §34.3)"). An OS error in step 5 therefore produces all three of:
-   *
-   *   - the caller is told the commit FAILED,
-   *   - the commit is durably VISIBLE — manifest revision advanced, head named,
-   *   - the review surface for that head is missing, permanently: step 4 already
-   *     wrote the idempotency pointer, so the natural retry with the same key
-   *     REPLAYS and never reaches step 5 again.
-   *
-   * This is the same shape as the two failures this repository already shipped —
-   * a component reporting one thing and disk holding another — with the addition
-   * that the retry path forecloses recovery. `fsStore.ts` is not owned by this
-   * work, so the behaviour is PINNED here, not fixed. The `it.fails` case below
-   * states what §33 requires; it will go red the moment the defect is fixed,
-   * which is the signal to delete it.
+   * Steps 1-2 may fail the call: nothing is visible yet, so "the save failed" is
+   * true. Steps 4-5 may NOT, and this pair of cases is the reason. A store that
+   * raised the step-5 `EACCES` would tell the editor a save failed that had in
+   * fact landed — the manifest revision has advanced and the head is named —
+   * and the retry that a §33 "save failure banner" invites would then be
+   * swallowed by the idempotency pointer step 4 already wrote, so the review
+   * surface would never be rebuilt. That was DEFECT D-1, found by this suite and
+   * fixed in `fsStore.ts`: past the commit point failures are collected into
+   * `projectionFailures` and the projection is regenerated from the head's
+   * immutable revision (§34.2 — deleting a local file is not a content change).
    * ───────────────────────────────────────────────────────────────────────────
    */
   it.runIf(CAN_USE_PERMISSIONS)(
-    'DEFECT D-1: a commit that throws an OS error after the commit point has already landed',
+    'reports a projection failure after the commit point without calling the commit failed',
     async () => {
       const {root, layout, store} = await seeded()
       await commitOne(store, 'article-1', {title: 'First'})
@@ -366,74 +356,97 @@ describe('§33 local disk write fails — the failure is reported and nothing pa
 
       /* THE INJECTION: a real read-only `documents/` directory, producing a real
        * kernel refusal — not a stubbed throw a store could special-case. Step 5
-       * is the only step that writes there, so this fails the commit strictly
-       * after the manifest rename. */
+       * is the only step that writes there, so this fails strictly AFTER the
+       * manifest rename. */
       await chmod(layout.documentsDir, 0o500)
       chmodded.push(layout.documentsDir)
 
-      let raised: NodeJS.ErrnoException | null = null
-      try {
-        await commitOne(store, 'article-2', {title: 'Second', key: 'doomed'})
-      } catch (error) {
-        raised = error as NodeJS.ErrnoException
-      }
-
-      /* PROOF THE INJECTION TOOK EFFECT: the operation genuinely failed, with an
-       * OS error — §33's stated detection for this row. */
-      expect(raised).not.toBeNull()
-      expect(['EACCES', 'EPERM', 'EROFS']).toContain(raised?.code)
-
-      /* THE DEFECT, on disk: the caller was told "failed" and the manifest moved. */
-      const after = await readManifestFile(layout)
-      expect(after.revision).toBe(before.revision + 1)
-      expect(after.documentHeads['article-2']).toBeDefined()
-
-      /* …with no review-facing intent behind the head it published. */
-      expect(await exists(layout.intentPath('article-2'))).toBe(false)
-
-      /* …which the store's own integrity check calls corruption — but only from
-       * a COLD store. The writing process keeps the intent it never managed to
-       * write in `#lastValidIntents`, so in-process reads and exports keep
-       * succeeding and the damage is invisible until the next restart. The cold
-       * store is the honest oracle here, and the longest possible fuse is
-       * exactly what makes this worth pinning. */
-      const cold = new FsOverlayStore({root, now: () => FIXED_NOW})
-      await expect(cold.exportCanonical(CONTRACT_OVERLAY_ID)).rejects.toMatchObject({
-        code: 'OVERLAY_STORE_CORRUPT',
-      })
-      expect((await store.exportCanonical(CONTRACT_OVERLAY_ID)).documents).toHaveLength(2)
-
-      /* …and the retry a "save failed" banner asks the editor to make is
-       * swallowed by the idempotency pointer step 4 already wrote, so the gap
-       * never closes even once the disk recovers. */
-      await chmod(layout.documentsDir, 0o755)
-      const retry = await store.commitTransaction(CONTRACT_OVERLAY_ID, {
+      const result = await store.commitTransaction(CONTRACT_OVERLAY_ID, {
         idempotencyKey: 'doomed',
         actor: CONTRACT_ACTOR,
         mutations: [],
         records: [documentRecordFixture({logicalId: 'article-2', title: 'Second'})],
       })
-      expect(retry.replayed).toBe(true)
+
+      /* PROOF THE INJECTION TOOK EFFECT: the projection really could not be
+       * written, and the store says so, with the OS's own error code. Without
+       * this the case would pass against a disk that was never made read-only. */
+      expect(result.projectionFailures).toHaveLength(1)
+      expect(['EACCES', 'EPERM', 'EROFS']).toContain(result.projectionFailures[0]!.code)
+      expect(result.projectionFailures[0]!.ref).toContain('intent.json')
       expect(await exists(layout.intentPath('article-2'))).toBe(false)
+
+      /* REQUIRED BEHAVIOUR: the commit is reported as what it is — committed. */
+      expect(result.replayed).toBe(false)
+      const after = await readManifestFile(layout)
+      expect(after.revision).toBe(before.revision + 1)
+      expect(after.documentHeads['article-2']).toBeDefined()
+
+      /* And a COLD store — no cache to hide behind, the honest oracle — still
+       * exports both documents, because the missing projection is rebuilt from
+       * the immutable revision the head names rather than called corruption.
+       * `documents/` is STILL unwritable here, so this proves the read path
+       * recovers without needing the disk back. */
+      const cold = new FsOverlayStore({root, now: () => FIXED_NOW})
+      const bundle = await cold.exportCanonical(CONTRACT_OVERLAY_ID)
+      expect(bundle.documents).toHaveLength(2)
+      const rebuilt = bundle.documents.find(
+        (document) => document.intent.logicalId === 'article-2',
+      )
+      /* Not a placeholder: the rebuilt intent carries the committed edit and
+       * agrees with the intent the clean commit of `article-1` produced, so it
+       * is the same projection and not an empty shell that happens to parse. */
+      expect(rebuilt?.intent.draft?.overrides).toContainEqual({path: ['title'], value: 'Second'})
+      expect(rebuilt?.intent.checksum).toBe(intentChecksum(rebuilt!.intent))
+
+      /* RECOVERY ON NEXT OPEN, once the disk is back: `revalidate` rewrites the
+       * file and NAMES it — a review surface that reappeared silently would be
+       * indistinguishable from one that was never lost. */
+      await chmod(layout.documentsDir, 0o755)
+      const colder = new FsOverlayStore({root, now: () => FIXED_NOW})
+      const report = await colder.revalidate(CONTRACT_OVERLAY_ID)
+      expect(report.regenerated).toEqual([
+        colder.layout.relative(colder.layout.intentPath('article-2')),
+      ])
+      expect(report.ok).toBe(true)
+
+      /* THE INDEPENDENT ORACLE: the bytes are on disk, they parse, and a fourth
+       * store reading them from cold agrees with the record the manifest names. */
+      const onDisk = parse(
+        await readFile(layout.intentPath('article-2'), 'utf8'),
+      ) as CheckpointDocumentIntent
+      expect(onDisk.draft?.overrides).toContainEqual({path: ['title'], value: 'Second'})
+      expect(onDisk.checksum).toBe(intentChecksum(onDisk))
+      const fourth = new FsOverlayStore({root, now: () => FIXED_NOW})
+      expect((await fourth.revalidate(CONTRACT_OVERLAY_ID)).regenerated).toEqual([])
     },
   )
 
-  it.fails.runIf(CAN_USE_PERMISSIONS)(
-    'REQUIRED (§33 local disk write fails): a rejected commit leaves the manifest untouched — currently DEFECT D-1',
-    async () => {
-      const {layout, store} = await seeded()
-      await commitOne(store, 'article-1', {title: 'First'})
-      const beforeBytes = await readFile(layout.manifestPath, 'utf8')
+  it('leaves the manifest byte-identical when a write fails BEFORE the commit point', async () => {
+    const ledger = createFailureLedger()
+    const {layout, store} = await seeded({hooks: ledger.hooks})
+    await commitOne(store, 'article-1', {title: 'First'})
+    const beforeBytes = await readFile(layout.manifestPath, 'utf8')
+    ledger.reset()
 
-      await chmod(layout.documentsDir, 0o500)
-      chmodded.push(layout.documentsDir)
-      await expect(commitOne(store, 'article-2', {title: 'Second'})).rejects.toBeTruthy()
+    /* Step 1 — the immutable revision, written before anything is visible. */
+    ledger.failOn(
+      (targetPath) => targetPath.includes('/revisions/'),
+      errnoError('ENOSPC', 'rename', layout.revisionsDir),
+      {repeat: true},
+    )
+    await expect(commitOne(store, 'article-2', {title: 'Second'})).rejects.toMatchObject({
+      code: 'ENOSPC',
+    })
+    expect(ledger.injections()).toBeGreaterThan(0)
 
-      /* §33: "Save failure banner" / "Preserve in-memory unsaved patches". A
-       * banner is only honest if the save really did not happen. */
-      expect(await readFile(layout.manifestPath, 'utf8')).toBe(beforeBytes)
-    },
-  )
+    /* §33: "Save failure banner" / "Preserve in-memory unsaved patches". A
+     * banner is only honest if the save really did not happen — so the commit
+     * point must be byte-for-byte where it was, and nothing may be reachable. */
+    expect(await readFile(layout.manifestPath, 'utf8')).toBe(beforeBytes)
+    expect(await exists(layout.intentPath('article-2'))).toBe(false)
+    expect(await tempLitter(layout)).toEqual([])
+  })
 
   it('fails at the rename point without publishing bytes and without leaving litter', async () => {
     const ledger = createFailureLedger()
@@ -565,127 +578,56 @@ describe('§33 concurrent writers to one overlay', () => {
   })
 
   /**
-   * ─────────────────────────────── DEFECT D-2 ────────────────────────────────
-   * TWO WRITERS ON ONE ROOT LOSE AN UPDATE, SILENTLY, EVEN WITH PRECONDITIONS.
-   *
-   * `commitTransaction` reads `manifest.json`, checks `expectedOverlayRevision`
-   * against what it read, then writes. Nothing holds the file between the read
-   * and the write, and nothing re-checks at the rename. Two `FsOverlayStore`
-   * instances on the same root — two Studio tabs, a CLI beside a dev server, two
-   * serverless invocations on one volume — therefore both pass the check and
-   * both rename over the manifest. Last rename wins; the loser's head vanishes
-   * from the manifest while its revision file survives as an orphan, and the
-   * loser is told it committed.
-   *
-   * That violates PRD §35.7 "Concurrent stale write rejection", §34.5 "Every
-   * successful transaction increments overlay revision exactly once", and the
-   * §33 row "Blob manifest ETag conflict → re-read, reapply idempotently, retry"
-   * whose filesystem analogue this is. The layout already reserves `.locks/`
-   * (`layout.ts` `LOCKS_DIR`, gitignored) and nothing in any package reads or
-   * writes it: the mutual exclusion was designed and never built.
-   *
-   * The interleaving below is FORCED rather than raced, so this is a
-   * deterministic demonstration and not a flake: writer A is parked at its
-   * manifest rename until writer B has fully committed.
-   *
-   * `fsStore.ts` is not owned by this work, so the behaviour is PINNED, not
-   * fixed. The `it.fails` case states what §35.7 requires.
-   * ───────────────────────────────────────────────────────────────────────────
+   * The forced-interleaving cases that found and now guard DEFECT D-2 — two
+   * stores on one root losing a committed head — live in
+   * `failure-concurrency.test.ts`, which is about writers meeting each other
+   * rather than a writer meeting a broken disk. What belongs HERE is the guard
+   * that survives when the lock does not apply: PRD §14.4 invites an agent or a
+   * Git merge to rewrite the files directly, and such a writer never takes the
+   * `.locks/` critical section at all.
    */
-  it('DEFECT D-2: a second store on the same root silently drops a committed head', async () => {
+  it('refuses to overwrite a manifest that an unlocked external writer moved', async () => {
     const ledger = createFailureLedger()
-    const {root, layout, store} = await seeded({hooks: ledger.hooks})
+    const {layout, store} = await seeded({hooks: ledger.hooks})
     await commitOne(store, 'article-1', {title: 'Base state'})
 
-    const other = new FsOverlayStore({root, now: () => FIXED_NOW})
-
-    /* Park writer A at its commit point, holding the pre-B manifest staged. */
+    /* Park the store at its commit point, with the new manifest staged. */
     const held = ledger.holdOn(endsWith('manifest.json'))
-    const writerA = store.commitTransaction(CONTRACT_OVERLAY_ID, {
-      idempotencyKey: 'writer-a',
-      actor: CONTRACT_ACTOR,
-      mutations: [],
-      records: [documentRecordFixture({logicalId: 'article-A', title: 'A'})],
-      expectedOverlayRevision: 1,
-    })
-    for (let attempt = 0; attempt < 5000 && !held.reached(); attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1))
-    }
-
-    /* PROOF THE INJECTION TOOK EFFECT: A really is parked mid-commit, with its
-     * new manifest bytes staged and not yet visible. */
-    expect(held.reached()).toBe(true)
-    expect((await readManifestFile(layout)).revision).toBe(1)
-
-    /* Writer B commits completely, from its own store, while A is parked. */
-    const resultB = await other.commitTransaction(CONTRACT_OVERLAY_ID, {
-      idempotencyKey: 'writer-b',
-      actor: CONTRACT_ACTOR,
-      mutations: [],
-      records: [documentRecordFixture({logicalId: 'article-B', title: 'B'})],
-      expectedOverlayRevision: 1,
-    })
-    expect(resultB.replayed).toBe(false)
-    expect((await readManifestFile(layout)).documentHeads['article-B']).toBeDefined()
-
-    held.release()
-    const resultA = await writerA
-
-    /* THE DEFECT: A was told it committed, and B — which committed FIRST, and
-     * fully — has been erased from the manifest. */
-    expect(resultA.replayed).toBe(false)
-    const manifest = await readManifestFile(layout)
-    expect(manifest.documentHeads['article-A']).toBeDefined()
-    expect(manifest.documentHeads['article-B']).toBeUndefined()
-
-    /* Two successful transactions, one revision increment (§34.5 violated). */
-    expect(manifest.revision).toBe(2)
-
-    /* B's work is not corrupt, merely unreachable — which is why nothing else
-     * in the system notices. */
-    const report = await store.verifyChecksums(CONTRACT_OVERLAY_ID)
-    expect(report.missing).toEqual([])
-  })
-
-  it.fails(
-    'REQUIRED (§35.7 "Concurrent stale write rejection"): a stale concurrent commit is refused — currently DEFECT D-2',
-    async () => {
-      const ledger = createFailureLedger()
-      const {root, layout, store} = await seeded({hooks: ledger.hooks})
-      await commitOne(store, 'article-1', {title: 'Base state'})
-      const other = new FsOverlayStore({root, now: () => FIXED_NOW})
-
-      const held = ledger.holdOn(endsWith('manifest.json'))
-      const writerA = store
-        .commitTransaction(CONTRACT_OVERLAY_ID, {
-          idempotencyKey: 'writer-a',
-          actor: CONTRACT_ACTOR,
-          mutations: [],
-          records: [documentRecordFixture({logicalId: 'article-A', title: 'A'})],
-          expectedOverlayRevision: 1,
-        })
-        .then(
-          () => 'committed' as const,
-          (error: {code?: string}) => error.code ?? 'unknown',
-        )
-      for (let attempt = 0; attempt < 5000 && !held.reached(); attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1))
-      }
-      await other.commitTransaction(CONTRACT_OVERLAY_ID, {
-        idempotencyKey: 'writer-b',
+    const commit = store
+      .commitTransaction(CONTRACT_OVERLAY_ID, {
+        idempotencyKey: 'writer-a',
         actor: CONTRACT_ACTOR,
         mutations: [],
-        records: [documentRecordFixture({logicalId: 'article-B', title: 'B'})],
-        expectedOverlayRevision: 1,
+        records: [documentRecordFixture({logicalId: 'article-A', title: 'A'})],
       })
-      held.release()
+      .then(
+        () => 'committed' as const,
+        (error: {code?: string}) => error.code ?? 'unknown',
+      )
+    await until(() => held.reached(), 'the commit parked at its rename')
 
-      /* The precondition A was given became false while A was in flight, so A
-       * must be refused rather than allowed to overwrite. */
-      expect(await writerA).toBe('OVERLAY_WRITE_CONFLICT')
-      expect((await readManifestFile(layout)).documentHeads['article-B']).toBeDefined()
-    },
-  )
+    /* THE INJECTION: something that is not this store — no lock, no API —
+     * publishes a different manifest while the commit is in flight. This is a
+     * `git merge` landing, or an older build of the CLI. */
+    const planted = parse(await readFile(layout.manifestPath, 'utf8')) as OverlayManifest
+    planted.revision = 7
+    planted.updatedAt = FIXED_NOW
+    await writeFile(layout.manifestPath, serialize(planted), 'utf8')
+
+    held.release()
+
+    /* REQUIRED: the rename is refused, because the revision the commit was based
+     * on is no longer the revision on disk. Silently overwriting would erase
+     * whatever the external writer published. */
+    expect(await commit).toBe('OVERLAY_WRITE_CONFLICT')
+
+    /* PROOF: the external writer's bytes are intact and no head was lost. */
+    const manifest = await readManifestFile(layout)
+    expect(manifest.revision).toBe(7)
+    expect(manifest.documentHeads['article-A']).toBeUndefined()
+    expect(manifest.documentHeads['article-1']).toBeDefined()
+    expect(await tempLitter(layout)).toEqual([])
+  })
 })
 
 /* ================================================================== *

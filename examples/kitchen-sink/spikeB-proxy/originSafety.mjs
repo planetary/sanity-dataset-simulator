@@ -22,9 +22,11 @@
  * only *statically* import modules with no such dependency.
  *
  * This file is that module: dependency-free apart from the write guard, which
- * `proxy.mjs` already imports. It holds the three things the transport layer
+ * `proxy.mjs` already imports. It holds the four things the transport layer
  * needs to decide before any overlay code is loaded — is Mode 2 requested, is
- * the bind address safe, and is this request one of the two the overlay owns.
+ * the bind address safe, is this request one of the two the overlay owns, and
+ * (§4 below, which applies to BOTH modes) is this browser origin one the proxy
+ * will hand a CORS grant.
  */
 
 import {normalizePath} from './writeGuard.mjs'
@@ -257,6 +259,117 @@ export function isOriginWriteRoute(method, rawUrl, dataset) {
   if (match === null) return false
   if (dataset !== undefined && match[1] !== String(dataset).toLowerCase()) return false
   return rawApiPath(rawUrl) === canonical
+}
+
+/* ------------------------------------------------------------------ *
+ * 4. who may read what the proxy can read — the CORS allowlist
+ * ------------------------------------------------------------------ *
+ *
+ * This section is NOT Mode 2 specific. It lives here because the grant is
+ * derived from {@link isLoopbackBind}, and one definition of "loopback" for the
+ * socket and for the caller is the entire point of putting them side by side.
+ *
+ * WHAT IT REPLACES (security review 2026-08-06, finding P2-4)
+ * `proxy.mjs` used to echo the request `Origin` VERBATIM alongside
+ * `Access-Control-Allow-Credentials: true`. In Mode 1 that meant any page the
+ * developer had open could read whatever the proxy could read — every
+ * unpublished draft in the staging dataset — because the browser attaches the
+ * developer's own session cookie to the request and the reflected grant then
+ * hands the response to the attacker's script.
+ *
+ * WHY LOOPBACK IS THE DEFAULT ALLOWLIST
+ * The proxy's one browser client is a local Studio whose dev port cannot be
+ * known in advance (`3333` for `sanity dev`, `5173` for a bare Vite, whatever
+ * `--port` said), so a port list would be a guess that fails closed on the
+ * developer and open on nobody. Deriving it structurally covers every port at
+ * once. `https://evil.example` is refused, INCLUDING one whose DNS has been
+ * rebound to 127.0.0.1: rebinding changes where a name resolves, not what a
+ * page's origin is.
+ *
+ * THE RESIDUAL, STATED RATHER THAN HIDDEN
+ * Any process the developer runs on loopback can therefore read through a Mode 1
+ * proxy. That is accepted: such a process is already executing code on the
+ * developer's machine and can read their Sanity credentials from disk directly,
+ * so the grant adds no authority it did not already have. The attacker this
+ * closes is the remote page, which cannot become a loopback origin.
+ */
+
+/**
+ * Is `value` an origin the proxy will hand a CORS grant?
+ *
+ * `Origin: null` — a sandboxed iframe, a `data:` document, some redirect chains
+ * — fails `new URL` and is refused, which is right: it is not a name that can be
+ * granted, and it is exactly what a hostile iframe sends.
+ *
+ * @param {unknown} value the request `Origin` header
+ * @param {{has: (value: string) => boolean}} [allowed] extra origins, verbatim
+ * @returns {boolean}
+ */
+export function isGrantedOrigin(value, allowed) {
+  if (typeof value !== 'string' || value === '') return false
+  if (allowed !== undefined && allowed.has(value)) return true
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    return isLoopbackBind(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+/** A wildcard allowlist is refused, so the refusal is typed like the bind one. */
+export class OriginGrantError extends Error {
+  /** @param {string} message */
+  constructor(message) {
+    super(message)
+    this.name = 'OriginGrantError'
+    this.code = 'OVERLAY_ORIGIN_WILDCARD_GRANT'
+  }
+}
+
+/**
+ * Normalise an explicit origin allowlist, refusing a wildcard.
+ *
+ * THIS IS THE STRUCTURAL STAND-IN FOR "NEVER EMIT `Allow-Credentials`".
+ *
+ * `createOverlayApi`, `overlayServer.mjs` and `origin.mjs`'s own view all refuse
+ * to emit that header at all, because none of them carries an ambient
+ * credential: not emitting it means a future widening of the allowlist cannot
+ * resurrect the hole. The proxy cannot buy the guarantee that way — it is a
+ * browser-facing origin that deliberately HOLDS an ambient credential (upstream
+ * `Set-Cookie`s are rewritten onto its own host so they stick, and
+ * `@sanity/client` reads through it with `withCredentials: true`), so a response
+ * without the header is one the browser refuses to show Studio. Dropping it
+ * would not harden Mode 1; it would delete it.
+ *
+ * So the containment rests entirely on the allowlist staying narrow, and the one
+ * value that would destroy it is refused outright rather than documented. There
+ * is deliberately no environment variable behind this list either: an ambient
+ * value is precisely how a "just let my other dev server in" instruction would
+ * end up widening a credentialled grant.
+ *
+ * @param {unknown} origins
+ * @returns {Set<string>}
+ * @throws {OriginGrantError}
+ */
+export function normalizeGrantedOrigins(origins) {
+  if (origins === undefined || origins === null) return new Set()
+  const list = Array.isArray(origins) ? origins : [origins]
+  const out = new Set()
+  for (const entry of list) {
+    const value = String(entry)
+    if (value === '*') {
+      throw new OriginGrantError(
+        'The proxy refuses a wildcard CORS allowlist. It reflects the granted origin back with ' +
+          '`Access-Control-Allow-Credentials: true` — which it must, because Studio reads through ' +
+          'it with `withCredentials: true` — so `origins: ["*"]` is verbatim reflection with ' +
+          'credentials attached, i.e. the 2026-08-06 P2-4 hole restated as configuration. Name ' +
+          'the origins, or rely on the loopback default.',
+      )
+    }
+    if (value !== '') out.add(value)
+  }
+  return out
 }
 
 /**

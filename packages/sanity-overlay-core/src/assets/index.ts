@@ -49,6 +49,13 @@ export {
 } from './document'
 export type {SynthesizeAssetDocumentOptions} from './document'
 
+export {
+  OVERLAY_ASSET_FILENAME_HEADER,
+  OVERLAY_ASSET_ROUTE_SEGMENT,
+  OVERLAY_ASSET_UPLOAD_HEADER,
+  SANITY_CDN_ORIGIN,
+} from './transport'
+
 export {assertAssetDeletable, assetUsage} from './usage'
 export type {OverlayAssetUsage} from './usage'
 

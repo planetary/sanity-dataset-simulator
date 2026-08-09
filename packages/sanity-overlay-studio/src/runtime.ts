@@ -11,6 +11,7 @@
  * {@link OverlayRuntime.status}; it derives nothing itself.
  */
 
+import {assetOriginFor, createOverlayAssetUploader} from './client/assets'
 import {createOverlayEcho, type OverlayEcho} from './client/echo'
 import {seedOverlayDocuments, wrapWithOverlay, type OverlayWriteRecord} from './client/facade'
 import {createStudioReader, type StudioReadRecord} from './client/reads'
@@ -223,6 +224,33 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
     onAuthFailure: (failure) => echo.noteAuthFailure(failure),
   })
 
+  /* ---------------------------------------------------------------- *
+   * Branch-local assets (PRD §24).
+   *
+   * Constructed unconditionally alongside the transport, because the failure it
+   * replaces was not "assets were configured wrongly" — it was that an image
+   * dropped into a field hung forever with no asset and no error, since nothing
+   * on the Studio side had a destination for the bytes at all.
+   *
+   * The ORIGIN is separate and can be refused: Studio's image pipeline builds
+   * `/images/<projectId>/<dataset>/<file>` at the origin root, which an overlay
+   * API mounted under a path prefix does not serve. `assetOriginFor` says so in
+   * a sentence rather than handing the pipeline a URL that 404s.
+   * ---------------------------------------------------------------- */
+  const assets = createOverlayAssetUploader({
+    apiUrl: resolved.apiUrl,
+    fetch: options.fetch,
+    onError: log,
+  })
+
+  const assetOrigin = assetOriginFor(resolved.apiUrl)
+  if ('refusal' in assetOrigin) {
+    log(
+      `[sanity-overlay-studio] branch image previews will not render: ${assetOrigin.refusal} ` +
+        `Uploads still work and the bytes are still stored in the branch.`,
+    )
+  }
+
   function onWrite(record: OverlayWriteRecord): void {
     if (record.committed === 'ok') {
       connection = 'ok'
@@ -246,6 +274,8 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
       onWrite,
       reads,
       onHydration: noteHydration,
+      assets,
+      ...('origin' in assetOrigin ? {assetOrigin: assetOrigin.origin} : {}),
       now: options.now,
     })
   }

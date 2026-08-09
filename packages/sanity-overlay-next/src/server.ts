@@ -38,6 +38,39 @@ export const DEFAULT_STUDIO_ORIGIN = 'http://localhost:3333'
  */
 const DEFAULT_WATCH_INTERVAL_MS = 250
 
+/**
+ * PRD §24.5 policy for this server's asset store, or `false` to have none.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY ASSETS ARE ON BY DEFAULT HERE, AND STILL OPTIONAL IN {@link createOverlayApi}.
+ *
+ * `createOverlayApi` takes `assetStore` as an option and answers
+ * `501 ASSETS_NOT_CONFIGURED` without one. That is a GOOD failure mode for an
+ * embedder mounting the handler from a `route.ts`: they choose their storage,
+ * and a stated refusal beats a silent 404.
+ *
+ * It is the wrong default for THIS function, which is not a library seam — it is
+ * the thing a developer runs. It already owns the overlay root, already
+ * constructs the document store from it, and the asset store is the same root
+ * and the same clock. Leaving it unset meant every first-party launcher answered
+ * `501` for every image, which is what made an upload in a real Studio hang with
+ * no asset and no error (2026-08-06). A default nobody can be expected to
+ * discover is not a default; it is a defect with a configuration flag on it.
+ *
+ * Nothing is created on disk until the first upload: `FsOverlayAssetStore`
+ * scaffolds lazily inside `put`, so a branch with no assets has no `assets/`
+ * directory and no diff.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+export type OverlayApiServerAssetOptions =
+  | false
+  | {
+      /** PRD §24.5 size ceiling. Defaults to core's `DEFAULT_MAX_ASSET_BYTES`. */
+      maxBytes?: number
+      /** PRD §24.5 MIME allow-list, matched against the SNIFFED type. */
+      allowedContentTypes?: readonly string[]
+    }
+
 export interface StartOverlayApiServerOptions
   extends Omit<OverlayApiOptions, 'store' | 'assetStore' | 'now'> {
   /**
@@ -51,6 +84,8 @@ export interface StartOverlayApiServerOptions
   /** The store's own fault-injection surface; production code leaves it unset. */
   hooks?: FsOverlayStoreHooks
   watchIntervalMs?: number
+  /** Branch-local assets (PRD §24). Enabled by default — see the type's note. */
+  assets?: OverlayApiServerAssetOptions
 }
 
 export interface OverlayApiServer {
@@ -60,6 +95,8 @@ export interface OverlayApiServer {
   root: string
   overlayId: string
   store: FsOverlayStore
+  /** The branch asset store, or `null` when `assets: false` was configured. */
+  assetStore: FsOverlayAssetStore | null
   api: OverlayApi
   readonly revision: number
   close(): Promise<void>
@@ -139,9 +176,26 @@ export async function startOverlayApiServer(
   const now = options.now ?? (() => new Date().toISOString())
 
   const store = new FsOverlayStore({root, now, hooks: options.hooks})
+
+  /* Same root, same clock, same lifetime as the document store — see
+   * {@link OverlayApiServerAssetOptions} for why this is not opt-in. */
+  const assetOptions = options.assets ?? {}
+  const assetStore =
+    assetOptions === false
+      ? null
+      : new FsOverlayAssetStore({
+          root,
+          now,
+          ...(assetOptions.maxBytes === undefined ? {} : {maxBytes: assetOptions.maxBytes}),
+          ...(assetOptions.allowedContentTypes === undefined
+            ? {}
+            : {allowedContentTypes: assetOptions.allowedContentTypes}),
+        })
+
   const api = await createOverlayApi({
     ...options,
     store,
+    ...(assetStore === null ? {} : {assetStore}),
     now,
     origins: options.origins ?? [DEFAULT_STUDIO_ORIGIN],
   })
@@ -212,6 +266,7 @@ export async function startOverlayApiServer(
     root,
     overlayId: api.overlayId,
     store,
+    assetStore,
     api,
     get revision() {
       return api.revision

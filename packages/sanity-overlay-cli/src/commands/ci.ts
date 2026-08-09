@@ -65,7 +65,7 @@ export interface CiOptions {
   readonly schema?: string
   readonly base?: string
   readonly config?: readonly string[]
-  readonly envFile?: readonly string[]
+  readonly previewEnv?: readonly string[]
   readonly checkpointPolicy?: string
   readonly format?: string
   readonly report?: string
@@ -288,9 +288,9 @@ export async function runCi(ctx: {
       }
       case 'write-tokens': {
         const files =
-          options.envFile === undefined || options.envFile.length === 0
+          options.previewEnv === undefined || options.previewEnv.length === 0
             ? []
-            : await collectSources(ctx.root, options.envFile, {
+            : await collectSources(ctx.root, options.previewEnv, {
                 extensions: PREVIEW_CONFIG_EXTENSIONS,
                 include: isDotenv,
               })
@@ -298,9 +298,9 @@ export async function runCi(ctx: {
           results.push(
             skipped(
               'write-tokens',
-              options.envFile === undefined || options.envFile.length === 0
-                ? 'no preview configuration to scan: pass --env-file <path>… naming the dotenv, workflow, vercel.json or source files a preview deployment is configured by.'
-                : `no configuration file matched under ${options.envFile.join(', ')} — the paths are wrong, and a credential scan over zero files proves nothing.`,
+              options.previewEnv === undefined || options.previewEnv.length === 0
+                ? 'no preview configuration to scan: pass --preview-env <path>… naming the dotenv, workflow, vercel.json or source files a preview deployment is configured by.'
+                : `no configuration file matched under ${options.previewEnv.join(', ')} — the paths are wrong, and a credential scan over zero files proves nothing.`,
               {files: 0, names: 0, credentials: 0, readOnly: 0, writeCapable: 0},
             ),
           )

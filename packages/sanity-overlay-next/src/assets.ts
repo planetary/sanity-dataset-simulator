@@ -45,41 +45,41 @@
  * refused outright rather than escaped.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-import {parseOverlayAssetRequest} from '../../sanity-overlay-core/src/index'
+import {
+  OVERLAY_ASSET_FILENAME_HEADER,
+  OVERLAY_ASSET_ROUTE_SEGMENT,
+  OVERLAY_ASSET_UPLOAD_HEADER,
+  SANITY_CDN_ORIGIN,
+  parseOverlayAssetRequest,
+} from '../../sanity-overlay-core/src/index'
 import type {SanityDocument} from '../../sanity-overlay-core/src/index'
 import type {FsOverlayAssetStore, PutAssetResult} from '../../sanity-overlay-store-fs/src/index'
 import {createOverlayAssetDelivery} from '../../sanity-overlay-client/src/assets'
 import {OverlayApiError} from './errors'
 
-/** The mount-relative segment both the upload and the document route sit under. */
-export const ASSET_ROUTE_SEGMENT = 'assets'
-
-/**
- * The header an upload MUST carry.
- *
+/*
  * ─────────────────────────────────────────────────────────────────────────────
- * THIS IS THE CSRF CONTROL, AND IT IS DOING THE SAME JOB AS `content-type:
- * application/json` DOES FOR `/commit`.
+ * THE WIRE CONSTANTS ARE CORE'S, NOT THIS MODULE'S, AND THAT IS THE POINT.
  *
- * An upload's `Content-Type` is `image/png` — a value on the CORS-safelist. A
- * `POST` carrying it fires NO preflight, so without this header any page the
- * developer happened to have open could write bytes into the branch. A custom
- * header name is not safelisted, so requiring one forces a preflight, and the
- * preflight is answered by the origin allowlist, which grants nothing by
- * default. That closes the class rather than an instance: it does not matter
- * what the body or the content type is.
- *
- * Page JavaScript can of course SET this header on a same-origin XHR — that is
- * the point. What it cannot do is make the browser skip the preflight.
+ * They used to be declared here — in the server that REQUIRES them. Nothing sent
+ * them, so nothing noticed. The moment a client existed, "the server demands a
+ * header the client does not send" is a 403 whose only symptom is a failed
+ * upload. `sanity-overlay-core/src/assets/transport.ts` now states the contract
+ * once; the Studio imports the same file. Re-exported under the old names so
+ * every existing caller is unaffected.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-export const ASSET_UPLOAD_HEADER = 'x-overlay-asset-upload'
+
+/** The mount-relative segment both the upload and the document route sit under. */
+export const ASSET_ROUTE_SEGMENT = OVERLAY_ASSET_ROUTE_SEGMENT
+
+/** The header an upload MUST carry — the CSRF control. See core's `transport.ts`. */
+export const ASSET_UPLOAD_HEADER = OVERLAY_ASSET_UPLOAD_HEADER
 
 /** Original filename, percent-encoded so a non-ASCII name survives a header. */
-export const ASSET_FILENAME_HEADER = 'x-overlay-asset-filename'
+export const ASSET_FILENAME_HEADER = OVERLAY_ASSET_FILENAME_HEADER
 
-/** Sanity's image/file CDN. Only ever a redirect target, never a request we make. */
-export const SANITY_CDN_ORIGIN = 'https://cdn.sanity.io'
+export {SANITY_CDN_ORIGIN}
 
 /** A project id or dataset name, as Sanity spells them. No separators, no escapes. */
 const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
@@ -246,6 +246,31 @@ export function cdnFallthroughLocation(request: Request): string | null {
  * function only supplies the base path (which is per-request, see
  * {@link assetBasePathFor}) and turns "not an asset route" into `null` so the
  * caller can fall through.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THIS IS A FILE SERVER, AND `verify` IS ITS CONTAINMENT — NOT AN OPTIMISATION
+ * SOMEBODY FORGOT TO TURN OFF.
+ *
+ * Naming is already traversal-proof by construction and not by filtering: the
+ * document route accepts only strings satisfying `isOverlayAssetDocumentId`
+ * (`image-<40 hex>-<w>x<h>-<ext>`, a grammar with no `/`, `.` or `%`), and
+ * `OverlayLayout.assetBlobPath` refuses any checksum that is not 64 lowercase
+ * hex. So `..`, `..%2f`, `%2e%2e%2f`, an absolute path and a NUL are all
+ * rejected as *not an identifier*, before a path is assembled.
+ *
+ * What naming CANNOT stop is the byte at the end of a legitimate name being a
+ * SYMLINK. `.sanity-overlay/` is committed and reviewed — that is the whole
+ * point of the format — so a hostile branch can contain
+ * `assets/blobs/<sha256>.bin` as a link to `~/.ssh/id_rsa`, and `readFile`
+ * follows it. Re-hashing closes that class rather than that instance: the
+ * response is the bytes the record NAMES, or it is a 502, and no substituted
+ * file can hash to a digest chosen before it existed.
+ *
+ * The cost is one SHA-256 per delivery, on a development server serving a
+ * handful of branch assets — tens of milliseconds for a large image. Serving
+ * arbitrary local file content is not a trade worth making against it. It also
+ * satisfies §13.2 integrity on the read path for free.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 export async function deliverAsset(
   options: OverlayAssetEndpointsOptions,
@@ -259,6 +284,7 @@ export async function deliverAsset(
      * which is exactly how the document route silently stopped resolving the
      * first time this was wired. */
     basePath: assetMountPath(request),
+    verify: true,
   })
   return deliver({method: request.method, url: `${url.pathname}${url.search}`})
 }

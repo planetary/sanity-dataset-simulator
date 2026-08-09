@@ -76,16 +76,346 @@ jobs:
       # where cfg comes from hostedConfigFromEnv(), which returns null unless
       # SANITY_PROJECT_ID + SANITY_BASE_DATASET + SANITY_API_READ_TOKEN are all
       # set. src/env.ts only reads a repo-root .env, which is gitignored and so
-      # never present in CI. Verified locally: with those three vars blanked the
-      # suite is 39 files passed / 1 skipped, 2637 passed / 13 skipped -- the 13
-      # being exactly hosted-parity's cases. Do not add a token here.
+      # never present in CI, so that whole leg SKIPS here -- see the gate below,
+      # which is what stops that from being indistinguishable from success.
+      # Do not add a token here.
       #
       # NO retries, deliberately. Two suites (test/action-echo.test.ts,
       # test/proxy-concurrency.test.ts) are known to flake under parallel load.
       # A flake is a real defect in a suite whose whole job is proving
       # concurrency invariants -- retrying it would delete the only signal we
       # have. Do not add `--retry`, and do not add `retry:` to a vitest config.
-      - run: pnpm --filter sanity-overlay-testkit test
+      #
+      # `--reporter=default --reporter=json` rather than the package's own
+      # `test` script: the human log is unchanged and a machine-readable record
+      # of WHAT RAN is written alongside it. That record is the input to the
+      # skip gate, and there is no other way to obtain it -- a vitest run that
+      # skips every test in a file still exits 0 and still prints a green
+      # summary line.
+      - name: test suite
+        run: >
+          pnpm --filter sanity-overlay-testkit exec vitest run
+          --reporter=default --reporter=json
+          --outputFile.json=${{ runner.temp }}/vitest-report.json
+
+      # ---------------------------------------------------------------------
+      # THE GREEN THAT MEANS "WE DID NOT RUN IT".
+      #
+      # Measured on vitest 4.1.10: a `describe.skipIf(true)` block emits one
+      # `status: "skipped"` entry per test and the run reports `success: true`.
+      # So before this step existed, a CI run WITHOUT hosted credentials
+      # produced byte-for-byte the same green as one WITH them, while the
+      # twelve hosted parity cases Gate D cites as evidence never executed.
+      #
+      # The rule this enforces: a skip is not a pass unless this invocation
+      # named it. Exactly the `--allow-skip` discipline `sanity-overlay ci`
+      # already uses, and for the same reason -- the workflow has to state, in
+      # configuration, which legs are inert here and therefore why.
+      #
+      # --allow-skip is SELF-CLEANING: naming a suite that actually ran, or one
+      # that no longer exists, is also red. An allowance cannot rot into a
+      # permanent hole.
+      #
+      # --require is the second half, and it is what makes "the no-staging-write
+      # guarantee is enforced in CI" true rather than merely present. PRD §0.0
+      # ("this system never writes to a Sanity dataset") is carried by five
+      # suites plus the suite-wide outbound monitor in vitest.setup.ts. Each is
+      # named here, so deleting one, renaming one, emptying one, or gating one
+      # behind a condition that is false on the runner is red -- which is the
+      # difference between a guarantee and a file that happens to exist.
+      #
+      # The last two entries carry requirements that are not about writes:
+      #
+      #   test/cli-runner.test.ts   PRD §31.4 privacy -- "[MUST] Do not log
+      #                             Sanity or Blob tokens", enforced by the
+      #                             `secret hygiene` block over `redact`. §31 as
+      #                             a whole specifies observability rather than
+      #                             CI, and this is the one part of it with a
+      #                             shape a gate can hold.
+      #   test/repo-hygiene.test.ts the tracked-file NUL scan -- the guard that
+      #                             makes a binary-classified blob visible at
+      #                             all. It is what the `.sanity-overlay/` gate
+      #                             in `repo-gates` depends on being true.
+      #
+      # `if: always()` so a red suite does not hide a skip: both get reported.
+      - name: the suite must not have silently skipped
+        if: always()
+        run: >
+          node .github/scripts/repo-gates.mjs skips
+          --report ${{ runner.temp }}/vitest-report.json
+          --require test/no-staging-writes.test.ts
+          --require test/preview-write-guard.test.ts
+          --require test/preview-write-impossibility.test.ts
+          --require test/write-guard.test.ts
+          --require test/studio-write-guard.test.ts
+          --require test/query-parity.test.ts
+          --require test/query-boundedness.test.ts
+          --require test/cli-runner.test.ts
+          --require test/repo-hygiene.test.ts
+          --allow-skip test/hosted-parity.test.ts
+
+  # ---------------------------------------------------------------------------
+  # repo-gates
+  #
+  # Repository-level invariants that no unit test can see, because each one is
+  # about the INDEX or about the workflow configuration rather than about a
+  # module. Every check is a pure function in .github/scripts/repo-gates.mjs
+  # with its failure modes driven directly in
+  # packages/sanity-overlay-testkit/test/ci-repo-gates.test.ts -- a `run:` line
+  # is only ever observed in the state it passes in, so a gate expressed as
+  # shell is a gate nobody has watched go red.
+  #
+  # No pnpm install: the script is Node built-ins only, on purpose, so this job
+  # still reports even when the install is what is broken.
+  repo-gates:
+    name: repo gates (roadmap Phase 7 CI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # fetch-depth: 0 is NOT needed -- every gate reads the index and the
+      # worktree at this commit, never history.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+
+      # examples/kitchen-sink/spikeB-proxy/proxy-log.jsonl is 730 lines of
+      # Spike F Track B replay evidence. .gitattributes already SAYS the count
+      # is asserted by the re-verification checklist and that the replay harness
+      # splits the file on '\n'; nothing actually asserted it, so a regenerated
+      # or truncated log would have moved the evidence under the conclusions
+      # drawn from it in silence. The gate also rejects CRLF, a NUL byte and a
+      # line that stopped being JSON -- three corruptions that leave the line
+      # count intact.
+      - name: pinned evidence has not moved
+        run: node .github/scripts/repo-gates.mjs pinned-evidence
+
+      # PRD §14.3/§23/§38.1: `.sanity-overlay/` is TRACKED, because that is how
+      # branch state travels with the branch. PRD §14.1: the `.runtime/` scratch
+      # under it is not, and FsOverlayStore writes the .gitignore that says so.
+      #
+      # Both halves have regressed here. A blanket ignore of the whole directory
+      # was added 2026-08-04 and removed 2026-08-05; runtime artifacts have
+      # reached the index twice. The second is invisible to `git diff` and to
+      # `rg` because those artifacts carry NUL bytes and git classifies them
+      # binary -- which is precisely why this gate is PATH-based and never opens
+      # a file it is judging.
+      - name: .sanity-overlay/ is tracked and .runtime/ is not
+        run: node .github/scripts/repo-gates.mjs overlay-tracking
+
+      # PRD §11.5 and §26.9: fork pull requests must have no access to draft
+      # read tokens, Blob credentials or overlay secrets.
+      #
+      # What this can honestly check is the CONFIGURATION, and only that. A step
+      # running inside a fork PR cannot enumerate the repository's secrets --
+      # GitHub does not pass them, so every `${{ secrets.X }}` there is the
+      # empty string and a runtime "are they absent?" check would pass
+      # unconditionally, forever. What CAN fail is whether a workflow reachable
+      # by `pull_request` references a repository secret at all; if none does,
+      # absence on a fork is structural rather than hoped for.
+      - name: no fork-reachable workflow is configured with a secret
+        run: node .github/scripts/repo-gates.mjs workflow-secrets
+
+  # ---------------------------------------------------------------------------
+  # overlay-gates
+  #
+  # PRD §37 Phase 6 "CI", the overlay half. Named as the discharging job by
+  # PHASE_6_CI_DISCHARGE in packages/sanity-overlay-cli/src/ci/checks.ts for
+  # five of the ten checklist lines, and test/ci-repo-gates.test.ts asserts that
+  # every job that table names actually exists -- until that assertion landed,
+  # all four job names in it were strings in a comment and none of them existed.
+  #
+  # TWO invocations, not one, because --config and --preview-env resolve
+  # relative to --root:
+  #
+  #   1. the overlay itself, rooted at examples/kitchen-sink
+  #   2. the repository's preview configuration, rooted at the repo
+  #
+  # `sanity-overlay ci` is read-only over the overlay (verified: the directory
+  # is byte-identical after a run).
+  overlay-gates:
+    name: overlay gates (PRD §37 Phase 6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # --checkpoint-policy warn, and the reason is specific rather than
+      # convenient. PRD §29.6 lets a project choose whether uncheckpointed
+      # runtime state is acceptable and decision D05's default-when-unanswered
+      # is `required`. examples/kitchen-sink is a demo overlay that is edited by
+      # hand against a local Studio -- it is not branch content whose loss would
+      # matter -- and it sits at revision 7 with no checkpoint today, so
+      # `required` here would be permanently red for a reason that says nothing
+      # about the product. A CONSUMING project drops this flag and gets D05's
+      # default. `warn` still prints the finding; `off` would not, which is why
+      # it is not used.
+      #
+      # branch-schema and strong-references ARE selected and ARE allow-skipped,
+      # which is not the same as leaving them out. The first needs a §20.1
+      # serialized schema artifact and the second needs a base snapshot, and
+      # this repository commits neither -- so selecting them makes the run print
+      #
+      #   branch-schema: SKIPPED — no branch schema to validate against: ...
+      #   strong-references: SKIPPED — no base dataset to resolve reference ...
+      #
+      # in the log every time, with the exact flag that would make each real.
+      # Dropping them instead would have produced a shorter, greener report that
+      # never mentions two mandated checklist lines again. Declaring an inert
+      # check loudly is the entire design of --allow-skip; using it to make a
+      # gap quiet would be the abuse of it.
+      #
+      # test/ci-repo-gates.test.ts pins the CI_CHECKS inventory against this
+      # file, so a check added to the command that no job selects or declares is
+      # red rather than forgotten.
+      - name: overlay file schemas, checkpoint status, conflict summary
+        run: >
+          node packages/sanity-overlay-cli/bin/sanity-overlay.mjs ci
+          --root examples/kitchen-sink
+          --check overlay-schemas
+          --check checkpoint-policy
+          --check conflict-summary
+          --check branch-schema
+          --check strong-references
+          --allow-skip branch-schema
+          --allow-skip strong-references
+          --checkpoint-policy warn
+
+      # PRD §11.3 and invariant §34.15 ("[MUST] CI scans preview environment
+      # configuration for write-capable tokens"), plus §21.10/§21.11 unsupported
+      # Studio surfaces. Classification is `classifyTokenEnvKey` and
+      # HOSTED_FEATURES from sanity-overlay-studio -- the rules the Studio
+      # itself refuses to boot against -- so this gate cannot drift from them.
+      #
+      # --config is scoped to examples/ because §21.10 is about a Studio
+      # WORKSPACE configuration; pointing it at packages/ reports
+      # sanity-overlay-studio/src/features.ts, which is the file that DEFINES
+      # the deny list rather than a workspace that installs the plugin.
+      #
+      # Measured on 2026-08-07: 37 files / 115 imports / 4 plugin calls, and
+      # 127 configuration files / 1677 environment names. If either leg ever
+      # reports files=0 the paths are wrong and the gate is vacuous.
+      - name: unsupported plugins and write-capable tokens
+        run: >
+          node packages/sanity-overlay-cli/bin/sanity-overlay.mjs ci
+          --root .
+          --check unsupported-plugins
+          --check write-tokens
+          --config examples
+          --preview-env .github/workflows
+          --preview-env examples
+          --preview-env e2e
+          --preview-env playwright.config.ts
+
+  # ---------------------------------------------------------------------------
+  # query-parity
+  #
+  # PRD §37 Phase 6 "Run query parity tests", and §22.4 / §22.2. The discharge
+  # table calls this a `workflow-job` rather than a `ci-check` precisely because
+  # nothing new was built: the parity and boundedness suites already exist and
+  # the job runs them.
+  #
+  # It is a SEPARATE job from `test` even though `test` also runs these files,
+  # and the reason is the checks UI: "query parity" has to be able to go red on
+  # its own, with its own name, so a parity regression is not one line inside a
+  # 9,500-test summary. The skip gate is repeated here with --require, so a
+  # parity suite that is present but inert fails this job specifically.
+  query-parity:
+    name: query parity (PRD §22.4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: parity and boundedness suites
+        run: >
+          pnpm --filter sanity-overlay-testkit exec vitest run
+          --reporter=default --reporter=json
+          --outputFile.json=${{ runner.temp }}/parity-report.json
+          test/query-parity.test.ts
+          test/query-boundedness.test.ts
+          test/query-registry.test.ts
+          test/offline-parity.test.ts
+
+      - name: the parity suites must have actually run
+        if: always()
+        run: >
+          node .github/scripts/repo-gates.mjs skips
+          --report ${{ runner.temp }}/parity-report.json
+          --require test/query-parity.test.ts
+          --require test/query-boundedness.test.ts
+          --require test/query-registry.test.ts
+          --require test/offline-parity.test.ts
+
+  # ---------------------------------------------------------------------------
+  # conflict-report
+  #
+  # PRD §37 Phase 6 "Report conflict summary on PR" (§13.1 summary, §13.3
+  # per-document conflicts, rendered as a markdown comment body).
+  #
+  # pull_request only: there is no pull request to comment on for a push.
+  #
+  # PERMISSIONS. `pull-requests: write` is needed to post the comment and
+  # `statuses: write` to refresh the commit status. On a FORK pull request
+  # GITHUB_TOKEN is read-only whatever this block says (PRD §11.5, §39.2 D14) --
+  # that is the platform's guarantee, not this file's -- so the command reports
+  # `pr-report: skip` there with the reason printed rather than reporting a
+  # delivery that did not happen. `--allow-skip pr-report` accepts that ONE
+  # skip; the conflict-summary check itself is not allowed to skip and still
+  # fails the job on a real conflict.
+  conflict-report:
+    name: conflict summary on PR (PRD §13.1)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # The two `github.event.*` values are passed through `env:` rather than
+      # interpolated into the `run:` string. They are platform-generated (an
+      # integer and a 40-character sha) so neither is attacker-controlled here,
+      # but interpolating event data into a shell command is the shape of a
+      # workflow-injection bug and this file should not model it.
+      - name: conflict summary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >
+          node packages/sanity-overlay-cli/bin/sanity-overlay.mjs ci
+          --root examples/kitchen-sink
+          --check conflict-summary
+          --format markdown
+          --report pr
+          --pr "$PR_NUMBER"
+          --sha "$PR_SHA"
+          --allow-skip pr-report
 
   # ---------------------------------------------------------------------------
   # typecheck

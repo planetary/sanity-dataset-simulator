@@ -14,8 +14,11 @@
  *   - Studio opens 5-6 concurrent long-lived listen streams per document pane.
  *     => no request timeouts, keep-alive upstream agent, Nagle disabled.
  *   - Studio sends `Authorization: Bearer` and/or cookies (`withCredentials: true`).
- *     => credentials forwarded faithfully; CORS reflected locally (the proxy, not
- *        Sanity, is the browser-facing origin).
+ *     => credentials forwarded faithfully; CORS answered locally (the proxy, not
+ *        Sanity, is the browser-facing origin). ANSWERED FROM AN ALLOWLIST, not
+ *        reflected — see `corsHeaders` and `originSafety.mjs` §4 for the 2026-08-06
+ *        P2-4 finding that verbatim reflection let any page the developer had
+ *        open read every unpublished draft in the staging dataset.
  *   - The write path is the Actions API (`POST /data/actions/<ds>`), not `/data/mutate`.
  *     => the write guard must cover it explicitly.
  *   - Studio's listener also opens a WebSocket (`/v2022-06-30/socket/<dataset>`).
@@ -52,9 +55,11 @@ import {fileURLToPath, pathToFileURL} from 'node:url'
 import {createRealtimeFrameGuard, isWriteRequest} from './writeGuard.mjs'
 import {
   assertLoopbackBind,
+  isGrantedOrigin,
   isLoopbackBind,
   isOriginModeRequested,
   isOriginWriteRoute,
+  normalizeGrantedOrigins,
 } from './originSafety.mjs'
 import {loadExplicitEnv} from '../../explicitEnv.mjs'
 
@@ -90,7 +95,24 @@ const HOP_BY_HOP = new Set([
   'upgrade',
 ])
 
-/** Headers the proxy owns and therefore strips from the upstream response. */
+/**
+ * Headers the proxy owns and therefore strips from the upstream response.
+ *
+ * THIS SET IS PART OF THE P2-4 FIX, not housekeeping. Everything else in
+ * `upstreamRes.headers` is relayed WHOLESALE (see the forwarding loop below), so
+ * any cross-origin grant Content Lake happens to emit would otherwise arrive at
+ * the browser with the proxy's own hostname in front of it — defeating the
+ * allowlist without touching it. The rule for membership is therefore "does this
+ * header grant a cross-origin capability", not "have we seen Sanity send it".
+ *
+ * The last two were added when the allowlist landed:
+ *   - `access-control-allow-private-network` is Chrome's Private Network Access
+ *     grant, i.e. the header that lets a PUBLIC page reach a LOOPBACK server at
+ *     all. Nothing upstream may issue that on this proxy's behalf.
+ *   - `timing-allow-origin` is not an access grant, but it hands a cross-origin
+ *     page this response's transfer size and timing, which is a side channel on
+ *     content it cannot read directly.
+ */
 const PROXY_OWNED_RESPONSE_HEADERS = new Set([
   'access-control-allow-origin',
   'access-control-allow-credentials',
@@ -98,9 +120,31 @@ const PROXY_OWNED_RESPONSE_HEADERS = new Set([
   'access-control-allow-headers',
   'access-control-expose-headers',
   'access-control-max-age',
+  'access-control-allow-private-network',
+  'timing-allow-origin',
 ])
 
+/**
+ * What the request path forwards when the write guard is OFF: everything,
+ * because that is exactly what an unguarded proxy does.
+ */
 const DEFAULT_ALLOW_METHODS = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS'
+
+/**
+ * What it forwards when the write guard is ON.
+ *
+ * `writeGuard.mjs` is default-deny and its read allowlist is reachable only by
+ * `GET`/`HEAD` (any allowlisted path) and `POST` (the GROQ-over-POST fallback);
+ * `PUT`, `PATCH` and `DELETE` classify as writes on every path there is, so the
+ * guard 403s them unconditionally. `OPTIONS` is never a write and never reaches
+ * the guard anyway — the preflight is answered locally, above it.
+ *
+ * A preflight that promised `DELETE` and then 403'd the request would be lying
+ * in the security-relevant direction: it tells a browser the capability exists.
+ * `test/proxy-cors.test.ts` pins the two sets equal by MEASURING the request
+ * path rather than by restating this comment.
+ */
+const GUARDED_ALLOW_METHODS = 'GET, HEAD, POST, OPTIONS'
 const DEFAULT_ALLOW_HEADERS =
   'Authorization, Content-Type, Accept, Accept-Encoding, X-Sanity-Project-ID, ' +
   'Sanity-Project-ID, X-Requested-With, Cache-Control, Last-Event-ID'
@@ -137,35 +181,105 @@ function isListenPath(apiPath) {
 // ---------------------------------------------------------------------------
 
 /**
- * Reflect CORS for the browser. Studio uses `withCredentials: true`, so a wildcard
- * origin is illegal — the request Origin must be echoed verbatim.
+ * `Vary` on an ordinary response. The grant below depends on the request
+ * `Origin` and on nothing else, so that is the one field named here.
+ *
+ * NOT OPTIONAL, and not only on the responses that carry a grant. A shared cache
+ * that stored the allowlisted answer without this would replay it, grant and
+ * all, to the next origin that asked — re-opening the hole through the cache
+ * rather than through the code. So it is emitted on every response, including
+ * the ones that were refused a grant, because those are equally wrong to replay.
  */
-function corsHeaders(req) {
+const CORS_VARY = 'Origin'
+
+/** A preflight additionally echoes the two `Access-Control-Request-*` fields. */
+const PREFLIGHT_VARY = `${CORS_VARY}, Access-Control-Request-Headers, Access-Control-Request-Method`
+
+/**
+ * The browser-facing CORS grant — an ALLOWLIST, never a reflection.
+ *
+ * SECURITY REVIEW 2026-08-06, FINDING P2-4. This function used to echo
+ * `req.headers.origin` verbatim alongside `Access-Control-Allow-Credentials:
+ * true`. In Mode 2 the damage was contained by `origin.mjs`, which strips a
+ * grant it would not have issued. In MODE 1 IT WAS LIVE: the forwarding path
+ * below hands Content Lake's responses to the browser with that grant attached,
+ * and the browser attaches the developer's own session cookie to the request
+ * that produced them. Any page the developer had open could therefore read
+ * whatever this proxy can read — every unpublished draft in the staging dataset.
+ *
+ * The allowlist is `originSafety.mjs`'s {@link isGrantedOrigin}: loopback
+ * derived structurally from the same predicate the Mode 2 bind check uses, plus
+ * anything the caller named explicitly. Its reasoning — including why a
+ * wildcard entry is refused rather than supported, and why THIS surface keeps
+ * emitting `Allow-Credentials` when the other three refuse to — is stated there
+ * and not repeated here.
+ *
+ * TWO SHAPES ONLY, and that is load-bearing. Either the origin is granted and
+ * gets `Allow-Origin` + `Allow-Credentials` + `Expose-Headers` together, or it
+ * gets no access-control header at all. There is no third branch, so no response
+ * anywhere in this file can emit one of those without the others, and none can
+ * emit credentials to an origin off the list.
+ *
+ * AN ABSENT `Origin` GETS NOTHING — not even the `*` this used to send. There is
+ * no browser to protect, so there is nothing to grant, and a cached `*` is a
+ * grant to whoever the cache serves next.
+ */
+function corsHeaders(req, allowed) {
   const origin = req.headers.origin
-  const headers = {
-    Vary: 'Origin, Access-Control-Request-Headers, Access-Control-Request-Method',
-    'Access-Control-Expose-Headers': EXPOSE_HEADERS,
-  }
-  if (origin) {
-    headers['Access-Control-Allow-Origin'] = origin
-    headers['Access-Control-Allow-Credentials'] = 'true'
-  } else {
-    // Non-browser caller (curl, server-side client): wildcard is fine and
-    // credentials must NOT be advertised alongside it.
-    headers['Access-Control-Allow-Origin'] = '*'
-  }
+  const headers = {Vary: CORS_VARY}
+  if (!isGrantedOrigin(origin, allowed)) return headers
+  headers['Access-Control-Allow-Origin'] = origin
+  headers['Access-Control-Allow-Credentials'] = 'true'
+  headers['Access-Control-Expose-Headers'] = EXPOSE_HEADERS
   return headers
 }
 
-function preflightHeaders(req) {
-  return {
-    ...corsHeaders(req),
-    'Access-Control-Allow-Methods': DEFAULT_ALLOW_METHODS,
-    'Access-Control-Allow-Headers':
-      req.headers['access-control-request-headers'] || DEFAULT_ALLOW_HEADERS,
-    'Access-Control-Max-Age': '600',
-    'Content-Length': '0',
+/**
+ * The preflight answer.
+ *
+ * It advertises the methods the REQUEST PATH will really forward — see
+ * {@link GUARDED_ALLOW_METHODS} — rather than a fixed list, and it advertises
+ * nothing whatsoever to an origin the allowlist refused. A 204 with no
+ * access-control headers is how a preflight says no; the browser then never
+ * sends the request.
+ */
+function preflightHeaders(req, allowed, blockWrites) {
+  const headers = {...corsHeaders(req, allowed), 'Content-Length': '0'}
+  if (headers['Access-Control-Allow-Origin'] === undefined) return headers
+  headers.Vary = PREFLIGHT_VARY
+  headers['Access-Control-Allow-Methods'] = blockWrites
+    ? GUARDED_ALLOW_METHODS
+    : DEFAULT_ALLOW_METHODS
+  headers['Access-Control-Allow-Headers'] =
+    req.headers['access-control-request-headers'] || DEFAULT_ALLOW_HEADERS
+  headers['Access-Control-Max-Age'] = '600'
+  return headers
+}
+
+/**
+ * Union of `Vary` field lists, order-preserving and case-insensitively deduped.
+ *
+ * The proxy used to REPLACE the upstream `Vary` with its own, which silently
+ * dropped `Vary: Accept-Encoding` — the same class of cache defect as dropping
+ * `Vary: Origin`, one axis over: a shared cache would then be free to hand a
+ * gzip body to a client that never asked for one. `*` absorbs everything, since
+ * it already means "do not reuse this for any other request".
+ */
+function mergeVary(...values) {
+  const tokens = []
+  const seen = new Set()
+  for (const value of values) {
+    for (const raw of String(value ?? '').split(',')) {
+      const token = raw.trim()
+      if (token === '') continue
+      if (token === '*') return '*'
+      const key = token.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      tokens.push(token)
+    }
   }
+  return tokens.join(', ')
 }
 
 /**
@@ -318,6 +432,16 @@ export function resolveProxyConfig(options = {}) {
         true
       : (options.blockWrites ??
         (env.PROXY_BLOCK_WRITES === '1' || env.PROXY_BLOCK_WRITES === 'true')),
+    /**
+     * Extra browser origins granted CORS, on top of the loopback default.
+     *
+     * OPTION-ONLY, WITH NO ENVIRONMENT VARIABLE BEHIND IT, for the same reason
+     * `dialUpstream` has none: this list is the whole of the P2-4 containment
+     * (see `originSafety.mjs` §4), and an ambient value is exactly how a "just
+     * let my other dev server in" instruction would widen a CREDENTIALLED grant
+     * from outside the process. `'*'` is refused outright.
+     */
+    origins: normalizeGrantedOrigins(options.origins),
     deriveProjectHost: options.deriveProjectHost ?? env.PROXY_DERIVE_PROJECT_HOST !== '0',
     forwardOrigin: options.forwardOrigin ?? env.PROXY_FORWARD_ORIGIN === '1',
     rewriteCookies: options.rewriteCookies ?? env.PROXY_REWRITE_COOKIES !== '0',
@@ -356,7 +480,11 @@ export function createProxyServer(options = {}) {
     dialUpstream: DIAL_UPSTREAM,
     origin: ORIGIN,
     originHandler: ORIGIN_HANDLER,
+    origins: ORIGINS,
   } = config
+
+  /** The CORS grant for this request, bound to this server's allowlist. */
+  const cors = (req) => corsHeaders(req, ORIGINS)
 
   /* --- Mode 2 preconditions, checked before a socket exists ---------------
    *
@@ -505,7 +633,7 @@ export function createProxyServer(options = {}) {
 
     // --- 1. CORS preflight is answered locally; it never reaches Sanity. -------
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, preflightHeaders(req))
+      res.writeHead(204, preflightHeaders(req, ORIGINS, BLOCK_WRITES))
       res.end()
       finish(204, false)
       return
@@ -532,7 +660,7 @@ export function createProxyServer(options = {}) {
         },
       })
       res.writeHead(403, {
-        ...corsHeaders(req),
+        ...cors(req),
         'Content-Type': 'application/json; charset=utf-8',
         'Content-Length': Buffer.byteLength(body),
         'Cache-Control': 'no-store',
@@ -546,7 +674,27 @@ export function createProxyServer(options = {}) {
 
     // --- 3. MODE 2: answer from the overlay, and never dial anything ---------
     if (ORIGIN) {
-      Promise.resolve(ORIGIN_HANDLER.handle(req, res, {pathname, search, apiPath, cors: corsHeaders(req)}))
+      /**
+       * `try` AROUND THE CALL, not only `.catch` after it.
+       *
+       * This used to read `Promise.resolve(ORIGIN_HANDLER.handle(…))`, and the
+       * argument to `Promise.resolve` is evaluated BEFORE `Promise.resolve`
+       * exists to wrap anything — so a handler that threw SYNCHRONOUSLY (a bad
+       * option, a `require` that failed, any bug above its first `await`) went
+       * straight past the `.catch` below to `uncaughtException`, and the client
+       * got no response at all rather than the 500 this block plainly intends.
+       * `origin.mjs`'s handler is `async`, which is why it was never seen; a
+       * handler is an INJECTED callable and this file cannot assume that.
+       */
+      let answered
+      try {
+        answered = Promise.resolve(
+          ORIGIN_HANDLER.handle(req, res, {pathname, search, apiPath, cors: cors(req)}),
+        )
+      } catch (err) {
+        answered = Promise.reject(err)
+      }
+      answered
         .then(() => finish(res.statusCode || 200, false))
         .catch((err) => {
           if (!res.headersSent) {
@@ -559,7 +707,7 @@ export function createProxyServer(options = {}) {
             })
             try {
               res.writeHead(500, {
-                ...corsHeaders(req),
+                ...cors(req),
                 'Content-Type': 'application/json; charset=utf-8',
                 'Content-Length': Buffer.byteLength(body),
               })
@@ -594,11 +742,24 @@ export function createProxyServer(options = {}) {
       (upstreamRes) => {
         const status = upstreamRes.statusCode || 502
         const headers = {}
+        /**
+         * The upstream's own `Vary`, held aside rather than copied.
+         *
+         * The CORS block below sets `Vary: Origin`, and `setHeader` REPLACES —
+         * so copying the upstream value here would simply lose it, which is how
+         * `Vary: Accept-Encoding` used to disappear on every forwarded response.
+         * Both field lists matter, so they are merged instead.
+         */
+        let upstreamVary = ''
 
         for (const [key, value] of Object.entries(upstreamRes.headers)) {
           const k = key.toLowerCase()
           if (HOP_BY_HOP.has(k)) continue
           if (PROXY_OWNED_RESPONSE_HEADERS.has(k)) continue
+          if (k === 'vary') {
+            upstreamVary = Array.isArray(value) ? value.join(', ') : String(value ?? '')
+            continue
+          }
           if (k === 'set-cookie') {
             headers['Set-Cookie'] = rewriteSetCookie(value)
             continue
@@ -606,9 +767,10 @@ export function createProxyServer(options = {}) {
           if (sse && k === 'content-length') continue
           headers[key] = value
         }
-        for (const [name, value] of Object.entries(corsHeaders(req))) {
+        for (const [name, value] of Object.entries(cors(req))) {
           setHeader(headers, name, value)
         }
+        setHeader(headers, 'Vary', mergeVary(upstreamVary, CORS_VARY))
 
         if (sse) {
           // Anything that could buffer the stream is neutralised here.
@@ -671,7 +833,7 @@ export function createProxyServer(options = {}) {
         })
         try {
           res.writeHead(502, {
-            ...corsHeaders(req),
+            ...cors(req),
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Length': Buffer.byteLength(body),
           })
@@ -846,7 +1008,39 @@ export function createProxyServer(options = {}) {
       hostname,
       port: upstreamPort,
     })
-    const upstreamSocket = DIAL_UPSTREAM(dialSpec)
+    /**
+     * The dial is wrapped for the same reason the Mode 2 `handle()` call above
+     * is: `DIAL_UPSTREAM` is an INJECTED callable, and this handler has already
+     * been given a raw socket. A synchronous throw here — a bad TLS option, an
+     * `ENOENT` on a trust anchor — would leave that socket open with nothing
+     * listening on either end, so the client hangs until it times out instead of
+     * being told. A 502 is the same answer the asynchronous failure below gives.
+     */
+    let upstreamSocket
+    try {
+      upstreamSocket = DIAL_UPSTREAM(dialSpec)
+    } catch (err) {
+      if (clientSocket.writable) {
+        const body = JSON.stringify({
+          error: {
+            code: 'OVERLAY_PROXY_UPSTREAM',
+            description: `Upstream upgrade to ${hostname} could not be dialled`,
+            message: err?.message ?? String(err),
+          },
+        })
+        clientSocket.end(
+          'HTTP/1.1 502 Bad Gateway\r\n' +
+            'Content-Type: application/json; charset=utf-8\r\n' +
+            `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+            'Connection: close\r\n\r\n' +
+            body,
+        )
+      } else {
+        clientSocket.destroy()
+      }
+      finish(502)
+      return
+    }
 
     let torn = false
     const teardown = () => {

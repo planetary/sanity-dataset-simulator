@@ -31,6 +31,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
+import type {OverlayAssetUploader} from './assets'
 import {
   authStatusOf,
   markOverlayRefusal,
@@ -87,6 +88,22 @@ export interface OverlayFacadeOptions {
    * spells "no opinion" and loses the tombstone the read path needs.
    */
   onHydration?: (documents: readonly OverlayHydrationDocument[]) => void
+  /**
+   * Branch-local asset uploads (PRD §24.3). ABSENT MEANS REFUSED, exactly as
+   * before this port existed: `client.assets.upload` rejects with a stated
+   * reason and the bytes go nowhere. Present, it is the ONLY destination —
+   * `@sanity/client`'s own upload is never called, so no asset can reach Sanity.
+   */
+  assets?: OverlayAssetUploader
+  /**
+   * Origin every asset URL `@sanity/image-url` builds must point at (PRD §24.7).
+   *
+   * ABSENT MEANS UNCHANGED: `config()` is delegated verbatim and Studio's image
+   * previews keep resolving against `cdn.sanity.io`, which is right for a
+   * deployment where the overlay does not serve `/images/...`. See
+   * `assetOriginFor`, which is what decides whether a given mounting can.
+   */
+  assetOrigin?: string
   /** Injected clock for the write ledger. */
   now?: () => number
 }
@@ -689,6 +706,83 @@ function createFacade(options: OverlayFacadeOptions): {
     return observableThrowing(error)
   }
 
+  /* ------------------------------------------------------------- assets */
+
+  /**
+   * `client.assets.upload(assetType, body, options)` — PRD §24.3, both shapes.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * THE HANG THIS REPLACES.
+   *
+   * This call used to be refused outright, and the refusal never reached the
+   * editor: an image dropped into a field patched `_upload: {progress: 2}` into
+   * the draft and stayed there forever — no asset, no error, no toast
+   * (observed 2026-08-06). The bytes now go to the overlay API, which stores
+   * them under `.sanity-overlay/` and commits a synthetic asset document, so
+   * `asset._ref` resolves through the ordinary reference machinery.
+   *
+   * TWO SHAPES, BECAUSE `@sanity/client@7.26.0` HAS TWO. `AssetsClient.upload`
+   * resolves to the asset DOCUMENT; `ObservableAssetsClient.upload` emits the
+   * raw request events, and sanity 6.8.0's `uploadSanityAsset` completes on
+   * `event.type === 'response'` reading `event.body.document._id`. Answering the
+   * wrong one is indistinguishable from a hang at the call site.
+   *
+   * NO SYNTHETIC PROGRESS. `fetch` reports none, and emitting a percentage
+   * nobody measured is the §5.5 approximation this exercise exists to remove.
+   * The stream carries the one event that is true.
+   * ───────────────────────────────────────────────────────────────────────────
+   */
+  function uploadAsset(kind: Kind, uploader: OverlayAssetUploader, args: unknown[]): unknown {
+    const document = uploader({
+      assetType: args[0],
+      body: args[1],
+      ...(args[2] === undefined ? {} : {options: args[2]}),
+    }).then((outcome) => {
+      /* The asset is an ordinary overlay document the API has already
+       * committed. Seeding it here — the same two feeds a commit uses — is what
+       * lets `asset->url`, the asset dialog and the file input's download link
+       * resolve without waiting for the next `/state` poll. */
+      const id = outcome.document._id
+      if (typeof id === 'string' && id !== '') {
+        const rows: OverlayHydrationDocument[] = [{logicalId: id, published: outcome.document}]
+        seedOverlayDocuments(echo, rows)
+        options.onHydration?.(rows)
+      }
+      return outcome.document
+    })
+
+    if (kind !== 'observable') return document
+
+    return makeObservable((subscriber) => {
+      let closed = false
+      void document.then(
+        (value) => {
+          if (closed) return
+          /* The shape `_requestObservable` emits, which is the shape
+           * `uploadSanityAsset` destructures. */
+          subscriber.next({
+            type: 'response',
+            statusCode: 200,
+            method: 'POST',
+            body: {document: value},
+          })
+          subscriber.complete()
+        },
+        (error: unknown) => {
+          if (closed) return
+          /* ERROR, never silence: sanity 6.8.0's image input clears `_upload`
+           * and raises a toast from `subscribe({error})`, and from nowhere
+           * else. An observable that merely completes leaves "Uploading" on
+           * screen for the life of the tab. */
+          subscriber.error(error)
+        },
+      )
+      return () => {
+        closed = true
+      }
+    })
+  }
+
   function refuseUnechoable(kind: Kind, label: string, reason: string): unknown {
     /* Marked, because a host that funnels this back through the session
      * observer must not read our own "no" as Sanity revoking the credential. */
@@ -1225,6 +1319,12 @@ function createFacade(options: OverlayFacadeOptions): {
         if (methodKind === 'push') {
           /* Not `kind`-dependent: see `refuseLivePush`. */
           wrapped = (): unknown => refuseLivePush(label)
+        } else if (path === 'assets' && name === 'upload' && options.assets !== undefined) {
+          /* The ONE namespace write with an overlay spelling. Everything else
+           * under `assets` — and `upload` itself when no port is configured —
+           * falls through to the refusal below, unweakened. */
+          const uploader = options.assets
+          wrapped = (...args: unknown[]): unknown => uploadAsset(kind, uploader, args)
         } else if (methodKind === 'write') {
           wrapped = (): unknown => refuseUnechoable(kind, label, namespaceRefusalReason(path))
         } else if (path === 'users' && name === 'getById') {
@@ -1447,6 +1547,48 @@ function createFacade(options: OverlayFacadeOptions): {
           wrapped = (...args: unknown[]): unknown => {
             const result = fn.apply(t, args)
             return isRec(result) ? wrap(result as object, kind) : result
+          }
+        } else if (name === 'config' && options.assetOrigin !== undefined) {
+          /**
+           * ───────────────────────────────────────────────────────────────────
+           * THE IMAGE PIPELINE, POINTED AT THE OVERLAY — PRD §24.7, §24.1.
+           *
+           * Studio's image preview never reads the asset document's `url`. It
+           * renders `createImageUrlBuilder(client).image(ref).url()`, and
+           * `@sanity/image-url@2.1.1` builds that string from `client.config()`
+           * and nothing else:
+           *
+           *     baseUrl = (apiHost || 'https://api.sanity.io')
+           *                 .replace(/^https:\/\/api\./, 'https://cdn.')
+           *     src     = `${baseUrl}/images/${projectId}/${dataset}/…`
+           *
+           * So a branch image renders if and only if `apiHost` — AS READ HERE —
+           * names something that answers that path. The overlay API does, and it
+           * answers for BASE assets too, with a 302 to `cdn.sanity.io` (§24.1),
+           * which is how one field can hold one of each.
+           *
+           * THIS DOES NOT MOVE ANY DATA TRAFFIC. `@sanity/client` builds request
+           * URLs from its own private `#clientConfig`, never from this method,
+           * and this facade's own staging-write guard reads the RAW client
+           * (`absoluteRequestUrl(t, …)`), not the proxy — so a write aimed at
+           * `*.api.sanity.io` is still recognised and still refused. What
+           * changes is only what an OUTSIDE reader of `config()` is told the
+           * asset origin is, which is the one thing it is consulted for here.
+           *
+           * `config(newConfig)` MUTATES IN PLACE AND RETURNS `this`
+           * (`SanityClient.ts:1220-1236`). That branch must keep returning a
+           * WRAPPED client — handing back the raw one was a live facade escape —
+           * so the rewrite applies only to the zero-argument read.
+           * ───────────────────────────────────────────────────────────────────
+           */
+          const assetOrigin = options.assetOrigin
+          wrapped = (...args: unknown[]): unknown => {
+            /* `guardArguments` and `wrapIfClient` are the DEFAULT branch's two
+             * halves, kept verbatim: this branch adds a rewrite to the read, it
+             * does not opt out of the guard that made `config` safe. */
+            const result = fn.apply(t, guardArguments(args, name, kind))
+            if (args.length > 0) return wrapIfClient(result, kind)
+            return isRec(result) ? {...result, apiHost: assetOrigin} : result
           }
         } else if (READ_TAP_METHODS.has(name)) {
           const authoritative = AUTHORITATIVE_READ_METHODS.has(name)

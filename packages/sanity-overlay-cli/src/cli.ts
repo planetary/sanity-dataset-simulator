@@ -92,7 +92,7 @@ export const PHASE_2_CLI_COMMANDS = Object.freeze([
  * Commands this CLI dispatches that PRD §14.5 does NOT name, each mapped to the
  * §37 Phase 2 task it exists to serve.
  *
- * These two are the real deviation, and they are small: the PRD mandates the
+ * These five are the real deviation, and they are small: the PRD mandates the
  * capability as a Phase 2 "Filesystem store task" and simply never spells a verb
  * for it. Recording the rationale beside the name means the next command cannot
  * be added without writing down why — the guard is the justification, not a
@@ -117,7 +117,7 @@ export const COMMANDS_BEYOND_PRD = Object.freeze({
  * = the ten §37 Phase 2 commands
  * + `normalize`, which §14.5 and §29.4 name directly and which is the §37 Phase 2
  *   "Local UX" surface for "File parse error UI" and "Reset actions"
- * + the {@link COMMANDS_BEYOND_PRD} pair.
+ * + the five {@link COMMANDS_BEYOND_PRD} entries.
  *
  * Two §14.5 commands are absent on purpose:
  *
@@ -230,7 +230,15 @@ const COMMAND_OPTIONS: Record<CliCommand, Record<string, unknown>> = {
     schema: {type: 'string'},
     base: {type: 'string'},
     config: {type: 'string', multiple: true},
-    'env-file': {type: 'string', multiple: true},
+    /*
+     * NOT `--env-file`, which is what this was called and could never work.
+     * Node 22 parses `--env-file` as its OWN option even after the script path,
+     * so `node bin/sanity-overlay.mjs ci --env-file preview` died with
+     * `node: preview: invalid format` before `runCli` was reached — taking the
+     * PRD §11.3 / §34.15 write-token scan, the only thing that flag selects,
+     * out of reach of every command line. See {@link CLI_OPTION_NAMES}.
+     */
+    'preview-env': {type: 'string', multiple: true},
     'checkpoint-policy': {type: 'string'},
     format: {type: 'string'},
     report: {type: 'string'},
@@ -239,6 +247,29 @@ const COMMAND_OPTIONS: Record<CliCommand, Record<string, unknown>> = {
     sha: {type: 'string'},
   },
 }
+
+/**
+ * Every long option name the CLI declares, globals included.
+ *
+ * Exported for one reason, and it is not documentation: **Node 22 claims some
+ * `--flag` names for itself even when they appear after the script path.**
+ * `node bin/sanity-overlay.mjs ci --env-file preview` never reached `runCli`
+ * at all — Node parsed `--env-file`, tried to load `preview` as a dotenv file
+ * and died with `node: preview: invalid format`. Every in-process test passed
+ * throughout, because passing an argv array to `runCli` skips the only parser
+ * that gets it wrong.
+ *
+ * `cli-runner.test.ts` spawns a real process for each name below and asserts
+ * Node hands it through, so a future option cannot be added into a collision
+ * silently. See `preview-env` in the `ci` block above for the one that already
+ * did.
+ */
+export const CLI_OPTION_NAMES: readonly string[] = Object.freeze([
+  ...new Set([
+    ...Object.keys(GLOBAL_OPTIONS),
+    ...Object.values(COMMAND_OPTIONS).flatMap((options) => Object.keys(options)),
+  ]),
+].sort())
 
 const USAGE_SUMMARY: Record<CliCommand, string> = {
   inspect: 'manifest, document heads, or one document in detail',
@@ -434,7 +465,7 @@ async function dispatch(
         ...(typeof values.schema === 'string' ? {schema: values.schema} : {}),
         ...(typeof values.base === 'string' ? {base: values.base} : {}),
         ...(Array.isArray(values.config) ? {config: values.config as string[]} : {}),
-        ...(Array.isArray(values['env-file']) ? {envFile: values['env-file'] as string[]} : {}),
+        ...(Array.isArray(values['preview-env']) ? {previewEnv: values['preview-env'] as string[]} : {}),
         ...(typeof values['checkpoint-policy'] === 'string'
           ? {checkpointPolicy: values['checkpoint-policy']}
           : {}),

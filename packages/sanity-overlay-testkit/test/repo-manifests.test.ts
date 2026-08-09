@@ -43,10 +43,11 @@
  *
  * So the convention changes: a relative specifier that stays inside its own
  * package is correct and is ignored; one that escapes is a defect and is named.
- * The 85 that exist today are pinned in KNOWN_ESCAPING below rather than
+ * Every one that exists today is pinned in KNOWN_ESCAPING below rather than
  * silently skipped, in the same self-cleaning shape as every other pinned list
  * here — a new one turns this red, and fixing one turns it red too, until the
- * entry is deleted. The pin is a blocked-work ledger, not an exemption.
+ * entry is deleted. The pin is a blocked-work ledger, not an exemption, and it
+ * is the ledger — not a hand-copied total — that carries the count.
  */
 import {existsSync, readdirSync, readFileSync, statSync} from 'node:fs'
 import {dirname, join, resolve, sep} from 'node:path'
@@ -755,6 +756,11 @@ describe('no package imports its way out of its own directory', () => {
    */
   const KNOWN_ESCAPING: Record<string, string[]> = {
     'sanity-overlay-cli': [
+      'packages/sanity-overlay-cli/src/ci/overlayChecks.ts -> ../../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-cli/src/ci/scan.ts -> ../../../sanity-overlay-studio/src/features',
+
+      'packages/sanity-overlay-cli/src/ci/scan.ts -> ../../../sanity-overlay-studio/src/options',
+      'packages/sanity-overlay-cli/src/commands/ci.ts -> ../../../sanity-overlay-core/src/index',
       'packages/sanity-overlay-cli/src/commands/cleanup.ts -> ../../../sanity-overlay-store-fs/src/index',
       'packages/sanity-overlay-cli/src/commands/codemod.ts -> ../../../sanity-overlay-query/src/index',
       'packages/sanity-overlay-cli/src/commands/conflicts.ts -> ../../../sanity-overlay-core/src/index',
@@ -796,6 +802,9 @@ describe('no package imports its way out of its own directory', () => {
       'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-core/src/index',
       'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-query/src/index',
       'packages/sanity-overlay-next/src/api.ts -> ../../sanity-overlay-store-fs/src/index',
+      'packages/sanity-overlay-next/src/assets.ts -> ../../sanity-overlay-client/src/assets',
+      'packages/sanity-overlay-next/src/assets.ts -> ../../sanity-overlay-core/src/index',
+      'packages/sanity-overlay-next/src/assets.ts -> ../../sanity-overlay-store-fs/src/index',
       'packages/sanity-overlay-next/src/queries.ts -> ../../sanity-overlay-query/src/index',
       'packages/sanity-overlay-next/src/rebase.ts -> ../../sanity-overlay-core/src/index',
       'packages/sanity-overlay-next/src/server.ts -> ../../sanity-overlay-store-fs/src/index',
@@ -815,6 +824,8 @@ describe('no package imports its way out of its own directory', () => {
       'packages/sanity-overlay-store-fs/src/watch.ts -> ../../sanity-overlay-core/src/index',
     ],
     'sanity-overlay-studio': [
+      'packages/sanity-overlay-studio/src/client/assets.ts -> ../../../sanity-overlay-client/src/stagingHost',
+      'packages/sanity-overlay-studio/src/client/assets.ts -> ../../../sanity-overlay-core/src/index',
       'packages/sanity-overlay-studio/src/client/facade.ts -> ../../../sanity-overlay-client/src/stagingHost',
       'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-core/src/index',
       'packages/sanity-overlay-studio/src/client/incomingReferences.ts -> ../../../sanity-overlay-query/src/baseSource',
@@ -868,14 +879,46 @@ describe('no package imports its way out of its own directory', () => {
     },
   )
 
+  /*
+   * ── WHY THE HEADLINE NUMBER IS NO LONGER A LITERAL ───────────────────────
+   *
+   * This assertion was `expect(...length).toBe(85)`. It went red twice today
+   * for a reason that had nothing to teach anyone: the `ci` command and
+   * `next/src/assets.ts` landed, the per-package ledgers above went red and
+   * NAMED the seven new imports, and then this one went red a second time
+   * saying only "expected 93 to be 85".
+   *
+   * That is not a second signal. It is the SAME signal with the diagnostics
+   * removed. The per-package assertions above pin the exact string of every
+   * escaping import for every package, and `KNOWN_ESCAPING names every
+   * package` proves the ledger covers all of them — so the total is already
+   * fully determined by assertions that have run before this one gets to
+   * speak. A hand-maintained literal on top of that adds no detection power
+   * and one more place to edit, and its failure message is strictly worse
+   * than the one it duplicates.
+   *
+   * A literal count is worth having when it is the ONLY thing pinning the
+   * quantity (see `proxy-log.jsonl`'s 730, which nothing else constrains).
+   * Here it was a second encoding of a fact the file already encodes
+   * exhaustively, so bumping 85 → 93 would have been maintenance, not a test.
+   *
+   * What survives is the part that was never redundant: the two claims in the
+   * test's own name. That the ledger is DERIVED from the scan rather than
+   * asserted against itself, and that the blocker is still open — so when it
+   * finally reaches zero, this test goes red and forces someone to come and
+   * delete the whole ledger rather than leaving a monument to solved work.
+   */
   it('the workspace still cannot be installed, and the ledger says by how much', () => {
-    /*
-     * The headline `[M-LOCAL]` blocker as a single number, so progress is
-     * legible and completion is unambiguous: this reaches 0 when every package
-     * resolves its siblings by name. It is derived from the scan, not from the
-     * pinned list, so it cannot drift from reality.
-     */
-    expect(ALL.flatMap((pkg) => escapingImports(pkg)).length).toBe(85)
+    const scanned = ALL.flatMap((pkg) => escapingImports(pkg)).length
+    const ledgered = Object.values(KNOWN_ESCAPING).reduce((n, list) => n + list.length, 0)
+
+    /* Derived from the scan, not from the pinned list — the ledger cannot
+     * claim a total the source tree does not actually contain. */
+    expect(scanned).toBe(ledgered)
+
+    /* The `[M-LOCAL]` blocker is still open. When this fails, every package
+     * resolves its siblings by name: delete KNOWN_ESCAPING and this block. */
+    expect(scanned, `${scanned} escaping imports remain`).toBeGreaterThan(0)
   })
 })
 
@@ -947,27 +990,22 @@ describe('the typecheck gate covers every package it can', () => {
    *                           the `unref` on a DOM `number` timer handle that
    *                           follows from the same missing lib).
    *                           pnpm --filter sanity-overlay-client add -D -E "@types/node@^22.20.1"
-   *   sanity-overlay-cli       0 errors. The remedy has already been applied:
-   *                           @types/node is declared AND now present in
-   *                           pnpm-lock.yaml. This exclusion is stale and the
-   *                           package is ready to move into the gate; doing so
-   *                           is a .github/workflows/ci.yml change, so both
-   *                           files must move together to keep the assertion
-   *                           below green.
-   *   sanity-overlay-studio    0 errors. Same story: groq-js is declared and in
-   *                           pnpm-lock.yaml, so the undeclared-import error is
-   *                           gone. Stale exclusion, same paired move.
-   *   sanity-overlay-testkit  39 errors, none in its own harness -- assets,
-   *                           studio-observable, write-guard, client-revalidate,
-   *                           proxy-tls, core-boundaries, and the untyped .mjs
-   *                           imports from examples/kitchen-sink.
+   *   sanity-overlay-testkit  51 errors (re-measured 2026-08-07), none in its
+   *                           own harness -- assets, studio-observable,
+   *                           write-guard, client-revalidate, proxy-tls,
+   *                           core-boundaries, and the untyped .mjs imports
+   *                           from examples/kitchen-sink.
+   *
+   * CLEARED 2026-08-07: `sanity-overlay-cli` and `sanity-overlay-studio` were
+   * both listed here as STALE exclusions -- the comment already said so, and
+   * said the remedy (@types/node in the lockfile for the cli, a declared
+   * groq-js for the studio) had already been applied. .github/workflows/ci.yml
+   * then moved both into the gate, and this list did not move with it, which is
+   * exactly the drift the paired assertion below exists to catch: it went red
+   * with cli and studio appearing on both sides. Both re-measured at 0 errors
+   * on 2026-08-07 before being removed from here.
    */
-  const EXCLUDED = [
-    'sanity-overlay-cli',
-    'sanity-overlay-client',
-    'sanity-overlay-studio',
-    'sanity-overlay-testkit',
-  ]
+  const EXCLUDED = ['sanity-overlay-client', 'sanity-overlay-testkit']
 
   /*
    * Anchored at `run:` so a COMMENTED step cannot count. The previous version

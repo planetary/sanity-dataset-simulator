@@ -8,17 +8,26 @@
  * the CLI just computed — the overlay under test is written to a real temp
  * directory by `seedOverlay`, i.e. by the Studio write path.
  */
-import {mkdir, readFile, writeFile} from 'node:fs/promises'
+import {spawnSync} from 'node:child_process'
+import {mkdir, mkdtemp, readFile, writeFile} from 'node:fs/promises'
+import {tmpdir} from 'node:os'
 import {join} from 'node:path'
-import {afterEach, describe, expect, it} from 'vitest'
+import {fileURLToPath} from 'node:url'
+import {afterEach, beforeAll, describe, expect, it} from 'vitest'
 import {
   CLI_COMMANDS,
+  CLI_OPTION_NAMES,
   COMMANDS_BEYOND_PRD,
   EXIT,
   PHASE_2_CLI_COMMANDS,
   PRD_14_5_COMMANDS,
   plural,
 } from '../../sanity-overlay-cli/src/index'
+
+/** The executable a user or a CI job actually runs. */
+const CLI_BIN = fileURLToPath(
+  new URL('../../sanity-overlay-cli/bin/sanity-overlay.mjs', import.meta.url),
+)
 import {
   cleanupOverlayFixtures,
   createOverlayFixture,
@@ -148,18 +157,20 @@ describe('dispatch', () => {
     expect(undeclared).toEqual([])
   })
 
-  it('declares exactly the four mandated tasks the PRD gives no command name for', () => {
+  it('declares exactly the five mandated tasks the PRD gives no command name for', () => {
     /* "Local runtime history" and "Local cleanup" are Phase 2 Filesystem store
      * tasks. "Build and run client-import codemod" and "Add lint rule for
      * direct client imports and unregistered queries" are Phase 5 Frontend
      * migration tasks, and §22.5 requires CI to RUN both — "CI runs the codemod
-     * in check mode and the lint rule in error mode". A mandated CI gate needs
-     * an invocation, and §14.5 names no verb for one.
+     * in check mode and the lint rule in error mode". `ci` is the whole §37
+     * Phase 6 CI block, which is ten mandated tasks and no verb for any of
+     * them. A mandated CI gate needs an invocation, and §14.5 names none.
      *
-     * All four ARE our deviation — a small one, and recorded here rather than
+     * All five ARE our deviation — a small one, and recorded here rather than
      * discovered later in a diff. The guard is not the count: it is that each
      * verb names the §37 task it exists to serve. */
     expect(Object.keys(COMMANDS_BEYOND_PRD).sort()).toEqual([
+      'ci',
       'cleanup',
       'codemod',
       'history',
@@ -173,9 +184,33 @@ describe('dispatch', () => {
     expect(COMMANDS_BEYOND_PRD.cleanup).toMatch(/§37 Phase 2/)
     expect(COMMANDS_BEYOND_PRD.lint).toMatch(/§37 Phase 5/)
     expect(COMMANDS_BEYOND_PRD.codemod).toMatch(/§37 Phase 5/)
+    expect(COMMANDS_BEYOND_PRD.ci).toMatch(/§37 Phase 6/)
     /* §22.5 is the requirement that makes a CI-runnable verb necessary at all. */
     expect(COMMANDS_BEYOND_PRD.lint).toMatch(/§22\.5/)
     expect(COMMANDS_BEYOND_PRD.codemod).toMatch(/§22\.5/)
+  })
+
+  /**
+   * The list above was a one-way guard: it required every DISPATCHED command
+   * outside §14.5 to appear in `COMMANDS_BEYOND_PRD`, and said nothing about an
+   * entry that is declared and then never wired up, or one that duplicates a
+   * §14.5 verb and so needs no justification at all. Both are ways for the
+   * ledger to describe a CLI that does not exist, which is the failure mode the
+   * ledger exists to prevent in the other direction.
+   *
+   * Closing it also makes the count above mean something: five entries, five
+   * verbs the dispatcher really answers to, none of them already specified.
+   */
+  it('declares nothing it does not dispatch, and nothing §14.5 already names', () => {
+    for (const command of Object.keys(COMMANDS_BEYOND_PRD)) {
+      expect(CLI_COMMANDS as readonly string[], `${command}: declared but not dispatched`).toContain(
+        command,
+      )
+      expect(
+        PRD_14_5_COMMANDS as readonly string[],
+        `${command}: §14.5 names it, so it needs no justification here`,
+      ).not.toContain(command)
+    }
   })
 
   it('--help lists every command and the exit-code table', async () => {
@@ -300,6 +335,82 @@ describe('secret hygiene', () => {
     })
     expect(run.code).toBe(EXIT.OK)
     expect(run.stdout).not.toContain('sk-live-abcdefghijklmnop')
+  })
+})
+
+/**
+ * ## THE ONE THING `runCliCapture` CANNOT SEE
+ *
+ * Every other case in this file calls `runCli` in process. That is the right
+ * default — it is fast, it injects the streams, and it asserts on the exact
+ * bytes a user gets. But it hands `runCli` an argv array directly, and so it
+ * skips the step that actually happens in production: **Node parses the command
+ * line first.**
+ *
+ * Node 22 claims some `--flag` names for itself even when they appear AFTER the
+ * script path. `node bin/sanity-overlay.mjs ci --env-file preview` never
+ * reaches `runCli` at all — Node treats `--env-file` as its own option, tries
+ * to load `preview` as a dotenv file, and dies with
+ * `node: preview: invalid format`. Verified on v22.22.2. The bin carries no
+ * execute bit, so `node <path>` is the only way to run it, and `npx` / a
+ * `node_modules/.bin` shim produce the same command line.
+ *
+ * The consequence was not cosmetic. `--env-file` was the ONLY way to reach the
+ * `write-tokens` check — PRD §11.3 and invariant §34.15, "[MUST] CI scans
+ * preview environment configuration for write-capable tokens" — so a mandated
+ * gate was unreachable from any command line while every in-process test of it
+ * passed.
+ *
+ * These cases spawn the real executable. The first is the class check: no
+ * declared option name may be one Node swallows. The second is the end-to-end
+ * proof that the check reached is the check that ran.
+ */
+describe('the declared flags survive a real command line', () => {
+  /**
+   * Independent oracle: a throwaway script that prints its own `process.argv`.
+   * It knows nothing about this CLI, so a flag reaching it is proof about NODE,
+   * not about our parser.
+   */
+  let probe: string
+
+  beforeAll(async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cli-argv-probe-'))
+    probe = join(dir, 'argv.mjs')
+    await writeFile(probe, 'console.log(JSON.stringify(process.argv.slice(2)))\n', 'utf8')
+  })
+
+  it.each([...CLI_OPTION_NAMES])('node passes --%s through to the script', (name) => {
+    const run = spawnSync(process.execPath, [probe, `--${name}`, 'VALUE'], {encoding: 'utf8'})
+    expect(
+      run.status,
+      `node refused --${name}: ${run.stderr.trim()}. Node claims this flag for itself, so the ` +
+        `CLI can never receive it. Rename the option.`,
+    ).toBe(0)
+    expect(JSON.parse(run.stdout)).toEqual([`--${name}`, 'VALUE'])
+  })
+
+  it('reaches the §11.3 write-token scan through the real binary', async () => {
+    /* The end-to-end claim the in-process tests structurally cannot make. */
+    const {root} = await createOverlayFixture({empty: true})
+    await mkdir(join(root, 'preview'), {recursive: true})
+    await writeFile(join(root, 'preview', '.env.preview'), 'SANITY_API_WRITE_TOKEN=x\n', 'utf8')
+
+    const run = spawnSync(
+      process.execPath,
+      [CLI_BIN, 'ci', '--json', '--root', root, '--check', 'write-tokens', '--preview-env', 'preview'],
+      {encoding: 'utf8', cwd: root},
+    )
+
+    expect(run.stderr).not.toMatch(/^node:/m)
+    const report = JSON.parse(run.stdout)
+    const check = report.checks.find((c: {check: string}) => c.check === 'write-tokens')
+    /* It ran, it saw a file, and it found the token. A scan over zero files
+     * would report `pass` with `files=0`, which is the failure this asserts
+     * against. */
+    expect(check.status).toBe('fail')
+    expect(check.measured.files).toBeGreaterThan(0)
+    expect(check.measured.writeCapable).toBeGreaterThan(0)
+    expect(run.status).toBe(EXIT.FINDINGS)
   })
 })
 

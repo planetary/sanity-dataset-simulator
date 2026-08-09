@@ -416,7 +416,7 @@ describe('write-tokens', () => {
       'preview/.env.preview',
       ['SANITY_PROJECT_ID=proj', 'SANITY_API_READ_TOKEN=sk-read', 'OVERLAY_MODE=blob', ''].join('\n'),
     )
-    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--env-file', 'preview'])
+    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--preview-env', 'preview'])
     expect(code).toBe(EXIT.OK)
     const check = checkOf(report, 'write-tokens')
     expect(check.status).toBe('pass')
@@ -435,7 +435,7 @@ describe('write-tokens', () => {
       'preview/.env.preview',
       ['SANITY_API_WRITE_TOKEN=sk-write', ''].join('\n'),
     )
-    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--env-file', 'preview'])
+    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--preview-env', 'preview'])
     expect(code).toBe(EXIT.FINDINGS)
     const check = checkOf(report, 'write-tokens')
     expect(check.status).toBe('fail')
@@ -450,7 +450,7 @@ describe('write-tokens', () => {
       'preview/deploy.yml',
       ['jobs:', '  preview:', '    env:', '      SANITY_TOKEN: ${{ secrets.SANITY_TOKEN }}', ''].join('\n'),
     )
-    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--env-file', 'preview'])
+    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--preview-env', 'preview'])
     expect(code).toBe(EXIT.FINDINGS)
     expect(checkOf(report, 'write-tokens').findings.some((f) => f.message.includes('SANITY_TOKEN'))).toBe(
       true,
@@ -464,7 +464,7 @@ describe('write-tokens', () => {
       'preview/.env.preview',
       ['NEXT_PUBLIC_SANITY_API_READ_TOKEN=sk-read', ''].join('\n'),
     )
-    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--env-file', 'preview'])
+    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--preview-env', 'preview'])
     expect(code).toBe(EXIT.OK)
     const check = checkOf(report, 'write-tokens')
     expect(check.status).toBe('pass')
@@ -474,7 +474,7 @@ describe('write-tokens', () => {
   it('refuses to report success over an empty file set', async () => {
     const {root} = await createOverlayFixture()
     await mkdir(join(root, 'no-config'), {recursive: true})
-    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--env-file', 'no-config'])
+    const {code, report} = await runCi(root, ['--check', 'write-tokens', '--preview-env', 'no-config'])
     expect(code).toBe(EXIT.FINDINGS)
     expect(checkOf(report, 'write-tokens').status).toBe('skip')
   })

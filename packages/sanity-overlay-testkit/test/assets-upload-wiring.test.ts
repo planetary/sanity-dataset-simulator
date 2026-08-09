@@ -36,7 +36,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 import {createHash} from 'node:crypto'
-import {mkdtemp, readFile, readdir, rm} from 'node:fs/promises'
+import {mkdtemp, readFile, readdir, rm, symlink, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {crc32, deflateSync} from 'node:zlib'
@@ -551,6 +551,143 @@ describe('core delivery routing (PRD §24.7)', () => {
       '/files/p/ds/short.pdf',
     ]) {
       expect(parseOverlayAssetRequest(hostile)).toBeNull()
+    }
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════ *
+ * 8. The launcher, which is what makes any of the above reachable
+ * ══════════════════════════════════════════════════════════════════ */
+
+describe('startOverlayApiServer configures the asset store (PRD §24.3)', () => {
+  it('exposes the store it built, addressed at the same overlay root', async () => {
+    const server = await boot()
+    await upload(server, PNG, {filename: 'hero.png', contentType: 'image/png'})
+
+    const handle = running[running.length - 1] as unknown as {
+      assetStore: {getRecord(id: string): Promise<{checksum: string} | null>} | null
+    }
+    expect(handle.assetStore, 'the launcher must construct an asset store').not.toBeNull()
+    const record = await handle.assetStore?.getRecord(PNG_ID)
+    expect(record?.checksum).toBe(PNG_SHA256)
+  })
+
+  it('keeps the 501 refusal for an embedder who turns assets off', async () => {
+    /* The 501 branch is a GOOD failure mode and must survive the fix: it tells a
+     * host that mounted the handler without storage exactly what is missing,
+     * instead of a 404 they would read as "no such asset". */
+    const root = await mkdtemp(join(tmpdir(), 'assets-wiring-off-'))
+    roots.push(root)
+    const server = await startOverlayApiServer({
+      root,
+      port: 0,
+      overlayId: OVERLAY_ID,
+      now: makeClock(),
+      watchIntervalMs: 0,
+      origins: [STUDIO_ORIGIN],
+      assets: false,
+    })
+    running.push(server)
+    expect(server.assetStore).toBeNull()
+
+    const uploaded = await upload({url: server.url, root, close: () => server.close()}, PNG, {
+      filename: 'hero.png',
+      contentType: 'image/png',
+    })
+    expect(uploaded.status).toBe(501)
+    expect((uploaded.body.error as Record<string, unknown>).code).toBe('ASSETS_NOT_CONFIGURED')
+
+    const delivered = await fetch(`${server.url}/assets/${PNG_ID}`)
+    expect(delivered.status).toBe(501)
+
+    /* And nothing was written: a refusal that scaffolds a directory is a
+     * refusal that changed the branch. */
+    await expect(readdir(join(root, '.sanity-overlay', 'assets'))).rejects.toThrow()
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════ *
+ * 9. `deliverAsset` IS A FILE SERVER. It must not serve a foreign file.
+ * ══════════════════════════════════════════════════════════════════ */
+
+describe('delivery containment beyond naming (PRD §35.9, §13.2)', () => {
+  it('refuses a blob replaced by a symlink to a file outside the overlay', async () => {
+    const server = await boot()
+    await upload(server, PNG, {filename: 'hero.png', contentType: 'image/png'})
+
+    /* `.sanity-overlay/` is committed and reviewed — that is the point of the
+     * format — so a hostile branch can carry a blob that is a LINK. No naming
+     * guard can see this: the path is a perfectly legal SHA-256. */
+    const secretPath = join(server.root, 'outside-the-overlay.txt')
+    const SECRET = 'SSH-PRIVATE-KEY-LOOKALIKE-9f3a2b'
+    await writeFile(secretPath, SECRET, 'utf8')
+    const blobPath = join(server.root, '.sanity-overlay', 'assets', 'blobs', `${PNG_SHA256}.bin`)
+    await rm(blobPath, {force: true})
+    await symlink(secretPath, blobPath)
+
+    for (const url of [
+      `${server.url}/assets/${PNG_ID}`,
+      `${server.url}/images/${PROJECT_ID}/${DATASET}/${PNG_SHA1}-64x32.png`,
+    ]) {
+      const response = await fetch(url, {redirect: 'manual'})
+      const text = await response.text()
+      expect(text, url).not.toContain(SECRET)
+      expect(response.status, url).not.toBe(200)
+    }
+  })
+
+  it('refuses a blob whose bytes no longer hash to the record’s checksum', async () => {
+    const server = await boot()
+    await upload(server, PNG, {filename: 'hero.png', contentType: 'image/png'})
+
+    const blobPath = join(server.root, '.sanity-overlay', 'assets', 'blobs', `${PNG_SHA256}.bin`)
+    await writeFile(blobPath, 'not the bytes this record names', 'utf8')
+
+    const response = await fetch(`${server.url}/assets/${PNG_ID}`)
+    expect(response.status).toBe(502)
+    expect(await response.text()).not.toContain('not the bytes')
+  })
+
+  it('cannot be talked into serving a file through an encoded or absolute name', async () => {
+    const server = await boot()
+    await upload(server, PNG, {filename: 'hero.png', contentType: 'image/png'})
+
+    for (const hostile of [
+      /* Encoded separators, on both route families. */
+      `/assets/image-${PNG_SHA1}-64x32-png%2f..%2f..%2fmanifest.json`,
+      `/images/${PROJECT_ID}/${DATASET}/%2e%2e%2f%2e%2e%2fmanifest.json`,
+      `/files/${PROJECT_ID}/${DATASET}/%2e%2e%2fmanifest.json`,
+      /* Encoded `?` and `#` — the truncation family a prior review found broken
+       * in the write guard, checked here rather than assumed absent. */
+      `/assets/${PNG_ID}%3f../../manifest.json`,
+      `/assets/${PNG_ID}%23/../../manifest.json`,
+      /* An absolute path, a NUL, and a Windows separator. */
+      `/assets/%2fetc%2fpasswd`,
+      `/assets/${PNG_ID}%00.png`,
+      `/assets/..%5c..%5cmanifest.json`,
+    ]) {
+      const response = await fetch(`${server.url}${hostile}`, {redirect: 'manual'})
+      const text = await response.text()
+      expect(text, hostile).not.toContain('formatVersion')
+      expect(text, hostile).not.toContain('root:')
+      /* The only 200 this server may ever answer on an asset route is the asset
+       * itself, and none of these names is one. */
+      expect(response.status, hostile).not.toBe(200)
+    }
+  })
+
+  it('never redirects anywhere but the Sanity CDN, however the path is spelled', async () => {
+    const server = await boot()
+    for (const hostile of [
+      `/images/${PROJECT_ID}/${DATASET}/..%2f..%2f${'a'.repeat(40)}-1x1.png`,
+      `/images/evil.example%2Fx/${DATASET}/${'a'.repeat(40)}-1x1.png`,
+      `/images/${PROJECT_ID}/${DATASET}%2f%2fevil.example/${'a'.repeat(40)}-1x1.png`,
+      `/files/..%2f..%2fevil.example/${DATASET}/${'a'.repeat(40)}.pdf`,
+    ]) {
+      const response = await fetch(`${server.url}${hostile}`, {redirect: 'manual'})
+      const location = response.headers.get('location')
+      if (location === null) continue
+      expect(new URL(location, server.url).origin, hostile).toBe('https://cdn.sanity.io')
     }
   })
 })

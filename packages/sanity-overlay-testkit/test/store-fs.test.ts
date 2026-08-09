@@ -732,12 +732,16 @@ describe('filesystem layout (PRD §14.1)', () => {
     expect(entries).toEqual([
       '.gitattributes',
       '.gitignore',
+      /* §14.1 reserves `.locks/`; it holds the writer critical section that
+       * makes two stores on one root safe (§35.7) and is `.gitignore`d. */
+      '.locks',
       '.runtime',
       'README.md',
       'documents',
       'manifest.json',
       'snapshots',
     ])
+    expect(await readFile(harness.layout.resolve('.gitignore'), 'utf8')).toContain('.locks/')
 
     const runtime = (await readdir(harness.layout.runtimeDir)).sort()
     expect(runtime).toEqual(['indexes', 'materialized', 'revisions', 'transactions'])

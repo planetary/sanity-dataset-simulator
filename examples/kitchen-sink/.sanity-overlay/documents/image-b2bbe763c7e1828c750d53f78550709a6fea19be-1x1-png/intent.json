@@ -1,0 +1,95 @@
+{
+  "base": {},
+  "checksum": "c3cc8140a8b013c5767cdda70337eb2aeed22c876dcf16860e1bf9ee0ca57219",
+  "conflicts": [],
+  "formatVersion": 1,
+  "logicalId": "image-b2bbe763c7e1828c750d53f78550709a6fea19be-1x1-png",
+  "published": {
+    "mode": "replace",
+    "replacement": {
+      "_createdAt": "2026-08-07T13:56:09.967Z",
+      "_id": "image-b2bbe763c7e1828c750d53f78550709a6fea19be-1x1-png",
+      "_rev": "overlay.10.f4d52ce74c29",
+      "_type": "sanity.imageAsset",
+      "_updatedAt": "2026-08-07T13:56:09.971Z",
+      "assetId": "b2bbe763c7e1828c750d53f78550709a6fea19be",
+      "extension": "png",
+      "metadata": {
+        "_type": "sanity.imageMetadata",
+        "dimensions": {
+          "_type": "sanity.imageDimensions",
+          "aspectRatio": 1,
+          "height": 1,
+          "width": 1
+        },
+        "hasAlpha": true
+      },
+      "mimeType": "image/png",
+      "originalFilename": "overlay-test.png",
+      "overlayAsset": {
+        "blobRef": "c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77",
+        "branchOnly": true,
+        "omittedMetadata": [
+          "metadata.blurHash",
+          "metadata.exif",
+          "metadata.isOpaque",
+          "metadata.location",
+          "metadata.lqip",
+          "metadata.palette",
+          "metadata.thumbHash"
+        ],
+        "overlayId": "spike-a-local-echo",
+        "provider": "filesystem"
+      },
+      "path": "assets/blobs/c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77.bin",
+      "sha1hash": "b2bbe763c7e1828c750d53f78550709a6fea19be",
+      "size": 70,
+      "source": {
+        "_type": "sanity.assetSourceData",
+        "id": "image-b2bbe763c7e1828c750d53f78550709a6fea19be-1x1-png",
+        "name": "sanity-branch-overlay"
+      },
+      "url": "http://localhost:3998/assets/image-b2bbe763c7e1828c750d53f78550709a6fea19be-1x1-png"
+    }
+  },
+  "tombstones": {
+    "draft": false,
+    "published": false
+  },
+  "touchedPaths": [
+    [
+      "assetId"
+    ],
+    [
+      "extension"
+    ],
+    [
+      "metadata"
+    ],
+    [
+      "mimeType"
+    ],
+    [
+      "originalFilename"
+    ],
+    [
+      "overlayAsset"
+    ],
+    [
+      "path"
+    ],
+    [
+      "sha1hash"
+    ],
+    [
+      "size"
+    ],
+    [
+      "source"
+    ],
+    [
+      "url"
+    ]
+  ],
+  "type": "sanity.imageAsset"
+}
