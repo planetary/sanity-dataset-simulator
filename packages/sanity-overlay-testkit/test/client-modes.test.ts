@@ -502,7 +502,15 @@ describe('environment configuration', () => {
         SANITY_OVERLAY_ROOT: '/srv/checkout',
         SANITY_OVERLAY_PERSPECTIVE: 'published',
       }),
-    ).toEqual({mode: 'fs', overlayRoot: '/srv/checkout', perspective: 'published'})
+    ).toEqual({
+      mode: 'fs',
+      overlayRoot: '/srv/checkout',
+      perspective: 'published',
+      /* `OVERLAY_REVALIDATE` defaults to `auto`, which is the behaviour every
+       * deployment already had — see `local-site-revalidation.test.ts` for why
+       * the key exists at all. */
+      autoRevalidate: true,
+    })
   })
 
   it('rejects an unknown mode rather than silently falling back', () => {

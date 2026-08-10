@@ -609,8 +609,18 @@ describe('what a checkpoint carries (PRD §29, §14.1)', () => {
     const {store} = await harness()
     await store.put({overlayId: OVERLAY_ID, bytes: PNG, filename: 'hero.png'})
 
+    /* Patterns are relative to the directory holding the `.gitattributes`, and
+       that file is written INSIDE `.sanity-overlay/`. This assertion once
+       expected a leading `.sanity-overlay/`, which made Git resolve
+       `.sanity-overlay/.sanity-overlay/assets/blobs/` — a path that cannot
+       exist — so the rule was a silent no-op and this test was pinning the bug.
+
+       Note what this case CANNOT establish, despite its name: a string in a file
+       is not Git behaviour. `store-scaffold-reconcile.test.ts` asks
+       `git check-attr` in a real repository, which is the only authority on
+       whether the attribute actually applies. */
     const attributes = await readFile(store.layout.resolve('.gitattributes'), 'utf8')
-    expect(attributes).toContain('.sanity-overlay/assets/blobs/** binary')
+    expect(attributes).toContain('assets/blobs/** binary')
   })
 })
 

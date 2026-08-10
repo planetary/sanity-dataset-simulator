@@ -12,6 +12,19 @@
 //   --demo                                         use the overlay `seed.mjs`
 //                                                  writes, instead of the Studio's
 //   --perspective=…   SANITY_OVERLAY_PERSPECTIVE   published|drafts (default drafts)
+//   --revalidate=…    SANITY_OVERLAY_REVALIDATE    auto|explicit (default auto).
+//                                                  `auto` probes the overlay before
+//                                                  every read and attaches the fs
+//                                                  watcher. `explicit` does NEITHER:
+//                                                  the page only changes when
+//                                                  `POST /revalidate` is called,
+//                                                  which is the model a Next.js
+//                                                  `revalidateTag` deployment runs.
+//                                                  Until this switch existed the
+//                                                  example could only be started in
+//                                                  `auto`, so that route was
+//                                                  unreachable — and therefore
+//                                                  untested — by anyone running it.
 //   --port=<n>        SITE_PORT                    default 4000 (3998 is the
 //                                                  overlay server, 3999 the proxy)
 //   --dataset=<file>  SITE_BASE_DATASET            NDJSON base dataset
@@ -41,7 +54,7 @@ import {loadExplicitEnv} from '../explicitEnv.mjs'
 
 register('./tsExtensionHook.mjs', import.meta.url)
 
-const KNOWN = ['mode', 'root', 'perspective', 'port', 'dataset']
+const KNOWN = ['mode', 'root', 'perspective', 'port', 'dataset', 'revalidate']
 /** Value-less flags. */
 const KNOWN_SWITCHES = ['demo']
 
@@ -105,22 +118,32 @@ const env = {
     process.env.SANITY_OVERLAY_ROOT ??
     DEFAULT_OVERLAY_ROOT,
   SANITY_OVERLAY_PERSPECTIVE: flags.perspective ?? process.env.SANITY_OVERLAY_PERSPECTIVE,
+  SANITY_OVERLAY_REVALIDATE: flags.revalidate ?? process.env.SANITY_OVERLAY_REVALIDATE,
   SITE_BASE_DATASET: flags.dataset ?? process.env.SITE_BASE_DATASET,
 }
 
 const {startLocalSite, DEFAULT_PORT} = await import('./src/server.ts')
 
-const {client, summary, warnings} = createSiteClient(env)
+const {client, summary, warnings, autoRevalidate} = createSiteClient(env)
 
 /* Deprecated spellings and the like. On stderr, before the banner: a notice
  * about configuration must not be lost in a stdout pipe, and must arrive before
  * the line it is qualifying. */
 for (const warning of warnings) process.stderr.write(`${warning}\n`)
 
+/*
+ * THE WATCHER FOLLOWS THE REVALIDATION MODEL, and it has to.
+ *
+ * With `watch: true` unconditionally, the filesystem watcher dropped the read
+ * cache on every overlay change — so `--revalidate=explicit` would have pinned
+ * the client and then had the page refresh itself anyway, which is the exact
+ * illusion this switch exists to remove. A deployment running the explicit
+ * model has no watcher (there is no filesystem to watch), and neither does this.
+ */
 const running = await startLocalSite({
   client,
   port: Number(flags.port ?? process.env.SITE_PORT ?? DEFAULT_PORT),
-  watch: true,
+  watch: autoRevalidate,
   log: (message) => console.log(`[site] ${message}`),
 })
 

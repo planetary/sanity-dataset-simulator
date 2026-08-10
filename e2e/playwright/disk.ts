@@ -23,14 +23,27 @@ import {OVERLAY_ROOT} from '../harness/paths.mjs'
 
 const OVERLAY_DIR = '.sanity-overlay'
 
+/**
+ * One perspective's compacted intent — `OverlayIntentState` in
+ * `sanity-overlay-core/src/store/intent.ts`, spelled here because `e2e/` does
+ * not import the packages it is auditing.
+ */
+export interface OverlayIntentLayer {
+  mode: 'patch' | 'replace' | string
+  overrides?: Array<{path: (string | number)[]; value: unknown}>
+  unsets?: Array<(string | number)[]>
+  /** Present, and authoritative, when `mode === 'replace'`. */
+  replacement?: Record<string, unknown>
+}
+
 export interface OverlayIntent {
   logicalId: string
   type?: string
   formatVersion: number
   checksum: string
   base?: {publishedRevision?: string; snapshotRef?: string}
-  draft?: {mode: string; overrides?: Array<{path: (string | number)[]; value: unknown}>}
-  published?: {mode: string; overrides?: Array<{path: (string | number)[]; value: unknown}>}
+  draft?: OverlayIntentLayer
+  published?: OverlayIntentLayer
   tombstones: {draft: boolean; published: boolean}
   touchedPaths: Array<(string | number)[]>
   conflicts: unknown[]
@@ -113,17 +126,51 @@ export function overlayDocumentIds(root: string = OVERLAY_ROOT): string[] {
     .sort()
 }
 
-/** The value an intent overrides at `path`, on the draft or published layer. */
+/**
+ * The value the branch holds at `path` on the draft or published layer.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THERE ARE TWO INTENT SHAPES, AND THIS SUITE ONLY EVER PRODUCES THE SECOND.
+ *
+ * `compactIntentState` (`sanity-overlay-core/src/store/intent.ts`) emits
+ * `mode: 'patch'` with an `overrides` array *only* when the document has a base
+ * ancestor. **A branch-created document selects `mode: 'replace'` and emits the
+ * whole document** as `replacement` — §14.2, §17.10.
+ *
+ * Every document in these specs is branch-created (Mode 2 has no base dataset
+ * at all), so `overrides` is absent from every `intent.json` the suite will ever
+ * write. This function used to read `overrides` and nothing else, so it returned
+ * `undefined` for a file that plainly contained `"title": "Edited on the
+ * branch"` — a green-looking oracle that could never be satisfied.
+ *
+ * It reads the file rather than re-deriving the mapping: `replacement` is a
+ * whole document, so the path is walked; `overrides` is an exact-path list, so
+ * it is matched; `unsets` wins over both, because a path the branch removed does
+ * not hold the base value, it holds nothing.
+ */
 export function overrideAt(
   intent: OverlayIntent | null,
   path: (string | number)[],
   layer: 'draft' | 'published' = 'draft',
 ): unknown {
-  const overrides = intent?.[layer]?.overrides ?? []
-  const hit = overrides.find(
-    (override) => JSON.stringify(override.path) === JSON.stringify(path),
+  const state = intent?.[layer]
+  if (state === undefined) return undefined
+  const key = JSON.stringify(path)
+
+  if ((state.unsets ?? []).some((unset) => JSON.stringify(unset) === key)) return undefined
+
+  const hit = (state.overrides ?? []).find(
+    (override) => JSON.stringify(override.path) === key,
   )
-  return hit?.value
+  if (hit !== undefined) return hit.value
+
+  if (state.mode !== 'replace' || state.replacement === undefined) return undefined
+  let cursor: unknown = state.replacement
+  for (const segment of path) {
+    if (cursor === null || typeof cursor !== 'object') return undefined
+    cursor = (cursor as Record<string | number, unknown>)[segment]
+  }
+  return cursor
 }
 
 /**

@@ -11,7 +11,7 @@
  *    generator is a hand-rolled 32-bit PRNG — core takes no dependencies, and the
  *    testkit follows the same rule, so there is no `fast-check`.
  */
-import {checksum} from '../../sanity-overlay-core/src/index'
+import {checksum} from 'sanity-overlay-core'
 import type {
   BaseDocumentVersion,
   LocalDocumentVersion,
@@ -20,7 +20,7 @@ import type {
   OverlayOperation,
   OverlayPath,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 
 /* ------------------------------------------------------------------ *
  * Deterministic PRNG

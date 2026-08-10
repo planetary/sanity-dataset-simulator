@@ -25,8 +25,8 @@ import type {
   OverlayValidationIssue,
   SerializedSchemaArtifact,
   SerializedSchemaField,
-} from '../../sanity-overlay-core/src/validation/index'
-import type {SanityDocument} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core/validation'
+import type {SanityDocument} from 'sanity-overlay-core'
 
 /**
  * A second artifact for the same fixture types with **no** required fields.

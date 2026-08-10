@@ -23,11 +23,11 @@
 import {
   classifyTokenEnvKey,
   isBrowserReachableEnvKey,
-} from '../../../sanity-overlay-studio/src/options'
+} from 'sanity-overlay-studio/options'
 import {
   DISABLED_HOSTED_TOOL_NAMES,
   HOSTED_FEATURES,
-} from '../../../sanity-overlay-studio/src/features'
+} from 'sanity-overlay-studio/features'
 import type {CiFinding} from './checks'
 
 /* ------------------------------------------------------------------ *

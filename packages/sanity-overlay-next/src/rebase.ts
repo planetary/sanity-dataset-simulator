@@ -25,15 +25,17 @@ import {
   applySyntheticSystemFields,
   autoRebase,
   canonicalEquals,
-} from '../../sanity-overlay-core/src/index'
+  currentBaseForAncestor,
+} from 'sanity-overlay-core'
 import type {
   AutoRebaseRequest,
+  BaseDocumentSource,
   LocalDocumentVersion,
   OverlayActor,
   OverlayDocumentRecord,
   RebaseMode,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 
 export type StudioRebaseMode = RebaseMode | 'auto'
 
@@ -135,8 +137,15 @@ function withLocal(
 export interface RebaseRunOptions {
   mode: StudioRebaseMode
   records: readonly OverlayDocumentRecord[]
-  /** The base as it stands now, keyed by logical id. */
-  currentBase: ReadonlyMap<string, SanityDocument>
+  /**
+   * The base as it stands now — as a PERSPECTIVE-AWARE port, not a map.
+   *
+   * A `ReadonlyMap<string, SanityDocument>` was the defect: `drafts.X` and `X`
+   * are two different base documents and any single-key map has to lose one of
+   * them. Which one a given record needs is decided by its `ancestorKind`, and
+   * `currentBaseForAncestor` is the one place that decides it.
+   */
+  currentBase: BaseDocumentSource
   overlayRevision: number
   now: string
   actor: OverlayActor
@@ -184,7 +193,11 @@ export function runRebase(options: RebaseRunOptions): RebaseRunResult {
      * without a non-null assertion. */
     if (local === null) continue
 
-    const currentBase = options.currentBase.get(record.logicalId) ?? null
+    const currentBase = currentBaseForAncestor(
+      options.currentBase,
+      record.logicalId,
+      local.ancestorKind,
+    )
     const ancestorRevision = ancestorRevisionFor(record, local)
 
     const request: AutoRebaseRequest = {

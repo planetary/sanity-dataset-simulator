@@ -35,6 +35,43 @@ export interface OverlayMutationEvent {
   projection: null
 }
 
+/**
+ * "I cannot describe what just happened to these documents — re-read them."
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY A REFUSAL HAS TO BE AN EVENT AND NOT ONLY A LOG LINE.
+ *
+ * A write the echo cannot spell as a frame leaves `BufferedDocument.submitted`
+ * non-empty for ever. That is not a cosmetic defect: `consistencyStatus` never
+ * flips, so `publish`, `unpublish`, `discardChanges` and `delete` — every
+ * `REQUIRES_CONSISTENCY` operation in `sanity@6.8.0` — silently never execute,
+ * and the pane reports `Saving…` until the tab is closed. Logging the reason
+ * tells whoever opens the console; it does not un-wedge the editor.
+ *
+ * `reset` is `sanity`'s OWN spelling for this. `getPairListener` maps a `reset`
+ * (or `welcome`) straight onto `fetchInitialDocumentSnapshots()`
+ * (`lib/datastores-DqFH7RLd.js:1681`), and a `snapshot` event rebuilds the
+ * BufferedDocument from what that fetch returns — which, through the facade's
+ * read tap, is the branch state the overlay just persisted. So the recovery is
+ * "go and read the truth", which is the only honest thing left to say, and it is
+ * a protocol path Studio already implements rather than one invented here.
+ *
+ * BOUNDED, because an unbounded one is a livelock: a resync re-commits whatever
+ * the buffer still holds, and if that write is unechoable too the pair would
+ * loop. After {@link MAX_RESYNCS_PER_DOCUMENT} the echo stops asking and says
+ * so, which leaves a stated dead end instead of a spinning one.
+ */
+export interface OverlayResyncEvent {
+  type: 'reset'
+  /** One sentence naming what could not be echoed. */
+  reason: string
+  /** The addresses whose frames could not be built. */
+  documentIds: readonly string[]
+}
+
+/** Everything the echo can put on a merged listener channel. */
+export type OverlayListenerEvent = OverlayMutationEvent | OverlayResyncEvent
+
 /** What the echo intends to tell Studio about one document. */
 export interface PlannedEvent {
   documentId: string
@@ -60,6 +97,22 @@ export interface OverlayDocState {
   doc?: Rec
   /** True once the revision chain for this document is echo-owned. */
   synthetic?: boolean
+  /**
+   * True when `rev` is the revision the PANE was handed — the overlay body the
+   * read tap substituted — rather than the one base reported.
+   *
+   * SEPARATE FROM {@link OverlayDocState.synthetic}, and the separation is
+   * load-bearing. `synthetic` says "this overlay minted the revision AND the
+   * stored `doc` must not be offered as a merge ancestor" (`runtime.ts`
+   * `baseDocuments`, §16.1/§17.1). Substituting a body into a read says only the
+   * first half: `doc` still holds the RAW base answer, which is exactly the
+   * ancestor a rebase needs. Collapsing the two silently emptied
+   * `baseDocuments`, which disables the rebase action with "no current base".
+   *
+   * Both flags protect the revision from being clobbered by a later
+   * non-authoritative read — see {@link seedFromDocument}.
+   */
+  paneRev?: boolean
 }
 
 /**
@@ -103,6 +156,16 @@ export interface OverlayEchoOptions {
   identity?: string
   onError?: (message: string) => void
   onEmit?: (event: OverlayMutationEvent, subscribers: number) => void
+  /**
+   * The namespace every {@link OverlayEcho.nextTransactionId} sits in — see
+   * {@link newOverlaySessionId} for why it exists.
+   *
+   * INJECTED ONLY FOR DETERMINISM, AND THE DEFAULT IS NOT WEAKENED TO SUIT IT. A
+   * test that wants the old fixed `overlay-…-1`, `overlay-…-2` sequence states a
+   * session id and gets it; production never does, and gets a fresh unique one
+   * per echo. Nothing may make this default to a constant.
+   */
+  sessionId?: string
 }
 
 export interface OverlayEcho {
@@ -126,12 +189,76 @@ export interface OverlayEcho {
    */
   setOverlaySuppressed(id: string, suppressed: boolean): void
   isOverlaySuppressed(id: string): boolean
+  /**
+   * Record what the pane was ACTUALLY handed for one address, after the read tap
+   * substituted the branch's body (or its tombstone) into a base answer.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * THE INVARIANT THIS EXISTS TO KEEP: the revision the echo chains the next
+   * frame off must be the revision the pane's HEAD actually carries.
+   *
+   * `seedFromResult` records the RAW base answer, and it has to — that body is
+   * the merge ancestor §17 recomputes against, and overwriting it with an
+   * overlay body would make the overlay its own ancestor. But the pane is not
+   * given the raw answer. It is given `echo.getOverlayDocument(id)`, whose `_rev`
+   * is a SYNTHETIC overlay revision (§13.9), or `null` for a tombstoned address.
+   *
+   * Without this the two diverge silently, and the divergence is fatal in both
+   * directions:
+   *
+   *   - base answered `null`, branch body substituted → the echo believes there
+   *     is no revision and omits `previousRev`, while `Document.considerIncoming`
+   *     looks for `previousRev === HEAD._rev` and finds nothing. Nothing is ever
+   *     applied. Reopening a branch-created document therefore wedged the pane
+   *     at `Saving…` for the life of the tab.
+   *   - base answered a document, branch tombstoned it → the pane's HEAD is
+   *     `null` and needs `appliesToMissingDocument`, while the echo would build a
+   *     patch frame chained off the base revision. Same wedge, opposite cause.
+   *
+   * `doc` is deliberately NOT touched: only the revision chain moves.
+   */
+  notePaneSnapshot(id: string, document: Rec | null): void
   subscribe(
     ids: readonly string[],
-    handler: (event: OverlayMutationEvent) => void,
+    handler: (event: OverlayListenerEvent) => void,
   ): OverlaySubscription
   subscriberCount(): number
+  /**
+   * A transaction id no other page load, tab or process will ever issue.
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * IT IS NOT A NAME. IT IS THE DEDUPLICATION AUTHORITY.
+   *
+   * `facade.ts` uses this value as the `idempotencyKey` of every write Studio
+   * did not supply its own uuid `transactionId` for — which is precisely the
+   * §18.4-§18.9 document actions: publish, unpublish, discard, delete,
+   * duplicate, restore. The ledger those keys are resolved against is DURABLE
+   * (`.runtime/indexes/idempotency/`), so it outlives the tab.
+   *
+   * This used to be `overlay-${counter}-${hash(counter)}` over a closure counter
+   * seeded at 0 per page load. The hash carried no entropy — it was a pure
+   * function of the counter — so every page load emitted the identical sequence
+   * and the Nth document action after any reload REPLAYED the Nth of an earlier
+   * one: `200 {"committed": false, "replayed": true}`, nothing applied, and the
+   * editor told it had saved. `examples/kitchen-sink/spikeA/localEcho.ts` had
+   * already found this and fixed it with a per-page-load `sessionId()` prefix;
+   * the prefix was lost when the spike was rewritten into this package.
+   *
+   * The counter survives as the ORDINAL, because that is what it was worth:
+   * ordered, readable ids in the write ledger and in a devtools trace. Only the
+   * namespace it lives in became unique. See {@link OverlayEchoOptions.sessionId}.
+   */
   nextTransactionId(): string
+  /**
+   * Ask every pane watching these addresses to discard its model and re-read.
+   *
+   * Called by {@link emit} whenever a plan produced no frame, and by the facade
+   * for a commit that provably did NOT land (`fatal`, `stale`) — in both cases
+   * the pane holds a submitted transaction that nothing will ever answer, and
+   * the difference between "wrong" and "wedged" is whether it is told so.
+   * Bounded per address; see {@link OverlayResyncEvent}.
+   */
+  requestResync(documentIds: readonly string[], reason: string): void
   planActions(payload: unknown): OverlayEchoPlan
   planMutations(body: unknown): OverlayEchoPlan
   planWrite(method: string, arg: unknown, options?: unknown): OverlayEchoPlan
@@ -155,6 +282,35 @@ export interface OverlayEcho {
 const GUARD_FIELD = '_empty_action_guard_pseudo_field_'
 const DEFAULT_IDENTITY = 'sanity-overlay'
 
+/**
+ * One unique identity per echo — i.e. per page load, per tab, per process.
+ *
+ * THE SAME SCHEME STUDIO'S OWN EDITS ALREADY USE, deliberately, rather than a
+ * second one. An ordinary edit reaches the facade carrying a `transactionId`
+ * that sanity 6.8.0 minted with `@sanity/uuid`, which is an RFC 4122 v4 uuid
+ * drawn from the platform CSPRNG — that is exactly what `crypto.randomUUID()`
+ * returns, so edits and document actions now share one notion of "unique".
+ *
+ * The fallback is not decoration. `crypto` is unavailable on a non-secure origin
+ * in some browsers and absent from older Node, and an echo with no session id at
+ * all would silently reinstate the collision this function exists to remove. So
+ * it degrades through `getRandomValues` to a time-plus-`Math.random()` value:
+ * weaker, still not a constant, and never zero entropy.
+ */
+export function newOverlaySessionId(): string {
+  const source = (globalThis as {crypto?: Crypto}).crypto
+  try {
+    if (typeof source?.randomUUID === 'function') return source.randomUUID()
+    if (typeof source?.getRandomValues === 'function') {
+      const bytes = source.getRandomValues(new Uint8Array(16))
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+    }
+  } catch {
+    /* A hardened environment can throw rather than omit; fall through. */
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
 const EDIT_ACTIONS = new Set([
   'sanity.action.document.edit',
   'sanity.action.document.version.replace',
@@ -171,6 +327,15 @@ export const DUPLICATE_TAG = 'document.duplicate'
 export const DUPLICATE_ACTION = 'sanity.overlay.document.duplicate'
 
 const CREATE_METHODS = new Set(['create', 'createOrReplace', 'createIfNotExists'])
+
+/** The Actions API's own spelling of "this document did not exist before". */
+const CREATE_ACTION = 'sanity.action.document.create'
+
+/**
+ * How many times one address may be told to re-read itself before the echo gives
+ * up and says so. See {@link OverlayResyncEvent}.
+ */
+export const MAX_RESYNCS_PER_DOCUMENT = 3
 
 function isRec(value: unknown): value is Rec {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -322,12 +487,15 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
   const overlaySuppressed = new Set<string>()
   const listeners = new Set<{
     ids: Set<string>
-    handler: (event: OverlayMutationEvent) => void
+    handler: (event: OverlayListenerEvent) => void
   }>()
   /** Transactions already delivered — a replay must never become a second frame. */
   const emitted = new Set<string>()
+  /** How many times each address has been asked to re-read itself. */
+  const resyncs = new Map<string, number>()
 
   let txCounter = 0
+  const sessionId = options.sessionId ?? newOverlaySessionId()
   let session: OverlaySessionState = 'active'
   const authFailureLog: OverlayAuthFailure[] = []
 
@@ -414,12 +582,13 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
     const id = value._id
     if (typeof id !== 'string') return
     const current = docs.get(id)
-    if (!authoritative && current?.synthetic) return
+    if (!authoritative && (current?.synthetic === true || current?.paneRev === true)) return
     setDocState(id, {
       rev: typeof value._rev === 'string' ? value._rev : undefined,
       updatedAt: typeof value._updatedAt === 'string' ? value._updatedAt : undefined,
       doc: authoritative ? value : current?.doc,
       synthetic: false,
+      paneRev: false,
     })
   }
 
@@ -429,6 +598,39 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       return
     }
     seedFromDocument(value, authoritative)
+  }
+
+  /** See {@link OverlayEcho.notePaneSnapshot}. */
+  function notePaneSnapshot(id: string, document: Rec | null): void {
+    if (document === null) {
+      /* The branch removed this address, so the pane's HEAD is `null` and only a
+       * create-shaped frame can ever apply to it again. */
+      setDocState(id, {rev: undefined, updatedAt: undefined, paneRev: true})
+      return
+    }
+    const rev = typeof document._rev === 'string' && document._rev !== '' ? document._rev : undefined
+    if (rev === undefined) {
+      /*
+       * UNRECOVERABLE BY ANY FRAME, SO IT IS SAID OUT LOUD.
+       *
+       * `Document.considerIncoming` will only look for a successor when
+       * `HEAD._rev` is truthy (`@sanity/mutator@6.8.0`): a HEAD that exists and
+       * carries no revision accepts NOTHING, for ever. Core stamps every
+       * materialized body with a synthetic `_rev` (`applySyntheticSystemFields`),
+       * so reaching this means an overlay answered without one, and no frame this
+       * module could build would help.
+       */
+      noteError(
+        `the overlay body substituted for ${id} carries no _rev, so nothing this session ` +
+          `echoes can ever be applied to it — @sanity/mutator only advances a HEAD that has a ` +
+          `revision. The document pane will not settle until it is re-read.`,
+      )
+    }
+    setDocState(id, {
+      rev,
+      updatedAt: typeof document._updatedAt === 'string' ? document._updatedAt : undefined,
+      paneRev: true,
+    })
   }
 
   /** Learn the real revision chain from an event another client produced. */
@@ -447,7 +649,7 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
 
   function subscribe(
     ids: readonly string[],
-    handler: (event: OverlayMutationEvent) => void,
+    handler: (event: OverlayListenerEvent) => void,
   ): OverlaySubscription {
     /* After logout the session is over: a late subscription (a pane torn down
      * asynchronously, a retrying listener) must not re-open a delivery channel. */
@@ -498,10 +700,51 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
     return state?.doc
   }
 
+  /**
+   * A body re-addressed to `documentId`, with the revision metadata removed.
+   *
+   * `_rev` and `_updatedAt` are the frame's to state — `Mutation.compile` writes
+   * `resultRev` and the frame timestamp over them — and leaving the SOURCE's
+   * values in the payload would put a revision in the pane that no event ever
+   * announced.
+   */
+  function reidentify(body: Rec, documentId: string, options: {keepCreatedAt: boolean}): Rec {
+    const copy: Rec = {...body, _id: documentId}
+    delete copy._rev
+    delete copy._updatedAt
+    if (!options.keepCreatedAt) delete copy._createdAt
+    return copy
+  }
+
+  /**
+   * `Mutation.appliesToMissingDocument`, transcribed from `@sanity/mutator@6.8.0`
+   * (`lib/index.js:1220`) because it is the ONLY question the mutator asks of a
+   * frame whose target document does not exist:
+   *
+   *     nextMut = this.HEAD
+   *       ? (HEAD._rev ? incoming.find(m => m.previousRev === HEAD._rev) : undefined)
+   *       : incoming.find(m => m.appliesToMissingDocument())
+   *
+   * A frame that fails it against a missing HEAD is not rejected — it is
+   * BUFFERED, for ever, and the document is inconsistent for as long as it sits
+   * there. Delivering one is therefore strictly worse than delivering nothing.
+   */
+  function appliesToMissingDocument(mutations: readonly Rec[]): boolean {
+    const first = mutations[0]
+    if (first === undefined) return true
+    return Boolean(first.create ?? first.createIfNotExists ?? first.createOrReplace)
+  }
+
+  /** `buildFrame`'s third answer: nothing happened here that is worth saying. */
+  const NOTHING_TO_SAY = 'nothing-to-say' as const
+
   function buildFrame(
     plan: PlannedEvent,
     transactionId: string,
-  ): Omit<OverlayMutationEvent, 'transactionCurrentEvent' | 'transactionTotalEvents'> | null {
+  ):
+    | Omit<OverlayMutationEvent, 'transactionCurrentEvent' | 'transactionTotalEvents'>
+    | null
+    | typeof NOTHING_TO_SAY {
     const state = docs.get(plan.documentId)
     const previousRev = state?.rev
     const timestamp = nextTimestamp(state)
@@ -518,11 +761,9 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
         )
         return null
       }
-      const copy: Rec = {...source, _id: plan.documentId}
-      delete copy._rev
-      delete copy._updatedAt
-      delete copy._createdAt
-      mutations = [{createOrReplace: copy}]
+      mutations = [
+        {createOrReplace: reidentify(source, plan.documentId, {keepCreatedAt: false})},
+      ]
     } else if (plan.mutations) {
       mutations = plan.mutations
     } else if (previousRev) {
@@ -533,24 +774,101 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
         {patch: {id: plan.documentId, unsetIsEmpty: false, ...(plan.patch ?? {})}},
       ]
     } else {
-      /* Document unknown: the Actions API edit creates the draft from the current
-       * published version first. Reproduce that, otherwise @sanity/mutator
-       * refuses the event (`appliesToMissingDocument === false`). */
+      /*
+       * ───────────────────────────────────────────────────────────────────────
+       * THE PANE HOLDS NO REVISION FOR THIS ADDRESS, SO THE FRAME MUST CREATE IT.
+       *
+       * `@sanity/mutator`'s `Document.considerIncoming` only consults
+       * `appliesToMissingDocument()` when `HEAD` is null, and that returns true
+       * for exactly `create` / `createIfNotExists` / `createOrReplace`. A patch
+       * frame here is not merely wrong, it is inert: it sits in `incoming` for
+       * ever and the document never becomes consistent.
+       *
+       * Two ways to spell a create, and which one is TRUE depends on where the
+       * document came from.
+       */
       const base = plan.cloneFrom ? bodyFor(plan.cloneFrom) : undefined
-      if (!base) {
+      if (base) {
+        /* A BASE document being drafted for the first time. The Actions API's
+         * edit really does clone the published version and then patch it, so the
+         * two-mutation form is what the Content Lake would have reported. The
+         * patch is not double-applied: `base` is the PUBLISHED body, which this
+         * edit has not touched. */
+        mutations = [
+          {createIfNotExists: reidentify(base, plan.documentId, {keepCreatedAt: true})},
+          {patch: {id: plan.documentId, unsetIsEmpty: false, ...(plan.patch ?? {})}},
+        ]
+      } else {
+        /*
+         * A BRANCH-CREATED document: it exists nowhere upstream, so there is no
+         * published version to clone and the refusal that used to stand here was
+         * the whole §21.2 defect — in Mode 2 EVERY document takes this branch.
+         *
+         * The body the overlay just materialized is the honest answer, and it is
+         * available because `persistAndEcho` seeds it from the commit's own
+         * hydration before calling `emit`. So the frame says "after this
+         * transaction this address holds exactly these bytes", which is a
+         * statement about the disk rather than about what Studio asked for.
+         *
+         * ONE `createOrReplace`, NOT `createIfNotExists` + the patch. The
+         * materialized body ALREADY has the patch folded in — core applied it —
+         * so replaying the patch on top would apply it twice. That is invisible
+         * for `set` and silently wrong for `inc`, `dec` and `insert`.
+         */
+        const branch = bodyFor(plan.documentId)
+        if (branch === undefined) {
+          noteError(
+            `cannot echo ${plan.documentId}: the pane holds no revision for it, there is no ` +
+              `published base to clone, and the overlay reported no body for it either — so ` +
+              `there is nothing true to say about what this address now contains`,
+          )
+          return null
+        }
+        mutations = [
+          {createOrReplace: reidentify(branch, plan.documentId, {keepCreatedAt: true})},
+        ]
+      }
+      transition = 'appear'
+    }
+
+    /*
+     * ───────────────────────────────────────────────────────────────────────────
+     * THE APPLICABILITY GUARD — the class the two refusals above belong to.
+     *
+     * Everything so far asks "can I describe this change?". This asks the
+     * question that actually decides whether the pane settles: "given what the
+     * pane HOLDS, can the mutator apply what I am about to send?" A frame that
+     * fails it is worse than a refusal, because it is delivered, looks fine in
+     * every log, and wedges the document silently.
+     *
+     * Two reachable shapes, and they want opposite answers:
+     *
+     *   DELETE of an address the pane does not hold. `planActions` emits a
+     *   `disappear` for the published id of a branch-created document that was
+     *   never published, and the Content Lake would emit nothing at all there.
+     *   Saying nothing is not a refusal — there is genuinely no change to report
+     *   — so it must not trigger a resync either.
+     *
+     *   PATCH-FIRST mutations against a missing document. `planMutations` passes
+     *   Studio's own mutation list through verbatim, and a live-edit type's first
+     *   keystroke is `[{patch: …}]` against a published document that does not
+     *   exist yet. The overlay has already created it by the time this runs, so
+     *   the truthful frame is the body the overlay now holds.
+     */
+    if (!previousRev && !appliesToMissingDocument(mutations)) {
+      if (transition === 'disappear') return NOTHING_TO_SAY
+      const branch = bodyFor(plan.documentId)
+      if (branch === undefined) {
         noteError(
-          `cannot echo ${plan.documentId}: no known revision and no published base to clone ` +
-            `(open the document pane first so the snapshot fetch can seed it)`,
+          `cannot echo ${plan.documentId}: the pane holds no revision for it and this write ` +
+            `starts with a patch, which @sanity/mutator can never apply to a missing document. ` +
+            `The overlay reported no body to state instead.`,
         )
         return null
       }
-      const seed: Rec = {...base, _id: plan.documentId}
-      delete seed._rev
-      mutations = [
-        {createIfNotExists: seed},
-        {patch: {id: plan.documentId, unsetIsEmpty: false, ...(plan.patch ?? {})}},
-      ]
-      transition = 'appear'
+      /* The materialization already has these mutations folded in, so it
+       * REPLACES them rather than being prepended to them. */
+      mutations = [{createOrReplace: reidentify(branch, plan.documentId, {keepCreatedAt: true})}]
     }
 
     /* A surviving document is `appear` exactly when the pane does not hold it yet
@@ -580,6 +898,45 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
 
   /* -------------------------------------------------------------- emit */
 
+  /**
+   * Tell every pane watching these addresses to throw its model away and re-read.
+   *
+   * The alternative is silence, and silence here is an indefinite `Saving…` plus
+   * four document actions that never run. See {@link OverlayResyncEvent}.
+   */
+  function requestResync(documentIds: readonly string[], reason: string): void {
+    const askable: string[] = []
+    for (const id of documentIds) {
+      const used = resyncs.get(id) ?? 0
+      if (used >= MAX_RESYNCS_PER_DOCUMENT) {
+        noteError(
+          `${id} has already been re-read ${used} times and still cannot be echoed; this pane ` +
+            `will not settle and no consistency-gated action (publish, unpublish, discard, ` +
+            `delete) will run on it. Reload the Studio. Reason: ${reason}`,
+        )
+        continue
+      }
+      resyncs.set(id, used + 1)
+      askable.push(id)
+    }
+    if (askable.length === 0) return
+
+    noteError(
+      `asking the document pane to re-read ${askable.join(', ')} because the change could not ` +
+        `be echoed: ${reason}. The write itself is unaffected — this only replaces the pane's ` +
+        `model with what the overlay actually holds.`,
+    )
+    const event: OverlayResyncEvent = {type: 'reset', reason, documentIds: askable}
+    for (const entry of Array.from(listeners)) {
+      if (!askable.some((id) => entry.ids.has(id))) continue
+      try {
+        entry.handler(event)
+      } catch (error) {
+        noteError(`overlay listener threw on resync: ${String(error)}`)
+      }
+    }
+  }
+
   function emit(plans: readonly PlannedEvent[], transactionId: string): OverlayMutationEvent[] {
     if (plans.length === 0) return []
     /* Checked before `emitted` is touched, so a logged-out emit leaves no trace
@@ -594,9 +951,66 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
 
     /* Built before anything is delivered, so every frame in a transaction chains
      * off the revision that was current when the transaction started. */
-    const built = plans
-      .map((plan) => buildFrame(plan, transactionId))
-      .filter((frame): frame is NonNullable<typeof frame> => frame !== null)
+    const attempts = plans.map((plan) => ({plan, frame: buildFrame(plan, transactionId)}))
+
+    /*
+     * ───────────────────────────────────────────────────────────────────────────
+     * ONE DOCUMENT, ONE FRAME PER TRANSACTION. THE CONTENT LAKE HAS NO OTHER SHAPE.
+     *
+     * A listener event carries a LIST of mutations precisely because a
+     * transaction may touch one document several times; `previousRev` and
+     * `resultRev` describe the transaction, not the individual mutation. Two
+     * events for the same document in the same transaction would therefore both
+     * claim `previousRev → resultRev`, and only the first can ever apply:
+     * `Document.considerIncoming` advances `HEAD._rev` to `resultRev`, after
+     * which the second no longer matches anything and sits in `incoming` for
+     * ever, holding the document inconsistent.
+     *
+     * This is not hypothetical. `toActions` flatMaps mutations to actions
+     * (`sanity@6.8.0 lib/datastores-DqFH7RLd.js:1766`), so the ordinary edit of
+     * an EXISTING draft — `[{patch: unset guard}, {patch: …}]`, squashed into one
+     * commit by `SquashingBuffer` — arrives here as TWO
+     * `sanity.action.document.edit` actions for one draft. Every reopened
+     * document took that path.
+     *
+     * Merging concatenates the mutation lists in plan order and keeps the LAST
+     * transition, so a create-then-delete inside one transaction still ends as
+     * `disappear`.
+     */
+    type BuiltFrame = Exclude<(typeof attempts)[number]['frame'], null | typeof NOTHING_TO_SAY>
+    const byDocument = new Map<string, BuiltFrame>()
+    const order: string[] = []
+    for (const {frame} of attempts) {
+      if (frame === null || frame === NOTHING_TO_SAY) continue
+      const existing = byDocument.get(frame.documentId)
+      if (existing === undefined) {
+        byDocument.set(frame.documentId, frame)
+        order.push(frame.documentId)
+        continue
+      }
+      byDocument.set(frame.documentId, {
+        ...existing,
+        mutations: [...existing.mutations, ...frame.mutations],
+        transition: frame.transition,
+      })
+    }
+    const built = order.map((documentId) => byDocument.get(documentId)!)
+
+    /*
+     * A PLAN WITH NO FRAME IS A PANE THAT WILL NEVER SETTLE, so it is never left
+     * silent. `buildFrame` has already said WHY on `noteError`; this says what is
+     * being done about it, and does the one thing that can still be done.
+     */
+    const unechoed = attempts
+      .filter((attempt) => attempt.frame === null)
+      .map((attempt) => attempt.plan.documentId)
+    if (unechoed.length > 0) {
+      requestResync(
+        unechoed,
+        `transaction ${transactionId} could not be spelled as a listener frame`,
+      )
+    }
+
     if (built.length === 0) return []
 
     for (const entry of Array.from(listeners)) {
@@ -784,13 +1198,47 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
         continue
       }
 
-      if (type === 'sanity.action.document.create') {
+      /* ------------------------------------------------- §18.4 create */
+      /*
+       * A CREATE IS NOT AN OPERATION WITHOUT AN OVERLAY SPELLING. IT IS THE
+       * MOST COMMON ONE THERE IS.
+       *
+       * `sanity@6.8.0`'s first edit of a document that has no published version
+       * is `draft.create(...)` followed immediately by `draft.commit()`
+       * (`patch.execute`, `lib/datastores-DqFH7RLd.js:2338`), and `toActions`
+       * turns that into `sanity.action.document.create` (`:1768`). In Mode 2 no
+       * document has a published version, so this is the FIRST transaction of
+       * every document in the branch — and it was being committed to the overlay
+       * while being reported to the pane as unrepresentable, with no frame.
+       *
+       * The commit was never the problem: the create was already in
+       * `mutationActions` and the bytes always landed. What was missing was the
+       * frame, and `create` is the one mutation shape `@sanity/mutator` accepts
+       * against a missing HEAD.
+       */
+      if (type === CREATE_ACTION) {
         const attributes = isRec(action.attributes) ? action.attributes : undefined
         const id =
           attributes !== undefined && typeof attributes._id === 'string' ? attributes._id : undefined
+        /* A restore-from-deleted sends a guarded create AND a full-body
+         * `replaceDraft` for the same draft; echoing both would put two frames in
+         * one transaction and leave the second unchainable. */
         if (id !== undefined && supersededCreates.has(id)) continue
+        if (attributes === undefined || id === undefined) {
+          /* Nothing to create and nothing to say about it. Refused by name rather
+           * than echoed as a guess. */
+          mutationActions.push(action)
+          unsupported.push(`${type}: no attributes carrying an _id`)
+          continue
+        }
+        plans.push({
+          documentId: id,
+          transition: 'appear',
+          /* The body Studio submitted and the overlay committed. Copied, because
+           * `Mutation.compile` writes `_createdAt` into the payload in place. */
+          mutations: [{create: {...attributes}}],
+        })
         mutationActions.push(action)
-        unsupported.push(type)
         continue
       }
 
@@ -863,7 +1311,12 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
     const rev = document._rev
     if (typeof rev !== 'string' || rev.length === 0) return undefined
     for (const [id, state] of docs) {
-      if (state.rev !== rev || state.synthetic === true) continue
+      /* `paneRev` is excluded alongside `synthetic` for the same reason: both
+       * mark a revision this overlay minted (§13.9), and a §18.9 duplicate names
+       * its source by matching a revision the CONTENT LAKE issued. A duplicate of
+       * a branch-only document therefore falls through to an ordinary create —
+       * an existing gap, unchanged here, not a consequence of the split. */
+      if (state.rev !== rev || state.synthetic === true || state.paneRev === true) continue
       if (id === document._id) continue
       const knownType = state.doc?._type
       if (knownType !== undefined && knownType !== document._type) continue
@@ -957,13 +1410,14 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       else overlaySuppressed.delete(id)
     },
     isOverlaySuppressed: (id) => overlaySuppressed.has(id),
+    notePaneSnapshot,
     subscribe,
     subscriberCount: () => listeners.size,
     nextTransactionId: () => {
       txCounter += 1
-      const suffix = ((txCounter * 2654435761) % 4294967296).toString(36).padStart(6, '0').slice(-6)
-      return `overlay-${txCounter}-${suffix}`
+      return `overlay-${sessionId}-${txCounter}`
     },
+    requestResync,
     planActions,
     planMutations,
     planWrite,

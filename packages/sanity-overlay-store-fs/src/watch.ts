@@ -24,7 +24,7 @@
  * flight joins the running pass instead of starting a racing one, so two
  * revalidations can never interleave their repair writes.
  */
-import type {OverlayRevalidationReport} from '../../sanity-overlay-core/src/index'
+import type {OverlayRevalidationReport} from 'sanity-overlay-core'
 import type {FsOverlayStore} from './fsStore'
 
 export interface OverlayWatchOptions {

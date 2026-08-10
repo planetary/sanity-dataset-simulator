@@ -11,9 +11,9 @@
  * takes those hits as an injected input; this file is the stand-in for that query
  * (plan §8.4: "with base-side reverse-reference results supplied as fixtures").
  */
-import type {OverlayActor, SanityDocument} from '../../sanity-overlay-core/src/index'
-import type {BaseReverseReferenceHit} from '../../sanity-overlay-core/src/references/index'
-import type {SerializedSchemaArtifact} from '../../sanity-overlay-core/src/validation/index'
+import type {OverlayActor, SanityDocument} from 'sanity-overlay-core'
+import type {BaseReverseReferenceHit} from 'sanity-overlay-core/references'
+import type {SerializedSchemaArtifact} from 'sanity-overlay-core/validation'
 
 export const REFERENCE_ACTOR: OverlayActor = {
   type: 'user',

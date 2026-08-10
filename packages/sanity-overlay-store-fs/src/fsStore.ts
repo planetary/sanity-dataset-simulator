@@ -59,6 +59,7 @@ import {
   CHECKPOINT_CHECKSUMS_FILE,
   OVERLAY_FORMAT_VERSION,
   assertFormatVersion,
+  assertGenuineStoreReplay,
   checksum as canonicalChecksum,
   canonicalize,
   encodeOverlayPath,
@@ -69,7 +70,7 @@ import {
   parse,
   serialize,
   toPublishedId,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {
   OverlayActor,
   OverlayCheckpointChecksums,
@@ -81,7 +82,7 @@ import type {
   OverlayStatus,
   OverlayTransactionRecord,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {readCheckpointDir} from './checkpointIo'
 import {watchOverlay, type OverlayWatchHandle, type OverlayWatchOptions} from './watch'
 import {
@@ -160,6 +161,7 @@ import {
   LOCKS_DIR,
   OverlayLayout,
   README_CONTENT,
+  reconcileScaffold,
   README_FILE,
   TEMP_PREFIX,
   documentKey,
@@ -910,6 +912,8 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       idempotencyKey: request.idempotencyKey,
     })
     if (replayed !== null) {
+      /* …but a replay must be a replay OF THIS REQUEST. See `store/replay.ts`. */
+      assertGenuineStoreReplay(request, replayed)
       const manifest = await this.#loadManifest()
       return {
         transaction: replayed,
@@ -2025,6 +2029,14 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
     const repairedChecksums: string[] = []
     const regenerated: string[] = []
 
+    /* Housekeeping first. `revalidate` is the documented repair entry point —
+     * the CLI's `normalize` calls it to fix a hand-edited overlay — and a
+     * `.gitattributes` missing a rule added by a later version is exactly that
+     * kind of drift. It is also the only path an ALREADY-CREATED overlay has to
+     * reach the scaffold at all: `#scaffold` is otherwise reached only from
+     * `createOverlay` and the two importers. */
+    await this.#scaffold()
+
     /* Step 2-3 for the manifest itself. */
     const manifestRead = await this.#readManifestFile()
     let manifestChanged = false
@@ -2331,8 +2343,14 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
       ].map((dir) => mkdir(dir, {recursive: true})),
     )
     await Promise.all([
-      this.#writeIfAbsent(this.layout.resolve(GITATTRIBUTES_FILE), GITATTRIBUTES_CONTENT),
-      this.#writeIfAbsent(this.layout.resolve(GITIGNORE_FILE), GITIGNORE_CONTENT),
+      /* `.gitattributes` and `.gitignore` are RECONCILED, not written once: both
+       * carry rules that protect content correctness, and an overlay created by
+       * an earlier version must gain a rule added later. See
+       * `reconcileScaffold` for the failure this repairs. The README is prose,
+       * so a stale one misleads but corrupts nothing — write-if-absent stays
+       * right for it, and rewriting it would fight a developer's own notes. */
+      this.#reconcileFile(this.layout.resolve(GITATTRIBUTES_FILE), GITATTRIBUTES_CONTENT),
+      this.#reconcileFile(this.layout.resolve(GITIGNORE_FILE), GITIGNORE_CONTENT),
       this.#writeIfAbsent(this.layout.resolve(README_FILE), README_CONTENT),
     ])
   }
@@ -2340,6 +2358,23 @@ export class FsOverlayStore implements OverlayStore, OverlayDirectEditStore, Ove
   async #writeIfAbsent(path: string, contents: string): Promise<void> {
     if (await exists(path)) return
     await this.#writeText(path, contents)
+  }
+
+  /**
+   * Ensure every required line is present, preserving whatever else is there.
+   *
+   * Writes only when something is genuinely missing, so the common case costs a
+   * read and no rename — this runs on `revalidate`, which is not a rare path.
+   */
+  async #reconcileFile(path: string, required: string): Promise<void> {
+    if (!(await exists(path))) {
+      await this.#writeText(path, required)
+      return
+    }
+    const existing = await readFile(path, 'utf8')
+    const merged = reconcileScaffold(existing, required)
+    if (merged === existing) return
+    await this.#writeText(path, merged)
   }
 
   /**

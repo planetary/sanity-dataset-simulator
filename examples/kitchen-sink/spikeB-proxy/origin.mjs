@@ -65,7 +65,7 @@ import {
   unpublish,
 } from '../../../packages/sanity-overlay-core/src/index.ts'
 import {FsOverlayStore} from '../../../packages/sanity-overlay-store-fs/src/index.ts'
-import {isLoopbackBind} from './originSafety.mjs'
+import {isGrantedOrigin} from './originSafety.mjs'
 
 /* ------------------------------------------------------------------ *
  * the synthetic identity
@@ -122,6 +122,40 @@ const DEFAULT_ACTOR = Object.freeze({
 
 const JSON_HEADERS = {'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store'}
 const MAX_BODY_BYTES = 8 * 1024 * 1024
+
+/**
+ * The transaction log is NDJSON, and NDJSON's empty document is ZERO LINES.
+ *
+ * `sanity@6.8.0` reads `/data/history/<ds>/transactions/<ids>` with the global
+ * `fetch` and decodes it line by line (`datastores-DqFH7RLd.js:6879 getStream`:
+ * split on "\n", `JSON.parse` each non-empty line, parse the trailing buffer at
+ * EOF). So the JSON envelope this endpoint used to answer —
+ * `{"transactions":[]}` — does not mean "no transactions". It decodes to
+ * exactly ONE transaction, the envelope, which has no `effects`, and
+ * `useBundleDocuments-BYW8M9LS.js:4965 getEditEvents` then evaluates
+ * `tx.effects[documentId]` and throws:
+ *
+ *     TypeError: Cannot read properties of undefined
+ *       (reading 'drafts.e2e-unicode-multihunk')
+ *
+ * observed live 2026-08-09, three-plus times per branch document. `[]` fails
+ * identically. The only body that decodes to nothing is nothing.
+ *
+ * `packages/sanity-overlay-studio/src/client/history.ts` states the same
+ * constant for the client half of this contract. The two are deliberately
+ * SEPARATE definitions — that module is a Studio-side client and this is a
+ * server; importing it here would invert the layering — and
+ * `test/origin-history-wire-format.test.ts` pins them equal so they cannot
+ * drift.
+ */
+const EMPTY_TRANSLOG_NDJSON = ''
+
+/**
+ * And it must be LABELLED as NDJSON. Studio parses these bytes line by line
+ * whatever the header says, but a body served as `application/json` tells every
+ * other reader of the same response something false about it.
+ */
+const NDJSON_CONTENT_TYPE = 'application/x-ndjson; charset=utf-8'
 
 /* ------------------------------------------------------------------ *
  * small helpers
@@ -193,22 +227,35 @@ async function readJson(request) {
  * page's ORIGIN is.
  */
 
-/** Is `value` an origin Mode 2 will talk to? */
-function isGrantedOrigin(value, allowed) {
-  if (typeof value !== 'string' || value === '') return false
-  if (allowed.has('*') || allowed.has(value)) return true
-  try {
-    const url = new URL(value)
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
-    /* The SAME predicate `assertLoopbackBind` uses, deliberately: one definition
-     * of "loopback" for the socket and for the caller. `Origin: null` — a
-     * sandboxed iframe or a `data:` document — fails `new URL` and is refused,
-     * which is right: it is not a name that can be granted. */
-    return isLoopbackBind(url.hostname)
-  } catch {
-    return false
-  }
-}
+/*
+ * Is `value` an origin Mode 2 will talk to? — `originSafety.mjs`, imported at
+ * the top of this file, and NOT a copy of it.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THERE WAS A PRIVATE COPY HERE, AND IT HAD ALREADY DRIFTED.
+ *
+ * The local version read `if (allowed.has('*') || allowed.has(value))`. The
+ * shared one has no wildcard clause, because `normalizeGrantedOrigins` refuses
+ * `'*'` outright: the proxy reflects the granted origin back with
+ * `Access-Control-Allow-Credentials: true`, so a wildcard there is the
+ * 2026-08-06 P2-4 hole restated as configuration. `origin.mjs` never ran its
+ * `origins` list through that normaliser, so `createOriginHandler({origins:
+ * ['*']})` granted `https://evil.example` a state-changing request against the
+ * whole branch — a list the proxy's own front door would have refused.
+ *
+ * The swap can only NARROW. For any allowlist, the shared predicate grants a
+ * strict subset of what the copy granted: the two clauses are identical except
+ * for the wildcard the copy honoured. `origin-granted-parity.test.ts` ran both
+ * against one corpus of origin shapes before the copy was deleted and recorded
+ * that they agreed on every case except exactly that one.
+ *
+ * Duplicating a security predicate is what produced the CORS hole in the first
+ * place: two copies agree the day they are written and nothing makes them keep
+ * agreeing. One definition — the same one `proxy.mjs` imports, and the same
+ * `isLoopbackBind` the bind check uses, so "loopback" means one thing for the
+ * socket and for the caller.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
 /**
  * Refuse a forged cross-site state-changing request.
@@ -1456,8 +1503,12 @@ export async function createOriginHandler(options = {}) {
              * but Studio's history UI reads Content Lake's `mendoza` event
              * stream, which is a different model entirely; translating one into
              * the other is PRD §37 Phase 5 work. Empty is honest: the document
-             * has no *Content Lake* history, because it has never been there. */
-            return jsonAnswer(historyAnswer(tail))
+             * has no *Content Lake* history, because it has never been there.
+             *
+             * `historyAnswer` returns a whole answer, not a body: one of these
+             * three endpoints is NDJSON and wrapping it in `jsonAnswer` is the
+             * bug this route used to have. */
+            return historyAnswer(tail)
           case 'mutate':
             return await handleMutate(request, url)
           case 'actions':
@@ -1574,10 +1625,54 @@ export async function createOriginHandler(options = {}) {
     }
   }
 
+  /**
+   * `<ids>` as Studio spells it: `ids.join(',')`, percent-encoded, possibly
+   * spread over the remaining path segments.
+   */
+  function historyDocumentIds(segments) {
+    return String(segments.join('/'))
+      .split(',')
+      .map((id) => {
+        try {
+          return decodeURIComponent(id)
+        } catch {
+          /* A malformed escape is still the id the caller asked about. */
+          return id
+        }
+      })
+      .filter((id) => id !== '')
+  }
+
+  /**
+   * The three history reads — THREE SHAPES, and two wire formats. Each one is
+   * dictated by how `sanity@6.8.0` decodes it, cited at the call site; every
+   * "obvious" empty answer here crashes a pane.
+   */
   function historyAnswer(tail) {
-    if (tail[0] === 'events') return {events: []}
-    if (tail[0] === 'transactions') return {transactions: []}
-    return {documents: []}
+    /* NDJSON, and empty means empty. See {@link EMPTY_TRANSLOG_NDJSON}. */
+    if (tail[0] === 'transactions') {
+      return {status: 200, raw: EMPTY_TRANSLOG_NDJSON, contentType: NDJSON_CONTENT_TYPE}
+    }
+
+    /* `useBundleDocuments-BYW8M9LS.js:5006` reads
+     * `response.events[documentId]?.map(…) || []`, so `events` is an OBJECT
+     * KEYED BY DOCUMENT ID. `{events: []}` is not a smaller version of that
+     * shape, it is a different one: the `?.` hides it at the call site, so the
+     * pane shows nothing and reports nothing. `nextCursor` must be a string or
+     * `loadMore` is handed `undefined` as a cursor. */
+    if (tail[0] === 'events') {
+      const events = {}
+      /* `events/documents/<ids>` is the spelling Studio sends; `events/<ids>`
+       * is accepted rather than 404'd, because the id list is the instruction
+       * and the extra segment is not. */
+      const rest = tail[1] === 'documents' ? tail.slice(2) : tail.slice(1)
+      for (const id of historyDocumentIds(rest)) events[id] = []
+      return jsonAnswer({events, nextCursor: ''})
+    }
+
+    /* `useBundleDocuments-BYW8M9LS.js:5101` reads `response.documents[0]` with
+     * NO optional chaining, so the envelope is not optional. */
+    return jsonAnswer({documents: []})
   }
 
   function queryParamsFrom(searchParams) {
@@ -1623,6 +1718,27 @@ export async function createOriginHandler(options = {}) {
         return
       }
 
+      /**
+       * A body that is NOT JSON.
+       *
+       * One route needs it — the NDJSON transaction log — and it needs it badly
+       * enough that serving it through `JSON.stringify` is a Studio crash (see
+       * {@link EMPTY_TRANSLOG_NDJSON}). The answer carries its own bytes and its
+       * own content type; everything else about the response is unchanged, so
+       * the CORS sanitisation above still applies to it.
+       */
+      if (typeof answer.raw === 'string') {
+        const bytes = Buffer.from(answer.raw, 'utf8')
+        response.writeHead(answer.status ?? 200, {
+          ...cors,
+          'content-type': answer.contentType ?? 'text/plain; charset=utf-8',
+          'cache-control': 'no-store',
+          'content-length': bytes.length,
+        })
+        response.end(bytes)
+        return
+      }
+
       const payload = JSON.stringify(answer.body ?? null)
       response.writeHead(answer.status ?? 200, {
         ...cors,
@@ -1633,9 +1749,33 @@ export async function createOriginHandler(options = {}) {
     } catch (error) {
       request.resume()
       const status = error instanceof OriginError ? error.status : 500
+      const code = error instanceof OriginError ? error.code : 'OVERLAY_ORIGIN_ERROR'
+
+      /**
+       * WHICH GATE REFUSED THIS, RECORDED WHERE `proxy.mjs` CAN LOG IT.
+       *
+       * This is the single chokepoint that turns an `OriginError` into a status,
+       * so it is the only place that knows. The proxy logs it as `refusal`
+       * alongside `disposition: 'local'`, which is what turns
+       *
+       *     POST /v…/data/mutate/parity → 415
+       *
+       * from something the network audit reported as an ESCAPED WRITE (it read
+       * `blocked !== true` as "forwarded to Sanity") into
+       *
+       *     …status: 415, disposition: 'local', gate: 'origin',
+       *       refusal: 'OVERLAY_ORIGIN_UNSUPPORTED_MEDIA_TYPE'
+       *
+       * A PLAIN PROPERTY, DELIBERATELY NOT A RESPONSE HEADER. The wire format of
+       * a security-sensitive origin should not change to carry a log field, and
+       * a header would additionally hand every browser client the name of the
+       * control that stopped it. The property never leaves this process.
+       */
+      response.overlayRefusalCode = code
+
       const payload = JSON.stringify({
         error: {
-          code: error instanceof OriginError ? error.code : 'OVERLAY_ORIGIN_ERROR',
+          code,
           description: error?.message ?? String(error),
           ...(error?.details === undefined ? {} : {details: error.details}),
         },

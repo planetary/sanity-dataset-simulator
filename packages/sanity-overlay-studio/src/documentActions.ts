@@ -50,8 +50,9 @@ import {
   type OverlayOperationCommand,
   type StudioRebaseMode,
 } from './operations'
-import {toPublishedId} from '../../sanity-overlay-core/src/index'
-import type {OverlayConflict} from '../../sanity-overlay-core/src/index'
+import {toPublishedId} from 'sanity-overlay-core'
+import type {OverlayConflict} from 'sanity-overlay-core'
+import {newOverlaySessionId} from './client/echo'
 import type {OverlayHydrationDocument, OverlayTransport} from './client/transport'
 
 /* ------------------------------------------------------------------ *
@@ -153,8 +154,28 @@ export interface OverlayActionControllerOptions {
    */
   baseDocuments?: (logicalIds: readonly string[]) => readonly unknown[]
   actor?: unknown
-  /** Monotonic counter for idempotency keys; injected so tests are deterministic. */
+  /**
+   * The ORDINAL inside {@link OverlayActionControllerOptions.sessionId};
+   * injected so tests are deterministic.
+   *
+   * It is no longer the identity — see `sessionId` below. Two controllers
+   * sharing this clock are now still distinguishable, which is what a pinned
+   * `() => 1000` in a test used to make impossible.
+   */
   now?: () => number
+  /**
+   * This controller's session identity — see {@link newOverlaySessionId}.
+   *
+   * `now()` ALONE WAS NOT AN IDENTITY. The key used to be
+   * `studio-${kind}-${Date.now()}`, which collides for two tabs acting in the
+   * same millisecond, for an impatient double-click, and — worst — for every
+   * test that injects the pinned clock this very interface advertises. The
+   * §34.6 ledger then answers the second one from the first one's record and
+   * reports a rebase or a checkpoint that never ran.
+   *
+   * Injected for determinism, unique by default, exactly as on the echo.
+   */
+  sessionId?: string
   /**
    * Render the §28.3 panel into a custom dialog. Without it the conflict action
    * still works (`resolve()` drives every action) but has no dialog of its own —
@@ -181,6 +202,7 @@ export function createOverlayActionController(
 ): OverlayActionController {
   const listeners = new Set<() => void>()
   const clock = options.now ?? ((): number => Date.now())
+  const sessionId = options.sessionId ?? newOverlaySessionId()
   let state: OverlayActionState = {dialogOpen: false, busy: false}
 
   function notify(): void {
@@ -209,7 +231,7 @@ export function createOverlayActionController(
     const result = await options.transport.operation({
       kind: command.kind,
       payload: command,
-      idempotencyKey: `studio-${command.kind}-${clock()}`,
+      idempotencyKey: `studio-${command.kind}-${sessionId}-${clock()}`,
       ...(options.actor === undefined ? {} : {actor: options.actor}),
       ...(baseDocuments === undefined ? {} : {baseDocuments: [...baseDocuments]}),
     })

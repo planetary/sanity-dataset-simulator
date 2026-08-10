@@ -87,14 +87,41 @@ test.describe('a refusal this system issued is not a failure of the user’s ses
       {origin: PROXY_ORIGIN, probes: REFUSED_PROBES as unknown as string[][]},
     )
 
+    /**
+     * REFUSED, AND BY US — the status number is not the claim.
+     *
+     * This asserted `toBe(403)` and the first real run caught it out: in Mode 2
+     * `/data/mutate/<ds>` and `/data/actions/<ds>` are the two OVERLAY-OWNED
+     * write routes, so the transport's guard deliberately passes them through
+     * to the origin, which then refuses them **415
+     * `OVERLAY_ORIGIN_UNSUPPORTED_MEDIA_TYPE`** because a probe sending no
+     * `content-type: application/json` is exactly the forged simple-request
+     * shape that check exists to close. A refusal, by a gate of ours, with our
+     * code on it — and the old assertion called it a failure.
+     *
+     * That is the same mistake the network audit was making with
+     * `blocked: false` (see `e2e/audit/logModel.mjs`), and the fix is the same:
+     * assert the fact, which is *this system refused it and said so*. The file's
+     * own header already says the discriminator is ORIGIN, not status.
+     */
     for (const result of results) {
-      expect(result.status, `${result.path} should have been refused: ${result.body}`).toBe(403)
+      expect(
+        typeof result.status === 'number' && result.status >= 400 && result.status < 500,
+        `${result.path} should have been refused by one of our gates: ${result.body}`,
+      ).toBe(true)
       expect(
         String(result.code ?? ''),
         `${result.path} must carry an OVERLAY_* code — that code is the ONLY thing that ` +
           `distinguishes our refusal from Sanity revoking the credential`,
       ).toMatch(/^OVERLAY_/)
     }
+
+    /* And the write guard's own 403 must still be in there: an all-415 result
+     * would mean the guard stopped running and the CSRF check was carrying it. */
+    expect(
+      results.filter((result) => result.status === 403).length,
+      'at least one probe must be refused by the write guard itself, with 403',
+    ).toBeGreaterThan(0)
 
     /* The browser-side statuses above are a convenience, not the evidence.
      * `99-network-audit.spec.ts` asserts the same refusals from the proxy's own

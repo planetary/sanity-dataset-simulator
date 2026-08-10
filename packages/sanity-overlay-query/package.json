@@ -5,12 +5,60 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./parity": "./parity/index.ts"
+    "./parity": "./parity/index.ts",
+    "./baseSource": "./src/baseSource.ts",
+    "./evaluate": "./src/evaluate.ts",
+    "./overlaySource": "./src/overlaySource.ts",
+    "./planner": "./src/planner.ts",
+    "./registry": "./src/registry.ts",
+    "./types": "./src/types.ts"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "prepack": "node ../../scripts/build-package.mjs",
     "test": "echo 'tested via sanity-overlay-testkit'"
   },
   "dependencies": {
-    "groq-js": "2.0.0"
+    "groq-js": "2.0.0",
+    "sanity-overlay-core": "workspace:*"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/src/index.d.ts",
+        "import": "./dist/src/index.js"
+      },
+      "./parity": {
+        "types": "./dist/parity/index.d.ts",
+        "import": "./dist/parity/index.js"
+      },
+      "./baseSource": {
+        "types": "./dist/src/baseSource.d.ts",
+        "import": "./dist/src/baseSource.js"
+      },
+      "./evaluate": {
+        "types": "./dist/src/evaluate.d.ts",
+        "import": "./dist/src/evaluate.js"
+      },
+      "./overlaySource": {
+        "types": "./dist/src/overlaySource.d.ts",
+        "import": "./dist/src/overlaySource.js"
+      },
+      "./planner": {
+        "types": "./dist/src/planner.d.ts",
+        "import": "./dist/src/planner.js"
+      },
+      "./registry": {
+        "types": "./dist/src/registry.d.ts",
+        "import": "./dist/src/registry.js"
+      },
+      "./types": {
+        "types": "./dist/src/types.d.ts",
+        "import": "./dist/src/types.js"
+      }
+    }
   }
 }

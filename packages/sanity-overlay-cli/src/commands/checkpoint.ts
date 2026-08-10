@@ -25,6 +25,7 @@
 import {stat} from 'node:fs/promises'
 import {isAbsolute, resolve} from 'node:path'
 import {writeFile} from 'node:fs/promises'
+import type {OverlayManifest} from 'sanity-overlay-core'
 import {confirmationRequired, usageError} from '../errors'
 import {EXIT} from '../exit'
 import {asCliError, createStore, openOverlay} from '../overlay'
@@ -38,6 +39,36 @@ export interface ExportOptions {
   /** File to write the §35.7 portable bundle into. */
   readonly bundle?: string
   readonly noTransactions?: boolean
+  /**
+   * Record the checkpoint in PRD §13.1 `manifest.checkpoint` as well as writing
+   * the tree.
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * WHY THIS IS OPT-IN, WHEN THE OVERLAY API's CHECKPOINT ENDPOINT IS NOT.
+   *
+   * `export --output` is also how a human INSPECTS a branch — write a tree to
+   * `/tmp`, diff it, verify its checksums, throw it away. A read command that
+   * silently advanced the overlay revision and rewrote the manifest would make
+   * looking at a branch change it, and would break the §34.17 property this
+   * command is otherwise pinned on: two consecutive exports of unchanged state
+   * are byte-identical. Marking bumps the revision and stamps a timestamp, so
+   * the second export could not match the first.
+   *
+   * The API endpoint has no such ambiguity — a `POST /commit kind: checkpoint`
+   * from a Studio is a deliberate act with a button behind it — so it always
+   * marks. This flag is how the same act is spelled from a terminal or a CI job.
+   * ─────────────────────────────────────────────────────────────────────────
+   */
+  readonly markCheckpoint?: boolean
+  /**
+   * The commit that will carry this checkpoint, when the caller already knows it.
+   *
+   * Requires `--mark-checkpoint`; see {@link runExport} for why it is refused
+   * rather than ignored on its own. Omitted, the marker records the checkpoint
+   * without naming a commit, which is the honest answer for a tree that has not
+   * been committed yet — see the note on `OverlayManifest['checkpoint']`.
+   */
+  readonly commitSha?: string
 }
 
 export interface ImportOptions {
@@ -60,6 +91,39 @@ export interface ImportOptions {
 const absolute = (cwd: string, path: string): string =>
   isAbsolute(path) ? path : resolve(cwd, path)
 
+/**
+ * Stamp PRD §13.1 `manifest.checkpoint`, returning what was written.
+ *
+ * The revision advances by one, matching the overlay API's checkpoint endpoint
+ * exactly: the manifest is the revision authority, `writeManifestConditional`
+ * requires the successor revision, and the marker names the revision it
+ * produced — so `checkpoint.overlayRevision === manifest.revision` immediately
+ * afterwards and §29.6 counts zero uncheckpointed revisions.
+ */
+async function markCheckpoint(
+  opened: {store: ReturnType<typeof createStore>; overlayId: string},
+  now: () => string,
+  commitSha?: string,
+): Promise<NonNullable<OverlayManifest['checkpoint']>> {
+  const current = await opened.store.readManifest(opened.overlayId)
+  const overlayRevision = current.revision + 1
+  const checkpoint = {
+    overlayRevision,
+    ...(commitSha === undefined ? {} : {commitSha}),
+    createdAt: now(),
+  }
+  try {
+    await opened.store.writeManifestConditional(
+      opened.overlayId,
+      {...current, revision: overlayRevision, checkpoint},
+      current.revision,
+    )
+  } catch (error) {
+    throw asCliError(error)
+  }
+  return checkpoint
+}
+
 export async function runExport(ctx: CommandContext, options: ExportOptions): Promise<number> {
   if (options.output === undefined && options.bundle === undefined) {
     throw usageError(
@@ -67,20 +131,68 @@ export async function runExport(ctx: CommandContext, options: ExportOptions): Pr
     )
   }
 
+  /*
+   * REFUSED, NOT IGNORED. A `--commit-sha` that silently did nothing is how a CI
+   * job comes to believe it attributed a checkpoint it did not — and the belief
+   * would be invisible, because the tree it wrote is identical either way.
+   */
+  if (options.commitSha !== undefined && options.markCheckpoint !== true) {
+    throw usageError(
+      'export --commit-sha names the commit that will carry a checkpoint, so it requires ' +
+        '--mark-checkpoint. Without it, `export` writes a tree and records nothing in ' +
+        'PRD §13.1 `manifest.checkpoint`, and the sha would be dropped in silence.',
+    )
+  }
+  if (options.markCheckpoint === true && options.output === undefined) {
+    throw usageError(
+      'export --mark-checkpoint records a §29.1 checkpoint tree in the manifest, so it requires ' +
+        '--output <dir>. The §35.7 portable bundle (--bundle) is a transfer format, not a ' +
+        'checkpoint, and marking one would claim a review surface that was never written.',
+    )
+  }
+
   const opened = await openOverlay(ctx.root, ctx.now)
 
   if (options.output !== undefined) {
     const dir = absolute(ctx.root, options.output)
+
+    /*
+     * MARKED BEFORE THE RENDER, for the same reason the API endpoint marks
+     * before its own: `exportCheckpoint` writes `manifest.json` and
+     * `checksums.json` together, so stamping afterwards would leave the tree's
+     * checksum file describing bytes the tree no longer holds — and the
+     * COMMITTED manifest would still say "never checkpointed", which is the
+     * whole defect this flag exists to close.
+     */
+    const marker = options.markCheckpoint === true
+      ? await markCheckpoint(opened, ctx.now, options.commitSha)
+      : null
+
     const result = await opened.store.exportCheckpoint(opened.overlayId, {dir})
     ctx.emitJson({
       overlayId: result.overlayId,
       dir: result.dir,
       files: result.files,
       checksum: result.checksums.checksum,
+      ...(marker === null
+        ? {marked: false}
+        : {
+            marked: true,
+            checkpointRevision: marker.overlayRevision,
+            attributedToCommit: marker.commitSha !== undefined,
+            ...(marker.commitSha === undefined ? {} : {commitSha: marker.commitSha}),
+          }),
     })
     if (!ctx.json) {
       ctx.out(`wrote ${plural(result.files.length, 'file')} to ${result.dir}`)
       ctx.out(`checkpoint checksum ${result.checksums.checksum}`)
+      if (marker !== null) {
+        ctx.out(
+          marker.commitSha === undefined
+            ? `recorded checkpoint at revision ${marker.overlayRevision} (not attributed to a commit yet — commit this tree)`
+            : `recorded checkpoint at revision ${marker.overlayRevision}, attributed to commit ${marker.commitSha}`,
+        )
+      }
     }
     return EXIT.OK
   }

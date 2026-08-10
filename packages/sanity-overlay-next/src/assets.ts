@@ -51,10 +51,10 @@ import {
   OVERLAY_ASSET_UPLOAD_HEADER,
   SANITY_CDN_ORIGIN,
   parseOverlayAssetRequest,
-} from '../../sanity-overlay-core/src/index'
-import type {SanityDocument} from '../../sanity-overlay-core/src/index'
-import type {FsOverlayAssetStore, PutAssetResult} from '../../sanity-overlay-store-fs/src/index'
-import {createOverlayAssetDelivery} from '../../sanity-overlay-client/src/assets'
+} from 'sanity-overlay-core'
+import type {SanityDocument} from 'sanity-overlay-core'
+import type {FsOverlayAssetStore, PutAssetResult} from 'sanity-overlay-store-fs'
+import {createOverlayAssetDelivery} from 'sanity-overlay-client/assets'
 import {OverlayApiError} from './errors'
 
 /*

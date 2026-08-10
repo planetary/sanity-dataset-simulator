@@ -23,8 +23,8 @@ import {
   type OverlayOperation,
   type OverlayState,
   type SanityDocument,
-} from '../../../sanity-overlay-core/src/index'
-import {FsOverlayStore} from '../../../sanity-overlay-store-fs/src/index'
+} from 'sanity-overlay-core'
+import {FsOverlayStore} from 'sanity-overlay-store-fs'
 
 export type SeedEdit =
   /** Patch the draft of an existing (base or branch) document — PRD §18.4. */

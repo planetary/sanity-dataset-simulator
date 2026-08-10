@@ -37,6 +37,13 @@ export interface OverlayRuntimeOptions {
   createClient: (options: Rec) => object
   now?: () => number
   onLog?: (message: string) => void
+  /**
+   * Deadline for one read delegated to the base dataset
+   * (`facade.ts` {@link DEFAULT_READ_TIMEOUT_MS}). Exposed so a deployment whose
+   * base is behind a slow link can raise it, and so the bound can be exercised
+   * in a test without waiting two minutes for it.
+   */
+  readTimeoutMs?: number
 }
 
 export interface OverlayRuntime {
@@ -124,8 +131,14 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
   let conflictReport: OverlayConflictReport = readConflictReport(undefined)
   let pendingWrites = 0
   let degradedWrites = 0
+  let replayedWrites = 0
   let uncheckpointedEdits = 0
   let identityMismatch = false
+  /* LATCHED. See `status.ts` `branchMoved`: once a 409 survives the server's own
+   * reconciliation, nothing this session sends will be accepted until the tab
+   * reloads, so a flag that cleared itself would invite the editor to keep
+   * typing into a document that cannot be saved. */
+  let branchMoved = false
 
   function notify(): void {
     for (const listener of Array.from(listeners)) {
@@ -217,8 +230,17 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
   const transport = createOverlayTransport({
     apiUrl: resolved.apiUrl,
     fetch: options.fetch,
-    onError: (message) => {
-      connection = 'unreachable'
+    onError: (message, context) => {
+      /*
+       * "UNREACHABLE" MEANS NO ANSWER, NOT AN ANSWER I DID NOT LIKE.
+       *
+       * This used to flip on every transport message. The `offline` banner
+       * outranks everything below it and reads "Edits are held locally and will
+       * be retried" — so a 409, whose whole content is "the branch moved,
+       * reload", rendered as a connectivity blip that would sort itself out.
+       * A status means the server answered; only its absence is an outage.
+       */
+      if (context?.status === undefined) connection = 'unreachable'
       log(message)
     },
     onAuthFailure: (failure) => echo.noteAuthFailure(failure),
@@ -258,6 +280,34 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
       uncheckpointedEdits += 1
     }
     if (record.committed === 'degraded') degradedWrites += 1
+    /*
+     * §34.6 REPLAY — SAID OUT LOUD, exactly as `stale` is.
+     *
+     * The ledger answered this key from its record and applied nothing now. A
+     * deliberate retry makes that harmless; anything else means the editor's
+     * work went nowhere while Studio showed a save, which is the failure the
+     * idempotency-key generator used to cause on every reload. Not latched and
+     * not a mode change — see `status.ts` `replayedWrites` — but never silent.
+     */
+    if (record.committed === 'replayed') {
+      replayedWrites += 1
+      log(
+        `[sanity-overlay-studio] the overlay REPLAYED ${record.method} from its idempotency ` +
+          `ledger (transaction ${record.transactionId}) and applied nothing now. If this was not ` +
+          `a retry, the change you just made was NOT saved: the pane has been asked to re-read ` +
+          `so it shows what the branch actually holds.`,
+      )
+    }
+    if (record.committed === 'stale' && !branchMoved) {
+      branchMoved = true
+      log(
+        `[sanity-overlay-studio] the branch moved underneath this session: the overlay API ` +
+          `refused this write with 409 after rebuilding its own view from disk. Another writer ` +
+          `— a CLI run, an agent, a Git merge or a second tab — is ahead of you. This edit was ` +
+          `NOT saved and further edits will be refused; reload the Studio to continue. Nothing ` +
+          `was written to the shared dataset.`,
+      )
+    }
     if (pendingWrites > 0) pendingWrites -= 1
     notify()
   }
@@ -274,8 +324,19 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
       onWrite,
       reads,
       onHydration: noteHydration,
+      /* THE HISTORY ORACLE. `overlaySource()` keys `documents` and `tombstones`
+       * by document ADDRESS (`drafts.x` and `x`), which is exactly the id
+       * spelling `/data/history/…` carries — so this is a lookup, not a
+       * translation. Before `/state` has been read the branch view is empty and
+       * every history read delegates, which is the same "branch-blind rather
+       * than guessing" rule the GROQ path follows. */
+      branchHolds: (documentId) => {
+        const view = overlaySource()
+        return view.documents.has(documentId) || view.tombstones.has(documentId)
+      },
       assets,
       ...('origin' in assetOrigin ? {assetOrigin: assetOrigin.origin} : {}),
+      ...(options.readTimeoutMs === undefined ? {} : {readTimeoutMs: options.readTimeoutMs}),
       now: options.now,
     })
   }
@@ -325,8 +386,10 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
         revision,
         pendingWrites,
         degradedWrites,
+        replayedWrites,
         uncheckpointedEdits,
         conflicts: {hard: conflictReport.summary.hard, soft: conflictReport.summary.soft},
+        branchMoved,
         identityMismatch,
       }),
     conflicts: () => conflictReport,

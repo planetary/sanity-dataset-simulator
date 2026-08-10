@@ -291,11 +291,21 @@ export const DEFAULT_RETENTION_DAYS: Readonly<Record<string, number | null>> = O
   orphan: 7,
 })
 
-/** Resolve the §15.7 default retention for a manifest's current state. */
+/**
+ * Resolve the §15.7 default retention for a manifest's current state.
+ *
+ * "Closed and checkpointed" is keyed on ATTRIBUTION, not on the mere existence
+ * of `manifest.checkpoint`. The shorter 14-day window is affordable because a
+ * checkpointed overlay's review surface is recoverable from Git; a checkpoint
+ * that was written but is not yet known to be in any commit has no such
+ * guarantee — its only copy may be an uncommitted working tree — so it keeps
+ * the conservative 30-day window until a commit is named. See the note on
+ * `OverlayManifest['checkpoint']` for why the two facts are separate.
+ */
 export function defaultRetentionDays(manifest: OverlayManifest): number | null {
   if (manifest.status === 'promoted') return DEFAULT_RETENTION_DAYS.promoted ?? null
   if (manifest.status === 'closed') {
-    return manifest.checkpoint
+    return manifest.checkpoint?.commitSha !== undefined
       ? (DEFAULT_RETENTION_DAYS['closed-checkpointed'] ?? null)
       : (DEFAULT_RETENTION_DAYS['closed-uncheckpointed'] ?? null)
   }

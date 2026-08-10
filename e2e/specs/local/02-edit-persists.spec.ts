@@ -112,6 +112,49 @@ test.describe('an edit lands on disk and survives a reload', () => {
     expect(overrideAt(overlay.intent(ARTICLE), ['title'])).toBe(TITLE)
   })
 
+  /**
+   * THE PANE MUST STOP SAYING `Saving...`.
+   *
+   * This is a separate test on purpose, and it is expected to be RED until the
+   * product is fixed. It is the same class of defect as 2026-08-04, inverted:
+   * then the pane said *Saved* and the file was empty; now the file is right and
+   * the pane never stops saying *Saving...*. Both are the editor lying about the
+   * state of the write, and an editor a person cannot trust about that is not
+   * shippable whatever the disk says.
+   *
+   * The mechanism, from `sanity@6.8.0`: the pulse is
+   * `documentStore.pair.consistencyStatus`, which is `@sanity/mutator`'s
+   * `BufferedDocument.onConsistencyChanged`, which flips to consistent only when
+   * the PAIR LISTENER delivers the submitted transaction id back. The overlay
+   * intercepts the write and commits it to the overlay API; the base-plane
+   * listener at the transport never hears about it, so nothing ever arrives and
+   * the buffer stays dirty forever.
+   *
+   * Every other spec treats settling as best-effort (`waitForSettled` returns a
+   * boolean) so this defect is reported ONCE, here, by name — rather than as a
+   * timeout in every spec that types a character.
+   */
+  test('the pane stops reporting "Saving..." once the write has landed on disk', async ({
+    page,
+    studio,
+    overlay,
+  }) => {
+    await studio.openDocument('article', ARTICLE)
+    await setField(page, 'Title', TITLE)
+
+    /* The file is complete before the assertion below, so a failure here is
+     * unambiguously the STATUS being wrong rather than the write being slow. */
+    await overlay.waitForIntent(ARTICLE, (value) => overrideAt(value, ['title']) === TITLE)
+
+    const settled = await waitForSettled(page, 30_000)
+    expect(
+      settled,
+      'the document is on disk and correct, but the pane still reports "Saving..." — ' +
+        'consistency is driven by the base-plane listener echoing the transaction back, ' +
+        'and the overlay write never traverses it',
+    ).toBe(true)
+  })
+
   test('the overlay root that was written is the RUN root, not the committed one', async ({
     page,
     studio,

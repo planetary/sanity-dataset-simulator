@@ -21,8 +21,8 @@ import {
   M_LOCAL_QUERIES,
   formatCodemodReport,
   runClientImportCodemod,
-} from '../../../sanity-overlay-query/src/index'
-import type {RegisteredQuerySummary} from '../../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
+import type {RegisteredQuerySummary} from 'sanity-overlay-query'
 import {EXIT} from '../exit'
 import {collectSources} from '../sources'
 import type {CommandContext} from '../types'

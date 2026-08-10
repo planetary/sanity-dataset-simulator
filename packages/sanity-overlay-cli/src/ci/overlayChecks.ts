@@ -20,7 +20,7 @@ import {
   mergeDocument,
   referenceValidationIssues,
   summarizeConflicts,
-} from '../../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {
   BaseDocumentSource,
   OverlayConflict,
@@ -28,7 +28,7 @@ import type {
   OverlayManifest,
   SanityDocument,
   SerializedSchemaArtifact,
-} from '../../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {LoadedRecords, OpenedOverlay} from '../overlay'
 import {ancestorFor, ancestorRevisionFor, localVersion, primaryVersion, tombstoned} from '../records'
 import {formatPath} from '../render'
@@ -319,6 +319,18 @@ export function checkpointPolicyCheck(
     checkpointRevision,
     uncheckpointedRevisions: uncheckpointed,
     hasCheckpoint: manifest.checkpoint === undefined ? 0 : 1,
+    /**
+     * Whether a commit is known to carry the checkpoint — a DIFFERENT fact from
+     * `hasCheckpoint`, and one §29.6 does not legislate.
+     *
+     * It is measured rather than asserted on purpose. §29.6's policy is about
+     * uncheckpointed runtime state, which `uncheckpointedRevisions` answers in
+     * full; whether the resulting tree has been committed yet is something the
+     * job's own `git status` knows better than this check does. Reporting it
+     * keeps the distinction visible without inventing a rule the PRD has not
+     * written.
+     */
+    attributedToCommit: manifest.checkpoint?.commitSha === undefined ? 0 : 1,
   }
 
   if (policy === 'off') {
@@ -336,7 +348,11 @@ export function checkpointPolicyCheck(
       ref: manifest.overlayId,
       message:
         manifest.checkpoint === undefined
-          ? `overlay is at revision ${manifest.revision} and has never been checkpointed, so ${uncheckpointed} runtime revision(s) exist only in the store and not in Git (PRD §29.2, §29.6). Run \`sanity-overlay export --output .sanity-overlay\` and commit.`
+          ? /* The remedy names `--mark-checkpoint`, because the command without
+             * it writes a tree and leaves `manifest.checkpoint` untouched — so
+             * an operator who followed the old advice to the letter saw this
+             * same finding on the next run and had no way to tell why. */
+            `overlay is at revision ${manifest.revision} and has never been checkpointed, so ${uncheckpointed} runtime revision(s) exist only in the store and not in Git (PRD §29.2, §29.6). Run \`sanity-overlay export --output .sanity-overlay --mark-checkpoint\` and commit.`
           : `overlay is at revision ${manifest.revision} but the last checkpoint is revision ${checkpointRevision}: ${uncheckpointed} uncheckpointed revision(s) (PRD §29.6).`,
     })
   }

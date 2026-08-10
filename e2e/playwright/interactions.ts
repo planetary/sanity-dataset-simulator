@@ -65,10 +65,44 @@ export async function setField(page: Page, label: string, value: string): Promis
  * false for every non-ASCII edit on 2026-08-04 while `intent.json` stayed empty.
  * Treat this as "stop typing now", never as evidence.
  */
-export async function waitForSettled(page: Page, timeout = 20_000): Promise<void> {
-  const status = page.getByTestId(STUDIO.paneFooterStatus).last()
+export async function waitForSettled(page: Page, timeout = 15_000): Promise<boolean> {
+  /**
+   * WHICH FOOTER SURFACE, AND WHY IT IS NOT THE OBVIOUS ONE.
+   *
+   * The first real run found `pane-footer-document-status` absent on every
+   * spec: that surface is the *last edited / last published* button and needs a
+   * timestamp the document does not have until something has published it. The
+   * sync state lives on `…-pulse`, which is what says `Saving...` and `Saved`
+   * (`structureTool` dist ~7216).
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * AND WHY REACHING `Saved` IS NOT REQUIRED HERE.
+   *
+   * `Saved` is `documentStore.pair.consistencyStatus`, and consistency in
+   * `@sanity/mutator` means *the listener delivered my own transaction back*.
+   * With the overlay active the write goes to the overlay API and the base-plane
+   * listener never learns of it, so the pane can sit on `Saving...` forever
+   * while the file on disk is complete and correct. That is a real product
+   * defect and `02-edit-persists.spec.ts` asserts it as one, by name — it must
+   * not also be re-asserted implicitly by every other spec in the suite, where
+   * it would show up as thirty mysterious timeouts instead of one finding.
+   *
+   * So: waiting for the pulse to APPEAR is required — that proves the editor
+   * accepted the keystroke and started writing, and a spec whose keystroke never
+   * landed must not go on to poll the disk. Waiting for it to LEAVE `Saving...`
+   * is best-effort, and the caller is told which happened.
+   */
+  const status = page
+    .getByTestId(STUDIO.paneFooterStatusPulse)
+    .or(page.getByTestId(STUDIO.paneFooterStatus))
+    .last()
   await expect(status).toBeVisible({timeout})
-  await expect(status).not.toContainText(/saving/i, {timeout})
+  try {
+    await expect(status).not.toContainText(/saving/i, {timeout})
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -106,6 +140,28 @@ export async function confirmIfAsked(page: Page): Promise<void> {
       return
     }
   }
+}
+
+/**
+ * Switch the Studio's global perspective.
+ *
+ * NOT A CONVENIENCE. Which document actions Sanity renders is a function of the
+ * selected perspective, so a spec about `Unpublish` that never leaves Drafts is
+ * asserting about a button that cannot exist there
+ * (`useUnpublishAction`: `release || isDraft || … ? null : …`). Driving the
+ * switcher is how a person reaches that action, and it is a client-side
+ * navigation — no reload, which matters for the reason
+ * `04-document-actions.spec.ts` gives at length.
+ */
+export async function selectPerspective(page: Page, label: string): Promise<void> {
+  const button = page.getByTestId(STUDIO.globalPerspectiveMenuButton)
+  await expect(button).toBeVisible()
+  await button.click()
+  const item = page
+    .getByRole('menuitem', {name: label, exact: false})
+    .or(page.getByRole('menuitemradio', {name: label, exact: false}))
+  await expect(item.first()).toBeVisible()
+  await item.first().click()
 }
 
 /** Is a document action offered at all? The availability half of §21.2. */

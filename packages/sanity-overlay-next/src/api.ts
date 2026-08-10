@@ -35,7 +35,11 @@ import {
   discardDraft,
   duplicate,
   getRecord,
+  hasAnyBaseAddress,
+  idempotencyReplayMismatch,
+  idempotencyReuseMessage,
   isSyntheticRev,
+  mutationTargetId,
   overlayConflictSummary,
   overlayDocumentIds,
   publish,
@@ -44,25 +48,26 @@ import {
   restore,
   toPublishedId,
   unpublish,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {
   OverlayActor,
   OverlayConflict,
   OverlayDocumentRecord,
   OverlayState,
+  OverlayTransactionRecord,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {
   FsOverlayAssetStore,
   FsOverlayStore,
   OverlayWatchHandle,
-} from '../../sanity-overlay-store-fs/src/index'
-import {revalidationIsNotable, watchOverlay} from '../../sanity-overlay-store-fs/src/index'
-import {createQueryRegistry, M_LOCAL_QUERIES} from '../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-store-fs'
+import {revalidationIsNotable, watchOverlay} from 'sanity-overlay-store-fs'
+import {createQueryRegistry, M_LOCAL_QUERIES} from 'sanity-overlay-query'
 import type {
   OverlayQueryRegistry,
   QueryPerspective,
-} from '../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
 import {
   ASSET_UPLOAD_HEADER,
   assertUploadIsNotForged,
@@ -75,7 +80,7 @@ import {
   uploadResponseBody,
   withUrl,
 } from './assets'
-import {OverlayApiError} from './errors'
+import {OverlayApiError, overlayApiStatusForErrorCode} from './errors'
 import {evaluateRegisteredQuery, planRegisteredQuery} from './queries'
 import {runRebase as performRebase, type StudioRebaseMode} from './rebase'
 import {encodeSseFrame} from './sse'
@@ -140,6 +145,16 @@ export interface OverlayHydrationDocument {
   baseRevisionAtFirstTouch?: string
   /** §13.4 — the most recent base revision this overlay observed. */
   currentBaseRevision?: string
+  /**
+   * §29.6 — was this document touched after the last checkpoint?
+   *
+   * OMITTED, NOT `false`, WHEN THERE IS NO CHECKPOINT. "Nothing has been
+   * checkpointed" and "this document predates the checkpoint" are different
+   * facts, and `sanity-overlay-studio`'s conflict panel filters on this column:
+   * a `false` it did not earn would silently hide rows. §28.1's rule about the
+   * conflicts array, applied to the column beside it.
+   */
+  touchedSinceCheckpoint?: boolean
 }
 
 export interface OverlayApiOptions {
@@ -242,7 +257,7 @@ async function openOverlay(
     source: OverlayApiOptions['source']
     actor: OverlayActor
   },
-): Promise<{overlayId: string; state: OverlayState}> {
+): Promise<{overlayId: string; state: OverlayState; checkpointRevision: number | null}> {
   let manifest: Awaited<ReturnType<FsOverlayStore['inspect']>> | null = null
   try {
     manifest = await store.inspect()
@@ -260,7 +275,11 @@ async function openOverlay(
     } as Parameters<FsOverlayStore['createOverlay']>[0])
   }
 
-  return {overlayId: manifest.overlayId, state: await hydrateState(store, manifest)}
+  return {
+    overlayId: manifest.overlayId,
+    state: await hydrateState(store, manifest),
+    checkpointRevision: manifest.checkpoint?.overlayRevision ?? null,
+  }
 }
 
 /**
@@ -309,7 +328,10 @@ async function hydrateState(
  * there is. That is what makes the Studio's 5-second `/state` poll free — an
  * array read and an O(documents) count, no merge, no I/O.
  */
-function hydrationDocuments(state: OverlayState): OverlayHydrationDocument[] {
+function projectDocuments(
+  state: OverlayState,
+  checkpointRevision: number | null,
+): OverlayHydrationDocument[] {
   return Object.keys(state.documents)
     .sort()
     .map((logicalId) => {
@@ -318,6 +340,17 @@ function hydrationDocuments(state: OverlayState): OverlayHydrationDocument[] {
       const capturedRevision = base?.published?.revision ?? base?.draft?.revision
       const observedRevision =
         base?.lastObservedPublishedRevision ?? base?.lastObservedDraftRevision
+      /* §29.6, from the two numbers that decide it: the overlay revision this
+       * document's local version was last written at, against the revision the
+       * last checkpoint captured. `local.overlayRevision` is a string on the
+       * record (§13.5) and the manifest's is a number, which is exactly the
+       * mismatch that left this derivable-but-underived. */
+      const localRevision =
+        record.local.draft?.overlayRevision ?? record.local.published?.overlayRevision
+      const touchedSinceCheckpoint =
+        checkpointRevision === null || localRevision === undefined
+          ? undefined
+          : Number(localRevision) > checkpointRevision
       return {
         logicalId,
         schemaType: record.schemaType,
@@ -336,6 +369,7 @@ function hydrationDocuments(state: OverlayState): OverlayHydrationDocument[] {
         baseStatus: base?.baseStatus ?? null,
         ...(capturedRevision === undefined ? {} : {baseRevisionAtFirstTouch: capturedRevision}),
         ...(observedRevision === undefined ? {} : {currentBaseRevision: observedRevision}),
+        ...(touchedSinceCheckpoint === undefined ? {} : {touchedSinceCheckpoint}),
       }
     })
 }
@@ -367,6 +401,18 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
   const overlayId = opened.overlayId
   let state = opened.state
   let sequence = 0
+  /**
+   * The overlay revision the last checkpoint captured, or `null` for none.
+   *
+   * Held here rather than re-read per request because `/state` is polled every
+   * five seconds and the answer only changes when a checkpoint is taken or the
+   * manifest is re-read after a direct edit — both of which refresh it below.
+   */
+  let checkpointRevision: number | null = opened.checkpointRevision
+
+  /** {@link projectDocuments}, bound to the checkpoint the branch is measured against. */
+  const hydrationDocuments = (from: OverlayState): OverlayHydrationDocument[] =>
+    projectDocuments(from, checkpointRevision)
 
   /* ---------------------------------------------------------------- *
    * The commit mutex
@@ -494,6 +540,9 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     if (report.manifestChanged) {
       const manifest = await store.inspect()
       state = {...state, revision: manifest.revision}
+      /* A hand-edited or externally imported manifest can move the checkpoint
+       * too, so the §29.6 answer is re-read from the same authority. */
+      checkpointRevision = manifest.checkpoint?.overlayRevision ?? null
     }
 
     if (report.changed.length > 0) {
@@ -578,6 +627,42 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     }
   }
 
+  /**
+   * Refuse a "replay" whose request is about documents the stored transaction
+   * never touched (PRD §13.10, §34.6 — see core's `mutations/idempotency.ts`).
+   *
+   * THIS API NEEDS ITS OWN COPY OF THE CHECK, and that is not duplication. Every
+   * endpoint below resolves the ledger EARLY and returns `replayEnvelope`
+   * without ever reaching `store.commitTransaction`, where the adapters' guard
+   * lives — so on the one path a browser actually takes, the adapters' guard is
+   * unreachable. It was on exactly this path that a publish of an article was
+   * answered with the transaction id of a publish of an author.
+   */
+  function assertReplayIsForTheseDocuments(
+    idempotencyKey: string,
+    replayed: OverlayTransactionRecord,
+    targetDocumentIds: readonly string[],
+  ): void {
+    const outside = idempotencyReplayMismatch(replayed.affectedDocumentIds, targetDocumentIds)
+    if (outside.length === 0) return
+    throw new OverlayApiError(
+      422,
+      'IDEMPOTENCY_KEY_REUSED',
+      idempotencyReuseMessage(
+        idempotencyKey,
+        replayed.transactionId,
+        replayed.affectedDocumentIds,
+        outside,
+      ),
+      {
+        idempotencyKey,
+        replayedTransactionId: replayed.transactionId,
+        affectedDocumentIds: [...replayed.affectedDocumentIds],
+        unrelatedDocumentIds: outside,
+      },
+    )
+  }
+
   async function commitMutations(body: Rec, kind: 'actions' | 'mutations'): Promise<Rec> {
     const idempotencyKey = body.idempotencyKey as string
 
@@ -585,17 +670,32 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
      * §34.6 — checked HERE, before the mutation engine runs, and against the
      * STORE rather than core's in-memory ledger.
      *
-     *   - Before translation, because `applyTransaction` would otherwise apply
-     *     the mutations to the projection a second time. The store would refuse
-     *     to persist them, so `/state` would then report a value the file on
-     *     disk contradicts — a divergence with no error attached to it.
+     *   - Before APPLYING, because `applyTransaction` would otherwise apply the
+     *     mutations to the projection a second time. The store would refuse to
+     *     persist them, so `/state` would then report a value the file on disk
+     *     contradicts — a divergence with no error attached to it.
      *   - Against the store, because core's ledger is not rehydrated from disk,
      *     so a restart would re-apply every key ever used.
+     *
+     * TRANSLATION MOVED ABOVE THE LOOKUP. It used to sit below it, on the
+     * reasoning quoted above — but that reasoning is about APPLICATION, and
+     * `translateInterceptedWrite` is pure: it reads the payload and returns
+     * mutations, touching neither `state` nor the store. Doing it first is what
+     * lets the replay be checked against the documents this request is actually
+     * about, instead of being granted on the strength of the key alone.
      */
-    const replayed = await store.getTransaction(overlayId, {idempotencyKey})
-    if (replayed !== null) return replayEnvelope(replayed.transactionId, [])
-
     const translated = translateInterceptedWrite({kind, payload: body.payload})
+
+    const replayed = await store.getTransaction(overlayId, {idempotencyKey})
+    if (replayed !== null) {
+      assertReplayIsForTheseDocuments(
+        idempotencyKey,
+        replayed,
+        translated.mutations.map(mutationTargetId),
+      )
+      return replayEnvelope(replayed.transactionId, [])
+    }
+
     if (translated.unsupported.length > 0) {
       log('warn', `overlay commit ${idempotencyKey}: ${translated.unsupported.join('; ')}`)
     }
@@ -634,6 +734,11 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
       actor,
       mutations: translated.mutations,
       records,
+      /* See {@link commitWithStaleRecovery}. Without this the store accepts a
+       * transaction whose records were computed from a projection that no
+       * longer describes the disk, and the other writer's work disappears with
+       * a `200 ok:true` on top of it. */
+      expectedOverlayRevision: state.revision,
     })
 
     /* The store owns the persisted revision counter, so the projection adopts it
@@ -675,9 +780,18 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     const stepKey = (index: number): string => `${idempotencyKey}#${index}`
 
     /* The first step's key stands for the whole request: if it is on disk the
-     * request already ran, so nothing is re-applied. */
+     * request already ran, so nothing is re-applied — PROVIDED it ran for these
+     * documents. A §18 step names its target directly, so the check costs a set
+     * lookup; `duplicate` names two and both must be covered. */
     const replayed = await store.getTransaction(overlayId, {idempotencyKey: stepKey(0)})
     if (replayed !== null) {
+      const targets: string[] = []
+      for (const step of translated.steps) {
+        if (typeof step.id === 'string') targets.push(toPublishedId(step.id))
+        const newId = (step as {newId?: unknown}).newId
+        if (typeof newId === 'string') targets.push(toPublishedId(newId))
+      }
+      assertReplayIsForTheseDocuments(stepKey(0), replayed, targets)
       return replayEnvelope(replayed.transactionId, translated.unsupported)
     }
 
@@ -725,6 +839,10 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
         actor,
         mutations: applied.transaction.mutations,
         records,
+        /* Same guard as the mutation path — see {@link commitWithStaleRecovery}.
+         * A §18 reducer reads the record it is about to replace, so a stale one
+         * is exactly as lossy here as an edit patch. */
+        expectedOverlayRevision: state.revision,
       })
 
       state = {...applied.state, revision: stored.manifest.revision}
@@ -799,15 +917,26 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
    * transaction, no revision increment, nothing lost. `committed: false` in the
    * answer is that fact, not a failure.
    *
-   * `manifest.checkpoint` (§13.1) IS NOT STAMPED UNLESS THE CALLER NAMES A
-   * COMMIT. That field records `{overlayRevision, commitSha, createdAt}`, and a
-   * checkpoint written from a Studio has no commit SHA — the commit does not
-   * exist yet, by construction, since this is what produces the files that will
-   * be committed. Inventing one would put a fabricated SHA into the manifest
-   * that `sanity-overlay status` prints and CI's §29.6 policy trusts, which is
-   * precisely the silent approximation §5.5 forbids. A CI step that HAS the SHA
-   * passes `commitSha` and gets the marker; the browser gets the tree and is
-   * told, in `manifestMarked`, that the marker was not written and why.
+   * `manifest.checkpoint` (§13.1) IS ALWAYS STAMPED. `commitSha` IS NOT ALWAYS
+   * PRESENT.
+   *
+   * This endpoint used to write the §13.1 marker only when the caller named a
+   * commit, which — since a checkpoint taken from a Studio is precisely what
+   * PRODUCES the files that will be committed — meant it was never written at
+   * all. `sanity-overlay status` and CI's §29.6 policy then reported "never
+   * checkpointed" the instant after a checkpoint, and no consumer could derive
+   * `touchedSinceCheckpoint`. Both were saying something false about the branch.
+   *
+   * The two facts are now separate, and only one of them is knowable here:
+   *
+   *   overlayRevision + createdAt   this endpoint knows them; always written
+   *   commitSha                     only the caller can know it; written only
+   *                                 when the caller supplies one
+   *
+   * Nothing is invented, so §5.5 holds; and every §29.6 predicate the PRD states
+   * is written in terms of `overlayRevision`, so the policy is now answerable.
+   * See the note on `OverlayManifest['checkpoint']` for why there is no
+   * stamp-the-sha-afterwards path.
    */
   async function commitCheckpoint(body: Rec): Promise<Rec> {
     const payload = isRec(body.payload) ? body.payload : {}
@@ -817,37 +946,31 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
         ? payload.commitSha.trim()
         : undefined
 
-    let manifestMarked = false
-    let markerReason =
-      'no `commitSha` was supplied, so PRD §13.1 `manifest.checkpoint` was not stamped — the ' +
-      'commit that will carry this checkpoint does not exist yet. Commit the tree and record ' +
-      'the SHA, or call this endpoint again with `commitSha` from CI.'
-
-    if (commitSha !== undefined) {
-      /* STAMPED BEFORE THE RENDER, deliberately. `exportCheckpoint` writes
-       * `manifest.json` and `checksums.json` together; marking the manifest
-       * afterwards would leave the tree's own checksum file describing bytes the
-       * tree no longer holds, and the next `importCheckpoint` would report it as
-       * divergence. */
-      const current = await store.readManifest(overlayId)
-      const marked = await store.writeManifestConditional(
-        overlayId,
-        {
-          ...current,
-          revision: current.revision + 1,
-          checkpoint: {
-            overlayRevision: current.revision + 1,
-            commitSha,
-            createdAt: now(),
-          },
+    /* STAMPED BEFORE THE RENDER, deliberately. `exportCheckpoint` writes
+     * `manifest.json` and `checksums.json` together; marking the manifest
+     * afterwards would leave the tree's own checksum file describing bytes the
+     * tree no longer holds, and the next `importCheckpoint` would report it as
+     * divergence. Stamping first also means the COMMITTED manifest carries the
+     * marker, so a fresh clone that imports the tree inherits a truthful §29.6
+     * answer rather than "never checkpointed". */
+    const current = await store.readManifest(overlayId)
+    const markedRevision = current.revision + 1
+    const marked = await store.writeManifestConditional(
+      overlayId,
+      {
+        ...current,
+        revision: markedRevision,
+        checkpoint: {
+          overlayRevision: markedRevision,
+          ...(commitSha === undefined ? {} : {commitSha}),
+          createdAt: now(),
         },
-        current.revision,
-        {actor: normalizeActor(body.actor) ?? defaultActor},
-      )
-      state = {...state, revision: marked.revision}
-      manifestMarked = true
-      markerReason = ''
-    }
+      },
+      current.revision,
+      {actor: normalizeActor(body.actor) ?? defaultActor},
+    )
+    state = {...state, revision: marked.revision}
+    checkpointRevision = markedRevision
 
     const exported = await store.exportCheckpoint(
       overlayId,
@@ -866,8 +989,21 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
         files: exported.files,
         checksum: exported.checksums.checksum,
         overlayRevision: state.revision,
-        manifestMarked,
-        ...(manifestMarked ? {} : {manifestMarkerReason: markerReason}),
+        /* The §13.1 marker was written. It always is now. */
+        manifestMarked: true,
+        /* …and whether a commit is named on it, which is a different fact and
+         * the one an operator still has to act on. */
+        attributedToCommit: commitSha !== undefined,
+        ...(commitSha === undefined ? {} : {commitSha}),
+        ...(commitSha === undefined
+          ? {
+              attributionNote:
+                'no `commitSha` was supplied, so PRD §13.1 `manifest.checkpoint` records the ' +
+                'checkpoint without naming a commit — the commit that will carry this tree does ' +
+                'not exist yet. `status` and the §29.6 CI policy already count this checkpoint; ' +
+                'commit the tree to put it in Git.',
+            }
+          : {}),
       },
       unsupported: [],
       documents: hydrationDocuments(state),
@@ -891,10 +1027,22 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
    */
   async function commitRebase(body: Rec): Promise<Rec> {
     const idempotencyKey = body.idempotencyKey as string
-    const replayed = await store.getTransaction(overlayId, {idempotencyKey})
-    if (replayed !== null) return replayEnvelope(replayed.transactionId, [])
-
     const payload = isRec(body.payload) ? body.payload : {}
+
+    const replayed = await store.getTransaction(overlayId, {idempotencyKey})
+    if (replayed !== null) {
+      /* A rebase with no explicit `documentIds` is overlay-wide, and "every
+       * document" cannot be narrowed to a target list — so only an explicitly
+       * scoped rebase can be checked. Stated rather than silently skipped: a
+       * whole-overlay rebase replayed under a reused key is still a real risk,
+       * and the honest bound on this guard is that it does not cover it. */
+      const requestedIds = Array.isArray(payload.documentIds)
+        ? payload.documentIds.filter((id): id is string => typeof id === 'string')
+        : []
+      assertReplayIsForTheseDocuments(idempotencyKey, replayed, requestedIds.map(toPublishedId))
+      return replayEnvelope(replayed.transactionId, [])
+    }
+
     const mode = typeof payload.mode === 'string' ? payload.mode : 'auto'
     if (mode !== 'auto' && !(REBASE_MODES as readonly string[]).includes(mode)) {
       throw new OverlayApiError(
@@ -928,15 +1076,33 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
       }
     }
 
-    /* §16.1 — core never fetches base, and this server holds no Sanity
-     * credential. The caller states the base or the rebase does not run. */
-    const currentBase = new Map<string, SanityDocument>()
-    for (const document of usableBaseDocuments(body.baseDocuments)) {
-      currentBase.set(toPublishedId(document._id), document)
-    }
+    /*
+     * §16.1 — core never fetches base, and this server holds no Sanity
+     * credential. The caller states the base or the rebase does not run.
+     *
+     * THE PAIR IS NOT COLLAPSED. This was
+     *
+     *     currentBase.set(toPublishedId(document._id), document)
+     *
+     * which put `drafts.X` and `X` on ONE key so the last entry of the array
+     * won. `runtime.baseDocuments()` sends `[published, draft]`, so the base
+     * DRAFT always became "the current base" — compared against a §17.1
+     * ancestor captured from the base PUBLISHED snapshot, which made every path
+     * the draft differed on look like the base moving under the branch. §28.5
+     * precondition 1 then failed and the endpoint answered `200 ok:true,
+     * committed:false`: an enabled button that accepted the click and did
+     * nothing, for every document that has a draft — i.e. every document anyone
+     * is editing.
+     *
+     * `createBaseSource` is core's own port and keeps the two addresses apart;
+     * it is already what the commit and resolve paths above use. The rebase path
+     * was the one place with a private keying scheme, which is the whole reason
+     * it could disagree with them.
+     */
+    const currentBase = createBaseSource(usableBaseDocuments(body.baseDocuments))
 
     const missing = records
-      .filter((record) => !currentBase.has(record.logicalId))
+      .filter((record) => !hasAnyBaseAddress(currentBase, record.logicalId))
       .map((record) => record.logicalId)
     if (missing.length > 0) {
       throw new OverlayApiError(
@@ -1001,6 +1167,73 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
       affectedDocumentIds: run.records.map((record) => record.logicalId),
       documents: run.outcomes,
       unsupported: [],
+    }
+  }
+
+  /**
+   * ─────────────────────────────────────────────────────────────────────────
+   * A LONG-LIVED SESSION WHOSE BRANCH MOVED UNDERNEATH IT.
+   *
+   * This server keeps a PROJECTION of the overlay in memory and rebuilds it
+   * only at boot. §14.4 explicitly invites other writers — a CLI run, an agent,
+   * a Git merge, a second tab — so the projection can stop describing the disk
+   * at any moment, and every commit above computes its post-state RECORDS from
+   * that projection. Writing those records back is a whole-record replacement:
+   * anything the other writer added is simply not in them.
+   *
+   * MEASURED 2026-08-09: a second process added a `summary` override to a
+   * document; the open session then committed a `title` edit; the answer was
+   * `200 ok:true committed:true`, the manifest advanced, and the `summary` was
+   * gone. A lost update, reported as a success. The same day, in a browser, the
+   * neighbouring symptom: a session whose writes stopped landing with no error,
+   * no toast and no indicator, fixed only by restarting the server.
+   *
+   * THE FIX IS OPTIMISTIC CONCURRENCY PLUS RECONCILIATION, IN THAT ORDER.
+   *
+   *   1. Every commit now states the revision its records were computed from
+   *      (`expectedOverlayRevision`). The store refuses a mismatch. That turns
+   *      the silent loss into a loud `OVERLAY_WRITE_CONFLICT` — but on its own
+   *      it would also turn every benign external revision bump into a dead
+   *      session, which is the browser symptom made permanent.
+   *   2. So a conflict is RECONCILED: the projection is rebuilt from disk and
+   *      the request is run again, from the top.
+   *
+   * WHY THE RETRY IS NOT A HOLE IN THE GUARD. It does not re-submit the stale
+   * records; it re-derives them. `hydrateState` re-reads every record from
+   * disk, the mutation is re-applied against what is actually there, and §17.11
+   * conflict detection runs again on the fresh state — so the other writer's
+   * work is an input to the second attempt rather than something overwritten by
+   * it. That is the difference between "retry" and "retry blind", and only the
+   * second is a lost update.
+   *
+   * WHY RE-RUNNING THE WHOLE REQUEST IS SAFE. `commitTransaction` is keyed by
+   * `idempotencyKey` against the STORE's ledger (§34.6), so if the first attempt
+   * did land before failing, the second finds it and replays rather than
+   * applying it twice.
+   *
+   * ONE RETRY, NOT A LOOP. A second conflict means something is writing
+   * continuously, and an unbounded retry would hold the commit mutex — and the
+   * editor's request — indefinitely. The caller gets `409 OVERLAY_WRITE_CONFLICT`
+   * naming both revisions, which is a fact a Studio can act on ("reload") and a
+   * 400 is not.
+   * ─────────────────────────────────────────────────────────────────────────
+   */
+  async function commitWithStaleRecovery(body: unknown): Promise<Rec> {
+    try {
+      return await commit(body)
+    } catch (error) {
+      if ((error as {code?: string})?.code !== 'OVERLAY_WRITE_CONFLICT') throw error
+
+      const manifest = await store.inspect()
+      log(
+        'warn',
+        `overlay commit: the branch moved to revision ${manifest.revision} underneath this ` +
+          `session (was ${state.revision}); rebuilding the projection from disk and retrying once`,
+      )
+      state = await hydrateState(store, manifest)
+      checkpointRevision = manifest.checkpoint?.overlayRevision ?? null
+
+      return await commit(body)
     }
   }
 
@@ -1290,10 +1523,30 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     })
   }
 
+  /**
+   * The response status for a failure, in the order the answer is knowable.
+   *
+   * 1. `OverlayApiError` states its own status — it is the boundary's own
+   *    vocabulary (415, 403, 501, …) and nothing outranks it.
+   * 2. Otherwise PRD §22.9, via {@link overlayApiStatusForErrorCode}. This step
+   *    used to be MISSING, which flattened the entire §22.9 table to 400: a
+   *    capacity refusal (413), a retryable store outage (503) and an evaluator
+   *    fault (500) all arrived looking like a malformed request, and a client
+   *    that can only see 400 retries the same request forever.
+   * 3. Otherwise the old shape: a code-carrying error is the caller's fault
+   *    (400), an anonymous throw is ours (500).
+   */
+  function statusFor(api: OverlayApiError | null, code: string, error: unknown): number {
+    if (api !== null) return api.status
+    return (
+      overlayApiStatusForErrorCode(code) ?? ((error as {code?: string})?.code ? 400 : 500)
+    )
+  }
+
   function failure(request: Request, error: unknown, label: string): Response {
     const api = error instanceof OverlayApiError ? error : null
     const code = api?.code ?? ((error as {code?: string})?.code || 'INTERNAL')
-    const status = api?.status ?? ((error as {code?: string})?.code ? 400 : 500)
+    const status = statusFor(api, code, error)
     const message = String((error as Error)?.message ?? error)
     /* Loud by contract: a write that reached the server and did not land is the
      * one failure mode this API must never hide. */
@@ -1422,6 +1675,7 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
       actor: defaultActor,
       mutations: [{type: 'create', document}],
       records,
+      expectedOverlayRevision: state.revision,
     })
     state = {...applied.state, revision: stored.manifest.revision}
   }
@@ -1603,7 +1857,7 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
         return failure(request, error, 'commit')
       }
       try {
-        const result = await enqueue(() => commit(body))
+        const result = await enqueue(() => commitWithStaleRecovery(body))
         /* Announced only after `enqueue` resolved — i.e. only after the store
          * passed its commit point — and before the response is produced, so a
          * subscriber can never observe the acknowledgement without the event

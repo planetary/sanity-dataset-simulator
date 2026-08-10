@@ -7,7 +7,7 @@
  * rejection of unregistered queries; §5.5 requires that nothing is silently
  * approximated. Both are enforced here rather than at the call site.
  */
-import {sha256Hex} from '../../sanity-overlay-core/src/checksum'
+import {sha256Hex} from 'sanity-overlay-core/checksum'
 import {OverlayQueryError} from './errors'
 import type {OverlayQueryDefinition, QueryCaller, QueryPerspective} from './types'
 

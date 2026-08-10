@@ -22,7 +22,7 @@ import {
   type OverlayConflict,
   type OverlayConflictResolutionType,
   type OverlayConflictSeverity,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 
 type Rec = Record<string, unknown>
 

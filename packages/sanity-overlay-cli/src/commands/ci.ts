@@ -25,7 +25,7 @@
  */
 import {readFile} from 'node:fs/promises'
 import {isAbsolute, resolve} from 'node:path'
-import type {SanityDocument, SerializedSchemaArtifact} from '../../../sanity-overlay-core/src/index'
+import type {SanityDocument, SerializedSchemaArtifact} from 'sanity-overlay-core'
 import {usageError} from '../errors'
 import {EXIT} from '../exit'
 import {loadRecords, openOverlay, type LoadedRecords, type OpenedOverlay} from '../overlay'

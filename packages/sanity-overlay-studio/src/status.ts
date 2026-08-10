@@ -21,6 +21,15 @@ export const OVERLAY_BANNER_STATES = [
   'disabled-unexpectedly',
   'unauthenticated',
   'offline',
+  /**
+   * §14.4's other writer won, and this session is behind it.
+   *
+   * BELOW `offline` because an unreachable API cannot tell you the branch moved,
+   * and ABOVE everything else because it is the only remaining state in which
+   * writes are accepted by the editor and refused by the server *permanently*.
+   * Conflicts and schema mismatches still let edits land; this does not.
+   */
+  'branch-moved',
   'schema-mismatch',
   'hard-conflict',
   'soft-conflict',
@@ -60,9 +69,33 @@ export interface OverlayStatusInput {
   pendingWrites: number
   /** Writes the overlay API could not accept (transient). */
   degradedWrites: number
+  /**
+   * Writes the §34.6 ledger answered from its record instead of applying
+   * (`transport.ts` `replayed`).
+   *
+   * A LINE, NOT A BANNER STATE, and the distinction is deliberate. The banner
+   * states are a precedence machine governing whether editing is allowed at
+   * all, and a replay does not change that: reads work, writes work, and the
+   * named transaction really is in the ledger. What it does change is whether
+   * "saved" can be believed for THAT write — which is a fact to put in front of
+   * the editor, not a mode to put the Studio into. Absent or `0` renders
+   * nothing, so a healthy session is unchanged.
+   */
+  replayedWrites?: number
   /** Edits since the last checkpoint (§29.6). */
   uncheckpointedEdits: number
   conflicts: {hard: number; soft: number}
+  /**
+   * A commit came back `409` after the server had already reconciled once
+   * (`transport.ts` outcome `stale`).
+   *
+   * It LATCHES, and that is the point: the session's in-memory revision chain is
+   * behind the disk and nothing it sends will be accepted until the tab reloads.
+   * A banner that cleared itself on the next successful read would let the
+   * editor keep typing into a document that cannot be saved — the failure this
+   * state exists to make impossible.
+   */
+  branchMoved?: boolean
   schemaMismatch?: boolean
   identityMismatch?: boolean
   base?: {dataset: string; revision?: string}
@@ -92,6 +125,7 @@ const SEVERITY: Readonly<Record<OverlayBannerState, OverlaySeverity>> = Object.f
   'disabled-unexpectedly': 'critical',
   unauthenticated: 'critical',
   offline: 'critical',
+  'branch-moved': 'critical',
   'schema-mismatch': 'critical',
   'hard-conflict': 'critical',
   'soft-conflict': 'warning',
@@ -140,6 +174,17 @@ export function deriveOverlayStatus(input: OverlayStatusInput): OverlayStatus {
     },
     {label: 'Overlay API', value: input.apiUrl},
   ]
+
+  /* Appended, and only when there is something to say — see
+   * {@link OverlayStatusInput.replayedWrites}. */
+  if ((input.replayedWrites ?? 0) > 0) {
+    lines.push({
+      label: 'Replayed writes',
+      value:
+        `${pluralize(input.replayedWrites ?? 0, 'write')} answered from the idempotency ledger ` +
+        `and NOT applied — re-read those documents`,
+    })
+  }
 
   return {
     state,
@@ -217,6 +262,19 @@ function classify(
           ? 'Too many edits are unsaved — editing is now read-only to avoid losing more.'
           : 'Edits are held locally and will be retried.'),
       editing: exhausted ? 'read-only' : 'normal',
+      publishBlocked: true,
+    }
+  }
+
+  if (input.branchMoved === true) {
+    return {
+      state: 'branch-moved',
+      headline:
+        'The branch moved underneath this session — another writer (a CLI run, an agent, a Git ' +
+        'merge or a second tab) changed the overlay, and edits made here are no longer being ' +
+        'saved. Reload the Studio to pick up the current branch state. Nothing was written to ' +
+        'the shared dataset.',
+      editing: 'read-only',
       publishBlocked: true,
     }
   }

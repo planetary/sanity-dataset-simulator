@@ -1,11 +1,17 @@
 {
   "algorithm": "sha256",
-  "checksum": "53cf67f9069589f90710e15d68935f8a084a870b7e92b329c6dd3e69142e5a3a",
+  "checksum": "735bd2465867b84162f66e1615de8b4567b15bc855728afaec8f06b80877e772",
   "files": {
-    "documents/article-01/intent.json": "4be93ae6cb888b2c50c686c8477e28bc96d7702a9e590763b42690679cf66cef",
+    "documents/article-01/intent.json": "afe0d2b4577aa1430b7d6061c5293af503d5709328b8d70f2cb467102a0a4d2d",
+    "documents/author-2/intent.json": "18b9cbfdc0eeae691ab9d320eec03c88e5e1ceed3e287dbabd982dca6060ec35",
+    "documents/author-3/intent.json": "582e4208160fb6c772bdcd0faf07b4402b3593360aade8823f1ab5c3ac339f19",
+    "documents/image-23ebda0ced54001ca658d9d443f7e290759b6810-2x2-png/intent.json": "a6279bc43da981ecf750bc4170a3e187e94b3f0f0df9f16ffec094e92a4337f3",
+    "documents/image-b2bbe763c7e1828c750d53f78550709a6fea19be-1x1-png/intent.json": "d124c8a568e65cf7b0ef55e584d5af9ecc21fb132c2088d78e3f4f363b8c4b24",
     "documents/origin-proof-1/intent.json": "5861db9e5e4650ed702d5f8d3ee2789a223c90ef295b11e53ae07289c32e999b",
-    "manifest.json": "52ade485de7ffcfc88f117bce51300008a2f752e3b6eb3dd2aa65d66cfa63c54",
-    "snapshots/1d9bb293b1d4fa563677dbda88217fa00d460db463f77db5f8623961df9e8653.json": "1d9bb293b1d4fa563677dbda88217fa00d460db463f77db5f8623961df9e8653"
+    "manifest.json": "14ebc6fc0653c69dc6e8ea01e6af2fc9d7f681932216c26d08c562d69b383027",
+    "snapshots/f638c6b67b720c899c76c685beac177ea3133be5b3ad71e548110a15465ccf72.json": "f638c6b67b720c899c76c685beac177ea3133be5b3ad71e548110a15465ccf72",
+    "snapshots/f9b578d03271c086bf6ee806aa265816d4adbf045b13cbc58697c4b042546519.json": "f9b578d03271c086bf6ee806aa265816d4adbf045b13cbc58697c4b042546519",
+    "snapshots/fb4a767dcf38d11366936519c0b74a467723f817b58d9d0bf49dc0d67325a5c7.json": "fb4a767dcf38d11366936519c0b74a467723f817b58d9d0bf49dc0d67325a5c7"
   },
   "formatVersion": 1,
   "overlayId": "spike-a-local-echo"

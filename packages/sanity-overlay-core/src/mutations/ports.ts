@@ -11,7 +11,7 @@ import type {OverlayConflict} from '../types/conflict'
 import type {SanityDocument} from '../types/document'
 import type {OverlayMutation} from '../types/operations'
 import type {OverlayPath} from '../types/path'
-import type {OverlayBaseStatus, OverlayDocumentOrigin} from '../types/record'
+import type {OverlayAncestorKind, OverlayBaseStatus, OverlayDocumentOrigin} from '../types/record'
 import {mergeDocument} from '../merge/merge'
 
 /* ------------------------------------------------------------------ *
@@ -76,6 +76,58 @@ export function createBaseSource(
     getPublished: (logicalId) => published.get(logicalId) ?? null,
     getDraft: (logicalId) => drafts.get(logicalId) ?? null,
   }
+}
+
+/**
+ * The base document a rebase must compare a record's ancestor against.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS A FUNCTION AND NOT A MAP LOOKUP.
+ *
+ * §17.1's `currentBase` is "the base document as it stands now" — but a document
+ * has TWO base addresses, `X` and `drafts.X`, and which of them is "the base"
+ * for a given rebase is decided by the ancestor the record captured
+ * (§13.5 `ancestorKind`). Getting it wrong is not a near miss: comparing a
+ * published ancestor against the current base DRAFT reports every path the
+ * draft differs on as "the base moved under the branch", which fails §28.5
+ * precondition 1 and reports the rebase blocked with no visible cause.
+ *
+ * That is exactly what happened. `sanity-overlay-next`'s rebase endpoint keyed
+ * the caller's `baseDocuments` by `toPublishedId(document._id)`, collapsing the
+ * pair onto one entry so the LAST one in the array won; the Studio sends
+ * `[published, draft]`, so the draft always won, and rebase was inert for every
+ * document that had a draft — which is every document anyone is editing. The
+ * CLI had the mirror-image half: it keyed by the document's own `_id` and then
+ * only ever looked up the published address, silently ignoring a base draft.
+ *
+ * One definition, here, beside the source it reads. Two four-line copies of a
+ * perspective rule is how the two halves came to disagree in the first place.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * `local-published` and `branch-created` resolve to the base PUBLISHED document:
+ * their ancestor is not a base version at all, and the base block a rebase
+ * updates is the published one either way (§28.5).
+ */
+export function currentBaseForAncestor(
+  source: BaseDocumentSource,
+  logicalId: string,
+  ancestorKind: OverlayAncestorKind,
+): SanityDocument | null {
+  const snapshot =
+    ancestorKind === 'base-draft' ? source.getDraft(logicalId) : source.getPublished(logicalId)
+  return snapshot?.document ?? null
+}
+
+/**
+ * Does the caller's base payload state ANY current base for this document?
+ *
+ * Deliberately either address. "You sent no base for this document" is a
+ * malformed request; "you sent the wrong perspective for this record's
+ * ancestor" is a §28.5 blockage reported per document, and a caller cannot act
+ * on the second if it arrives as the first.
+ */
+export function hasAnyBaseAddress(source: BaseDocumentSource, logicalId: string): boolean {
+  return source.getPublished(logicalId) !== null || source.getDraft(logicalId) !== null
 }
 
 /* ------------------------------------------------------------------ *

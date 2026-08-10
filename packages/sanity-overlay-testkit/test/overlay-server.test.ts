@@ -1618,6 +1618,11 @@ describe('spikeA overlay server — POST /query', () => {
       baseDocuments: [BASE_ARTICLE],
     })
 
+    /* 400 here, and 422 from `sanity-overlay-next` for the same refusal, is not
+     * an inconsistency to fix in one place: this is the SPIKE A server
+     * (`examples/kitchen-sink/spikeA/overlayServer.mjs`), which is disposable
+     * evidence code (§0.6) and deliberately not held to §22.9. The shipped
+     * boundary's answer is pinned in `failure-api.test.ts`. */
     expect(status).toBe(400)
     expect(json.ok).toBe(false)
     expect(json.error?.code).toBe('UNSUPPORTED_QUERY')

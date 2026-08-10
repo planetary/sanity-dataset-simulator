@@ -39,7 +39,8 @@ import {
   type OverlayEchoPlan,
   type PlannedEvent,
 } from './echo'
-import {STAGING_WRITE_POLICY, isStagingWrite} from '../../../sanity-overlay-client/src/stagingHost'
+import {STAGING_WRITE_POLICY, isStagingWrite} from 'sanity-overlay-client/stagingHost'
+import {classifyOverlayHistoryRead, emptyOverlayHistoryAnswer} from './history'
 import type {StudioReadRouter} from './reads'
 import type {
   OverlayHydrationDocument,
@@ -65,7 +66,23 @@ export interface OverlayWriteRecord {
   transactionId: string
   /** Did the echo produce at least one listener frame for the pane? */
   echoed: boolean
-  committed: 'ok' | 'degraded' | 'fatal' | 'refused'
+  /**
+   * `stale` is the §14.4 case: the overlay refused the write with 409 because
+   * this session's view of the branch is behind another writer's. It is neither
+   * `degraded` (which means "saved, loudly" and would be a lie) nor `fatal`
+   * (which the runtime reads as a dead credential).
+   */
+  /**
+   * `replayed` is the §34.6 ledger answering "I already hold this key". NOTHING
+   * WAS APPLIED BY THIS CALL, so it is not `ok` — but it is not a failure
+   * either: the write it names did land, at some point, under this key.
+   *
+   * It is recorded distinctly because the two readings are opposite. A genuine
+   * retry after a timeout is benign; a replay the editor did not ask for means
+   * their keystrokes went nowhere, and the only difference visible from here is
+   * that the second one used to be indistinguishable from a save.
+   */
+  committed: 'ok' | 'degraded' | 'stale' | 'fatal' | 'refused' | 'replayed'
   unsupported: string[]
   at: number
 }
@@ -104,9 +121,61 @@ export interface OverlayFacadeOptions {
    * `assetOriginFor`, which is what decides whether a given mounting can.
    */
   assetOrigin?: string
+  /**
+   * Does the branch hold state for this document ADDRESS (`drafts.x` or `x`)?
+   *
+   * SYNCHRONOUS, because the call site is `request()` and the decision has to
+   * be made before the delegation happens. The overlay's own view already
+   * answers it — `overlaySourceFromBranch` keys `documents` and `tombstones` by
+   * exactly these addresses — so nothing new is fetched to ask.
+   *
+   * WHAT IT IS NOT. It is NOT "this document was created in the branch". That
+   * question cannot be answered here at all: it needs to know what BASE holds,
+   * which is a network round trip this call cannot make. The two differ for a
+   * base document the branch has edited, and this predicate says `true` for
+   * both. See {@link OverlayFacadeOptions.branchHolds} usage in the `request`
+   * branch for why that is the safe side to err on.
+   *
+   * ABSENT MEANS UNCHANGED: every history read is delegated exactly as it was
+   * before this option existed.
+   */
+  branchHolds?: (documentId: string) => boolean
+  /**
+   * Deadline for one DELEGATED read, in ms. See {@link DEFAULT_READ_TIMEOUT_MS}.
+   * `0` or a negative number disables it.
+   */
+  readTimeoutMs?: number
   /** Injected clock for the write ledger. */
   now?: () => number
 }
+
+/**
+ * Two minutes on a read that has been handed to the base dataset.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY A READ NEEDS A DEADLINE AT ALL.
+ *
+ * `fetch` has none, and neither does `@sanity/client`. A base that accepts the
+ * connection and never answers leaves the promise pending for the life of the
+ * tab. That is survivable for a list pane — it renders a spinner and the editor
+ * reloads — and it is NOT survivable for a read something else is gated on.
+ *
+ * §24's asset-deduplication probe was exactly that: `uploadSanityAsset` does not
+ * send a single byte until `client.observable.fetch(…sha1hash…)` emits
+ * (`sanity@6.8.0 lib/useBundleDocuments-BYW8M9LS.js:13450`). Delegated to a base
+ * that never answered, it produced an image field stuck on "Uploading" with no
+ * error anywhere — observed live 2026-08-09. `assetDedup.ts` takes that
+ * particular read off the network entirely, which fixes the instance; this
+ * deadline is the CLASS, because the next gated read will not be an asset one
+ * and nobody will know it was gated until it wedges.
+ *
+ * TWO MINUTES, matching {@link DEFAULT_UPLOAD_TIMEOUT_MS}, and for the same
+ * reason: long enough that no healthy query on a bad connection reaches it,
+ * short enough that a wedged session becomes a sentence rather than a spinner.
+ * It bounds the WHOLE read, not an idle period, because the failure being
+ * prevented is a server that accepts and never replies.
+ */
+export const DEFAULT_READ_TIMEOUT_MS = 120_000
 
 /* ------------------------------------------------------------ observables */
 
@@ -557,21 +626,73 @@ function createFacade(options: OverlayFacadeOptions): {
   ): Promise<void> {
     let committed: OverlayWriteRecord['committed'] = 'ok'
 
-    for (const commit of plan.commits) {
+    for (const [index, commit] of plan.commits.entries()) {
       const result: OverlayTransportResult = await transport.commit(commit, {
-        idempotencyKey: transactionId,
+        /*
+         * ONE KEY PER BATCH, NOT ONE PER WRITE.
+         *
+         * `planActions` splits a single `client.action([...])` into an `actions`
+         * commit and a `documentActions` commit whenever the call carries both —
+         * which is exactly how sanity 6.8.0 spells "save this edit, then publish
+         * it", and how a restore of a deleted document arrives. Every batch used
+         * to be posted under the bare `transactionId`, i.e. one idempotency key
+         * presented two or three times for two or three different writes.
+         *
+         * NOT A LIVE LOSS TODAY, AND SAID PLAINLY RATHER THAN OVERSTATED: it
+         * survives only because the two endpoints happen to key into disjoint
+         * spaces — `commitMutations` files the key verbatim while
+         * `commitDocumentActions` files `${key}#0` — so the second batch misses
+         * the first batch's ledger entry by coincidence. Measured: with one
+         * shared key both batches still commit.
+         *
+         * That coincidence is the whole safety margin, it lives in a different
+         * package, and nothing enforces it. A third batch kind, or an endpoint
+         * that files the caller's key verbatim like the first one does, silently
+         * reinstates a dropped write — the exact failure this file has now been
+         * bitten by once. `#index` is the overlay API's own spelling for a
+         * derived step key (`sanity-overlay-next` `api.ts` `stepKey`), so a
+         * retry still replays exactly the batches it already ran, and the
+         * uniqueness stops depending on where the batch happens to be routed.
+         */
+        idempotencyKey: `${transactionId}#${index}`,
         baseDocuments: baseDocumentsFor(plan.plans),
       })
       if (result.outcome === 'fatal') {
         committed = 'fatal'
-        echo.noteAuthFailure({
-          status: result.status ?? 401,
-          source: 'write',
-          message: result.message ?? 'the overlay API rejected the write',
-        })
+        /*
+         * ONLY 401/403 ENDS THE SESSION.
+         *
+         * `fatal` used to mean nothing but "the overlay said 401/403", so this
+         * branch could assume one. It now also covers 413/415/422 — refusals
+         * about the REQUEST — and `noteAuthFailure` moves the session to
+         * `unauthenticated`, which stops all further writes and tells the editor
+         * their Sanity login has gone. Doing that because one image was too
+         * large would discard a whole session's work over a payload limit.
+         */
+        if (result.status === 401 || result.status === 403) {
+          echo.noteAuthFailure({
+            status: result.status,
+            source: 'write',
+            message: result.message ?? 'the overlay API rejected the write',
+          })
+        }
+        break
+      }
+      /* §14.4: the branch moved. Recorded distinctly and NOT retried — the
+       * server already reconciled once and refused anyway. */
+      if (result.outcome === 'stale') {
+        committed = 'stale'
         break
       }
       if (result.outcome === 'degraded') committed = 'degraded'
+      /* §34.6 replay. NOT a save: this call applied nothing, so it must not
+       * echo — a frame is a claim about what the overlay now holds, and the
+       * overlay does not now hold what this write asked for. Recorded after
+       * `degraded` so the loud, retryable outcome of an earlier batch is not
+       * overwritten by a later batch's replay. */
+      if (result.replayed === true && result.committed === false && committed === 'ok') {
+        committed = 'replayed'
+      }
       if (result.documents !== undefined) options.onHydration?.(result.documents)
       seedOverlayDocuments(echo, result.documents ?? [])
       for (const entry of result.unsupported ?? []) {
@@ -582,7 +703,43 @@ function createFacade(options: OverlayFacadeOptions): {
       }
     }
 
-    const frames = committed === 'fatal' ? [] : echo.emit(plan.plans, transactionId)
+    /*
+     * ───────────────────────────────────────────────────────────────────────────
+     * A FRAME IS A CLAIM ABOUT WHAT THE OVERLAY NOW HOLDS, SO ONLY A COMMIT THAT
+     * LANDED MAY PRODUCE ONE.
+     *
+     *   `ok`       persisted            → echo
+     *   `degraded` may have landed, retryable, the edit stays in the pane → echo
+     *   `stale`    409, did NOT land and resending will not help          → do not
+     *   `fatal`    401/403/413/422, provably cannot land                  → do not
+     *   `replayed` §34.6 said the key was already spent; THIS call applied
+     *              nothing, so there is nothing to claim                   → do not
+     *
+     * `stale` used to echo, and that was the 2026-08-04 defect wearing a new hat:
+     * the pane would go `Saved` over a write the disk never took.
+     *
+     * BUT NOT ECHOING IS NOT ENOUGH ON ITS OWN. Studio has already been handed a
+     * synthetic success for this transaction — it must be, because
+     * `consumeUnresolved` only matches a frame against a transaction it has
+     * registered — so silence here leaves `BufferedDocument.submitted` holding it
+     * for ever, and the pane at `Saving…` with four document actions quietly
+     * disabled. The honest recovery is the same one the echo uses for a frame it
+     * cannot build: tell the pane to re-read, so it shows the state the write did
+     * NOT reach. The banner says separately, and loudly, why.
+     */
+    const landed = committed === 'ok' || committed === 'degraded'
+    const frames = landed ? echo.emit(plan.plans, transactionId) : []
+    if (!landed && plan.plans.length > 0) {
+      echo.requestResync(
+        plan.plans.map((entry) => entry.documentId),
+        committed === 'replayed'
+          ? `the overlay replayed ${method} from its §34.6 ledger instead of applying it, so ` +
+            `there is nothing to echo and the pane is holding a transaction that will never be ` +
+            `answered`
+          : `the overlay did not accept ${method} (${committed}), so there is nothing to echo and ` +
+            `the pane is holding a transaction that will never be answered`,
+      )
+    }
 
     recordWrite({
       method,
@@ -872,8 +1029,29 @@ function createFacade(options: OverlayFacadeOptions): {
       /* The branch has DELETED this address (§18.6, §18.7). Falling through to
        * the base body would put a document the branch removed back into the
        * editor, which is the same silent approximation §5.5 forbids. */
-      if (echo.isOverlaySuppressed(id)) return null
-      return echo.getOverlayDocument(id) ?? value
+      if (echo.isOverlaySuppressed(id)) {
+        if (authoritative) echo.notePaneSnapshot(id, null)
+        return null
+      }
+      const overlay = echo.getOverlayDocument(id)
+      if (overlay === undefined) return value
+      /*
+       * THE SUBSTITUTION HAS TO BE RECORDED, NOT JUST PERFORMED.
+       *
+       * `seedFromResult` above learned the revision of the RAW base answer,
+       * which is right — that body is the merge ancestor §17 needs. But this is
+       * the value the pane's `BufferedDocument` is actually constructed from,
+       * and its `_rev` is the SYNTHETIC overlay one. Leaving the echo chaining
+       * the next frame off the base revision (or off nothing at all, when base
+       * answered `null`) makes every subsequent frame unapplicable, and the
+       * symptom is an indefinite `Saving…` with no error anywhere.
+       *
+       * Only for the AUTHORITATIVE read — the pair listener's `getDocuments`
+       * snapshot — because that is the only read Studio rebuilds its document
+       * model from. See {@link AUTHORITATIVE_READ_METHODS}.
+       */
+      if (authoritative) echo.notePaneSnapshot(id, overlay)
+      return overlay
     }
 
     if (isPromiseLike(result)) {
@@ -956,6 +1134,39 @@ function createFacade(options: OverlayFacadeOptions): {
    * Content Lake had said it. A DELEGATED read still seeds, because that really
    * is base traffic.
    */
+  /**
+   * The same promise, but it cannot outlive the deadline.
+   *
+   * REJECTS rather than resolving with a sentinel: the caller of a read is
+   * `groq-js`, a React hook, or — the case that motivated this —
+   * `uploadSanityAsset`'s `mergeMap`. Every one of them has an error channel
+   * that reaches a human, and none of them has a "still waiting" channel that
+   * does. §5.5: a stated failure beats an unbounded pending state.
+   */
+  function withReadDeadline(work: Promise<unknown>, label: string): Promise<unknown> {
+    const limit = options.readTimeoutMs ?? DEFAULT_READ_TIMEOUT_MS
+    if (!(limit > 0)) return work
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          markOverlayRefusal(
+            new Error(
+              `[sanity-overlay-studio] the base dataset did not answer this read within ` +
+                `${limit}ms, so it was abandoned rather than left pending. Nothing was written ` +
+                `and nothing was approximated. Query: ${label}`,
+            ),
+          ),
+        )
+      }, limit)
+    })
+    /* ALWAYS cleared. An uncleared two-minute timer keeps a Node process — and
+     * every test runner that hosts one — alive long after the work is done. */
+    return Promise.race([work, deadline]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer)
+    })
+  }
+
   function interceptFetch(
     target: object,
     fn: (...args: unknown[]) => unknown,
@@ -966,12 +1177,18 @@ function createFacade(options: OverlayFacadeOptions): {
     const delegate = (): unknown => tapReadErrors(fn.apply(target, args))
     if (router === undefined || typeof args[0] !== 'string') return delegate()
 
+    const label = args[0]
     const answered = router({
       query: args[0],
       params: args[1],
       options: args[2],
-      baseFetch: (query, params) => firstValueOf(fn.call(target, query, params)),
-    }).then((answer) => (answer.answered ? answer.result : firstValueOf(delegate())))
+      /* The CANDIDATE fetch is bounded too, and it has to be: an evaluation the
+       * planner proved complete is still gated on staging answering it. */
+      baseFetch: (query, params) =>
+        withReadDeadline(firstValueOf(fn.call(target, query, params)), query),
+    }).then((answer) =>
+      answer.answered ? answer.result : withReadDeadline(firstValueOf(delegate()), label),
+    )
 
     if (kind !== 'observable') {
       return answered.catch((error: unknown) => {
@@ -1496,19 +1713,71 @@ function createFacade(options: OverlayFacadeOptions): {
              *
              * They are answered by the BASE DATASET, so anything a branch created
              * looks absent to them and anything a branch deleted looks present.
-             * Intercepting them means teaching this facade the `/data/doc` and
-             * `/data/history` wire formats — a second, weaker copy of the overlay
-             * read path — so it is recorded here rather than half-done.
+             *
+             * THE TWO HISTORY ONES ARE NO LONGER DELEGATED — see below and
+             * `history.ts`. `/data/doc` still is: it is an EXISTENCE question,
+             * not a history one, and the overlay origin answers it from branch
+             * state already.
              *
              * Strictly worse, and genuinely UNREACHABLE from any client proxy:
              * the timeline reads its transaction log with the GLOBAL `fetch()`,
              * built from `client.getUrl()` + `client.config().token`
              * (`datastores-DqFH7RLd.js:6876`, `:7097`;
              * `useBundleDocuments…:4822`). No wrapper around a client method can
-             * see those at all.
+             * see those at all — and it is the translog, not the events feed,
+             * that produced the live `getEditEvents` TypeError, because
+             * `{"transactions":[]}` on an NDJSON endpoint decodes to one bogus
+             * transaction with no `effects`. `EMPTY_TRANSLOG_NDJSON` states the
+             * contract that closes it; enforcing it belongs to whatever serves
+             * `apiHost`, which is why the constant is exported rather than used.
              * ─────────────────────────────────────────────────────────────────
              */
-            if (!isWrite) return tapReadErrors(fn.apply(t, args))
+            if (!isWrite) {
+              /*
+               * A BRANCH DOCUMENT'S UPSTREAM HISTORY IS EMPTY, AND SAYING SO IS
+               * NOT AN APPROXIMATION.
+               *
+               * Only for a document the branch holds, and only when EVERY id in
+               * the request is one — a base id in the list has a real timeline
+               * and one branch id must not erase it.
+               *
+               * `branchHolds` cannot tell "created in the branch" from "base
+               * document the branch edited", and this errs towards answering
+               * empty for both. That is the safe side, for two reasons. The
+               * pane shows BRANCH content, so a base timeline beside it is a
+               * lineage the displayed document does not have — §5.5's "no
+               * silent approximation" cuts against showing it, and the revert /
+               * compare-versions affordances hanging off it would diff branch
+               * content against base revisions. And the native history
+               * inspector is already removed from an overlay workspace
+               * (`features.ts` `DISABLED_HOSTED_INSPECTOR_NAMES`), whose
+               * declared residue is precisely "the document-events/timeline
+               * machinery still runs". This tells that residue the truth
+               * instead of letting it read someone else's past.
+               *
+               * The method test is load-bearing: `/data/history` carries no
+               * write plane, so a POST aimed at one of these paths reaches this
+               * branch, and answering it with an empty history would swallow
+               * it.
+               */
+              const branchHolds = options.branchHolds
+              const historyRead =
+                branchHolds === undefined || (method !== 'GET' && method !== 'HEAD')
+                  ? undefined
+                  : classifyOverlayHistoryRead(url)
+              /* `(id) => branchHolds(id)`, never `.every(branchHolds)`: `every`
+               * passes an index as the second argument, and a caller who wrote
+               * `branchHolds: set.has.bind(set)`-shaped code would get it. */
+              if (
+                historyRead !== undefined &&
+                branchHolds !== undefined &&
+                historyRead.ids.every((id) => branchHolds(id))
+              ) {
+                const answer = emptyOverlayHistoryAnswer(historyRead)
+                return kind === 'observable' ? observableOf(answer) : Promise.resolve(answer)
+              }
+              return tapReadErrors(fn.apply(t, args))
+            }
             if (plane !== 'documents') {
               return refuseUnechoable(kind, `request(${String(url)})`, UNECHOABLE_REASON[plane])
             }

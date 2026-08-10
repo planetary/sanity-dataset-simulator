@@ -1,0 +1,36 @@
+{
+  "assetDocumentId": "image-23ebda0ced54001ca658d9d443f7e290759b6810-2x2-png",
+  "assetId": "23ebda0ced54001ca658d9d443f7e290759b6810",
+  "checksum": "f9acd1e6d179c86539827da10bf7c48e30c257ae11cb89e94e8e20b8194fa48d",
+  "contentType": "image/png",
+  "createdAt": "2026-08-09T17:45:54.378Z",
+  "createdBy": {
+    "displayName": "Overlay local API",
+    "id": "overlay-local-api",
+    "type": "user"
+  },
+  "formatVersion": 1,
+  "kind": "image",
+  "metadata": {
+    "aspectRatio": 1,
+    "extension": "png",
+    "hasAlpha": true,
+    "height": 2,
+    "omitted": [
+      "metadata.blurHash",
+      "metadata.exif",
+      "metadata.isOpaque",
+      "metadata.location",
+      "metadata.lqip",
+      "metadata.palette",
+      "metadata.thumbHash"
+    ],
+    "width": 2
+  },
+  "originalFilename": "obs-probe.png",
+  "overlayId": "spike-a-local-echo",
+  "provider": "filesystem",
+  "sha1hash": "23ebda0ced54001ca658d9d443f7e290759b6810",
+  "size": 74,
+  "storageRef": "assets/blobs/f9acd1e6d179c86539827da10bf7c48e30c257ae11cb89e94e8e20b8194fa48d.bin"
+}

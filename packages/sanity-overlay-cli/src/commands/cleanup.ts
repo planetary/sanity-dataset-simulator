@@ -28,7 +28,7 @@
 import type {
   OverlayOrphanReport,
   RuntimeHistoryPruneReport,
-} from '../../../sanity-overlay-store-fs/src/index'
+} from 'sanity-overlay-store-fs'
 import {confirmationRequired, usageError} from '../errors'
 import {EXIT} from '../exit'
 import {openOverlay} from '../overlay'

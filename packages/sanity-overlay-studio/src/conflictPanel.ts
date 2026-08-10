@@ -41,7 +41,7 @@ import {
   type OverlayConflictResolutionType,
   type OverlayConflictSeverity,
   type OverlayConflictType,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 
 import {formatConflictPath, type ConflictDocumentFacts, type OverlayConflictReport} from './conflicts'
 

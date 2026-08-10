@@ -50,7 +50,9 @@ export type {
 
 export {
   createBaseSource,
+  currentBaseForAncestor,
   EMPTY_BASE_SOURCE,
+  hasAnyBaseAddress,
   localWinsMerge,
   noopStrongReferenceCheck,
   noopValidator,
@@ -82,6 +84,8 @@ export {
   validateMutation,
 } from './mutation'
 export type {AppliedMutation, MutationContext} from './mutation'
+
+export {idempotencyReplayMismatch, idempotencyReuseMessage} from './idempotency'
 
 export {applyTransaction, commitTransform, findByIdempotencyKey} from './transaction'
 export type {TransactionCommit, TransactionOptions} from './transaction'

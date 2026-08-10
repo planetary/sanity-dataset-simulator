@@ -1,0 +1,25 @@
+{
+  "baseStatus": "present",
+  "draft": null,
+  "firstTouchedAt": "2026-08-09T18:48:16.617Z",
+  "formatVersion": 1,
+  "lastObservedPublishedRevision": "V2rkHT6iCw5OR37gl8ZsX0",
+  "published": {
+    "capturedAt": "2026-08-09T18:48:16.617Z",
+    "checksum": "3082da3b37cf5da60f35c2c677f64b80be8f07ba68f99b7eac8f4c761d514b49",
+    "revision": "V2rkHT6iCw5OR37gl8ZsX0",
+    "snapshot": {
+      "_createdAt": "2026-01-04T12:00:00Z",
+      "_id": "author-4",
+      "_rev": "V2rkHT6iCw5OR37gl8ZsX0",
+      "_type": "author",
+      "_updatedAt": "2026-08-04T13:11:54Z",
+      "bio": "Bio for author 4.",
+      "name": "Author 4",
+      "slug": {
+        "_type": "slug",
+        "current": "author-4"
+      }
+    }
+  }
+}

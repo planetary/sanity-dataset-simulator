@@ -10,8 +10,8 @@ import {
   applicableResolutionActions,
   summarizeConflicts,
   toPublishedId,
-} from '../../../sanity-overlay-core/src/index'
-import type {OverlayConflict} from '../../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
+import type {OverlayConflict} from 'sanity-overlay-core'
 import {EXIT} from '../exit'
 import {loadRecords, openOverlay, requireHead} from '../overlay'
 import {formatPath, plural, table} from '../render'

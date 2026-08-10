@@ -10,7 +10,7 @@
  *   - {@link createHttpBaseSource} — the hosted Content Lake query API over
  *     `fetch`. It issues only GET requests to `/query/<dataset>`.
  */
-import {createMemoryBaseSource, type QueryDocument} from '../../sanity-overlay-query/src/index'
+import {createMemoryBaseSource, type QueryDocument} from 'sanity-overlay-query'
 import {createStagingSafeFetch} from './stagingHost'
 import type {OverlayClientBaseSource} from './types'
 

@@ -41,22 +41,22 @@ import {parse as parseGroq} from 'groq-js'
 import type {
   BaseCandidateRequest,
   QueryBaseSource,
-} from '../../../sanity-overlay-query/src/baseSource'
-import {evaluateOverlayQuery} from '../../../sanity-overlay-query/src/evaluate'
-import type {OverlaySource} from '../../../sanity-overlay-query/src/overlaySource'
-import {planCandidateRequests} from '../../../sanity-overlay-query/src/planner'
+} from 'sanity-overlay-query/baseSource'
+import {evaluateOverlayQuery} from 'sanity-overlay-query/evaluate'
+import type {OverlaySource} from 'sanity-overlay-query/overlaySource'
+import {planCandidateRequests} from 'sanity-overlay-query/planner'
 import {
   createQueryRegistry,
   defineOverlayQuery,
   queryTextChecksum,
-} from '../../../sanity-overlay-query/src/registry'
+} from 'sanity-overlay-query/registry'
 import type {
   CandidatePlan,
   OverlayQueryDefinition,
   OverlayQueryDiagnostics,
   QueryDocument,
   QueryPerspective,
-} from '../../../sanity-overlay-query/src/types'
+} from 'sanity-overlay-query/types'
 import {prepareFindabilityQuery, type OverlayApproximation} from './findability'
 import {createBranchCandidateSource} from './readSource'
 
@@ -142,6 +142,20 @@ export interface StudioReadPlan {
   sourceQuery?: string
   /** Declared departures from the hosted answer. Empty when the answer is exact. */
   approximations?: readonly OverlayApproximation[]
+  /**
+   * Answer this plan from the branch ALONE — issue no base request, ever.
+   *
+   * A plan without this flag is free to ask staging for candidates, and that
+   * request is unbounded work owned by somebody else. For most reads that is the
+   * right trade: a slow list pane is a slow list pane. For a read that GATES
+   * something — §24's asset-dedup probe gates every byte of every upload — it is
+   * not, because a base that accepts the request and never answers turns the
+   * gated operation into a permanent spinner (§5.5, observed 2026-08-09).
+   *
+   * Only a plan whose candidate set is provably enumerable from the branch may
+   * set it. `assetDedup.ts` is the one that can, and it argues why in its header.
+   */
+  branchOnly?: boolean
 }
 
 export type StudioReadDerivation =
@@ -448,6 +462,28 @@ function constraintOf(expr: unknown, params: Rec): Constraint | null {
   let ids: string[] | null = null
   let types: string[] | null = null
   let field: {path: string[]; value: unknown} | null = null
+  /**
+   * A hosted system type seen on this filter, HELD rather than refused.
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * WHY IT IS NOT REFUSED WHERE IT IS SEEN.
+   *
+   * The refusal is about COMPLETENESS: a plain `*[_type == "sanity.imageAsset"]`
+   * scan cannot be proven to return every such document, so a type plan built
+   * from one would answer over a subset. That reasoning is sound for a type
+   * scan and vacuous next to an `_id` constraint — an id set names the
+   * documents outright, and a `_type` conjunct standing beside it can only
+   * NARROW, which this function's own contract says is safe to ignore.
+   *
+   * Refusing on sight cost real behaviour. Sanity's file and image inputs read
+   * their asset with `*[_type == $type && _id == $ref][0]{mimeType,
+   * originalFilename}` (`WithReferencedAsset`), which names the id exactly.
+   * That was refused, delegated to base, and base does not hold a BRANCH asset
+   * — so every branch-uploaded file rendered with no filename and no mime type,
+   * and in strict mode threw. The order of two conjuncts decided it.
+   * ─────────────────────────────────────────────────────────────────────────
+   */
+  let systemType: string | undefined
 
   for (const conjunct of conjuncts) {
     /* §22.6 step 4 for the version set. Read as an ID constraint, so it composes
@@ -506,12 +542,7 @@ function constraintOf(expr: unknown, params: Rec): Constraint | null {
         )
       }
       const system = values.find((type) => SYSTEM_TYPE.test(type))
-      if (system !== undefined) {
-        fail(
-          `type ${JSON.stringify(system)} is a hosted system type; a plain \`*[_type == …]\` ` +
-            'fetch does not return its documents, so the candidate set cannot be proven complete',
-        )
-      }
+      if (system !== undefined) systemType ??= system
       types = types === null ? values : [...types, ...values]
       continue
     }
@@ -530,7 +561,17 @@ function constraintOf(expr: unknown, params: Rec): Constraint | null {
     }
   }
 
+  /* An exact id set bounds the fetch by itself; the held system-type refusal
+   * does not apply to it (see `systemType` above). */
   if (ids !== null) return {kind: 'ids', ids}
+
+  if (systemType !== undefined) {
+    fail(
+      `type ${JSON.stringify(systemType)} is a hosted system type; a plain \`*[_type == …]\` ` +
+        'fetch does not return its documents, so the candidate set cannot be proven complete',
+    )
+  }
+
   if (types !== null && field !== null) {
     return {kind: 'field', types, path: field.path, value: field.value}
   }

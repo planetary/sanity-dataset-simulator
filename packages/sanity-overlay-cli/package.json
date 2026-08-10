@@ -11,12 +11,32 @@
   },
   "files": [
     "bin",
-    "src"
+    "dist"
   ],
   "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "prepack": "node ../../scripts/build-package.mjs",
     "test": "echo 'tested via sanity-overlay-testkit'"
+  },
+  "dependencies": {
+    "sanity-overlay-client": "workspace:*",
+    "sanity-overlay-core": "workspace:*",
+    "sanity-overlay-query": "workspace:*",
+    "sanity-overlay-store-fs": "workspace:*",
+    "sanity-overlay-studio": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.20.1"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/src/index.d.ts",
+        "import": "./dist/src/index.js"
+      }
+    },
+    "bin": {
+      "sanity-overlay": "./bin/sanity-overlay-installed.mjs"
+    }
   }
 }

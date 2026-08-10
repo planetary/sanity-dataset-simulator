@@ -35,7 +35,7 @@ import {
   type QueryCaller,
   type QueryDocument,
   type QueryPerspective,
-} from '../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
 import {buildOverlaySource} from './overlaySource'
 import type {
   OverlayClient,

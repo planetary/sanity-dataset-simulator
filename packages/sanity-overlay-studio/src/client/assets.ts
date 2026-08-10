@@ -39,11 +39,11 @@ import {
   OVERLAY_ASSET_FILENAME_HEADER,
   OVERLAY_ASSET_ROUTE_SEGMENT,
   OVERLAY_ASSET_UPLOAD_HEADER,
-} from '../../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {
   assertNoStagingWrite,
   createStagingSafeFetch,
-} from '../../../sanity-overlay-client/src/stagingHost'
+} from 'sanity-overlay-client/stagingHost'
 import {markOverlayRefusal} from './echo'
 
 type Rec = Record<string, unknown>

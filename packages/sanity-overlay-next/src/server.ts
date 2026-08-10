@@ -11,8 +11,8 @@
 import {createServer} from 'node:http'
 import type {IncomingMessage, Server, ServerResponse} from 'node:http'
 import {isAbsolute, resolve as resolvePath} from 'node:path'
-import {FsOverlayAssetStore, FsOverlayStore} from '../../sanity-overlay-store-fs/src/index'
-import type {FsOverlayStoreHooks} from '../../sanity-overlay-store-fs/src/index'
+import {FsOverlayAssetStore, FsOverlayStore} from 'sanity-overlay-store-fs'
+import type {FsOverlayStoreHooks, FsOverlayStoreOptions} from 'sanity-overlay-store-fs'
 import {createOverlayApi} from './api'
 import type {OverlayApi, OverlayApiOptions} from './api'
 
@@ -83,6 +83,19 @@ export interface StartOverlayApiServerOptions
   now?: () => string
   /** The store's own fault-injection surface; production code leaves it unset. */
   hooks?: FsOverlayStoreHooks
+  /**
+   * The store's durability and locking policy, forwarded verbatim.
+   *
+   * `root`, `now` and `hooks` are this function's own and are not accepted here
+   * — two ways to say the same thing is how they come to disagree. What is left
+   * is the policy an operator legitimately chooses: how long a writer waits for
+   * `.locks/` before answering `503 OVERLAY_STORE_UNAVAILABLE`, when a lock is
+   * treated as abandoned, and whether writes are `fsync`ed. An embedder calling
+   * `createOverlayApi` has always been able to set these by constructing its own
+   * store; the launcher had no way to, which made the retryable-outage path
+   * unreachable from the thing developers actually run.
+   */
+  storeOptions?: Omit<FsOverlayStoreOptions, 'root' | 'now' | 'hooks'>
   watchIntervalMs?: number
   /** Branch-local assets (PRD §24). Enabled by default — see the type's note. */
   assets?: OverlayApiServerAssetOptions
@@ -175,7 +188,7 @@ export async function startOverlayApiServer(
   const port = options.port ?? DEFAULT_API_PORT
   const now = options.now ?? (() => new Date().toISOString())
 
-  const store = new FsOverlayStore({root, now, hooks: options.hooks})
+  const store = new FsOverlayStore({...options.storeOptions, root, now, hooks: options.hooks})
 
   /* Same root, same clock, same lifetime as the document store — see
    * {@link OverlayApiServerAssetOptions} for why this is not opt-in. */

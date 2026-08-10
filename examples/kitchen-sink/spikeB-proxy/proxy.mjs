@@ -26,25 +26,40 @@
  *        "No activity within 45000 milliseconds. Reconnecting." with panes stuck on
  *        "Loading document…".
  *
+ *   - Chromium allows SIX concurrent HTTP/1.1 connections per origin and Studio holds
+ *     six listener streams open, so over cleartext the SEVENTH request — the document
+ *     pane's first snapshot — is queued forever and no pane ever loads. Content Lake is
+ *     HTTP/2, where those six are streams on one connection.
+ *     => the CLI serves HTTP/2 over TLS *on the same port*, chosen per connection by
+ *        the first byte. See `createProxyStack` and `tlsMaterial.mjs`.
+ *
  * Usage:
- *   node proxy.mjs                       # CLI: config from the environment
- *   import {createProxyServer} from './proxy.mjs'   # embedded: config injected
+ *   node proxy.mjs                       # CLI: BOTH framings on PROXY_PORT
+ *   import {createProxyServer} from './proxy.mjs'   # embedded, HTTP/1.1 only
+ *   import {createProxyStack} from './proxy.mjs'    # embedded, both framings
  *
  * Env (CLI defaults; every one is overridable through createProxyServer options):
- *   PROXY_PORT=3999                       listen port
+ *   PROXY_PORT=3999                       listen port (http:// AND https:// both)
  *   PROXY_BIND=<addr>                     bind address (default: all interfaces, v4+v6)
+ *   PROXY_TLS=0                           disable the HTTP/2 listener (see README)
+ *   PROXY_TLS_DIR=<dir>                   where a minted certificate is cached
+ *   PROXY_TLS_CERT / PROXY_TLS_KEY        use a certificate you already have
+ *   PROXY_TLS_SOURCE=mkcert|self-signed   pin a rung of the certificate ladder
+ *   PROXY_TLS_NAMES=<a,b>                 extra certificate subject names
  *   SANITY_API_HOST=https://b1n03q3z.api.sanity.io   upstream origin — declare it
  *                                         in examples/kitchen-sink/.env, not in
  *                                         your shell; see resolveProxyConfig
  *   PROXY_BLOCK_WRITES=1                  enable the overlay write guard
  *   PROXY_DERIVE_PROJECT_HOST=0           disable `<project>.localhost` -> `<project>.api.sanity.io`
  *   PROXY_FORWARD_ORIGIN=1                forward browser Origin/Referer upstream (default: strip)
- *   PROXY_REWRITE_COOKIES=0               disable Set-Cookie Domain/Secure rewriting
+ *   PROXY_REWRITE_COOKIES=0               disable Set-Cookie rewriting (`Domain` always;
+ *                                         `Secure` on the cleartext leg only)
  *   PROXY_LOG=<path>                      JSONL request log (default: ./proxy-log.jsonl)
  *   PROXY_VERBOSE=1                       also mirror the log line to stderr
  */
 
 import http from 'node:http'
+import http2 from 'node:http2'
 import https from 'node:https'
 import net from 'node:net'
 import tls from 'node:tls'
@@ -53,6 +68,7 @@ import {dirname, join} from 'node:path'
 import {fileURLToPath, pathToFileURL} from 'node:url'
 
 import {createRealtimeFrameGuard, isWriteRequest} from './writeGuard.mjs'
+import {describeTlsMaterial, ensureTlsMaterial, trustVisitUrl} from './tlsMaterial.mjs'
 import {
   assertLoopbackBind,
   isGrantedOrigin,
@@ -80,6 +96,26 @@ const STUDIO_DIR = join(HERE, '..')
 const DECLARED_UPSTREAM = Object.freeze({
   SANITY_API_HOST: 'https://b1n03q3z.api.sanity.io',
 })
+
+/**
+ * Headers HTTP/2 has no spelling for, and which Node REFUSES to put on an h2
+ * response: `ERR_HTTP2_INVALID_CONNECTION_HEADERS`, thrown from `respond()`.
+ *
+ * This overlaps {@link HOP_BY_HOP} almost entirely, and is a separate set on
+ * purpose. `HOP_BY_HOP` is a FORWARDING rule about what a proxy may relay; this
+ * is a FRAMING rule about what the wire can carry. The SSE branch below adds
+ * `Connection: keep-alive` of its own accord — it is not relayed, so no
+ * forwarding rule can catch it — and on an h2 stream that one header would turn
+ * every listener into a 500. So the h2 response path filters again, at the last
+ * moment, against the set that describes the transport rather than the relay.
+ */
+const H2_ILLEGAL_RESPONSE_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+])
 
 /** RFC 7230 §6.1 hop-by-hop headers — must not be forwarded in either direction. */
 const HOP_BY_HOP = new Set([
@@ -297,6 +333,42 @@ function setHeader(headers, name, value) {
 
 const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/
 
+// ---------------------------------------------------------------------------
+// transport — the four places h2 is not "h1 with different framing"
+// ---------------------------------------------------------------------------
+
+/** Is this request an HTTP/2 stream rather than an HTTP/1.1 message? */
+function isH2(req) {
+  return req.httpVersionMajor === 2
+}
+
+/**
+ * Did this request arrive over TLS?
+ *
+ * Both listeners can serve either protocol: the TLS listener answers HTTP/1.1
+ * too (ALPN falls back, and Chrome opens WebSockets that way), so "h2" and
+ * "encrypted" are independent questions and only one of them decides whether a
+ * `Secure` cookie is usable.
+ */
+function isEncrypted(req) {
+  if (isH2(req)) return true
+  return Boolean(req.socket && req.socket.encrypted)
+}
+
+/**
+ * The authority this request was addressed to.
+ *
+ * HTTP/2 has NO `Host` header — RFC 9113 §8.3.1 replaces it with the
+ * `:authority` pseudo-header — so a proxy that reads `req.headers.host` and
+ * nothing else silently stops deriving `<projectId>.localhost` ->
+ * `<projectId>.api.sanity.io` the moment a browser negotiates h2, and sends
+ * every project's traffic to the configured default instead.
+ */
+function requestAuthority(req) {
+  const raw = req.headers[':authority'] ?? req.headers.host ?? ''
+  return String(Array.isArray(raw) ? raw[0] : raw)
+}
+
 /**
  * Re-emit a request line + headers on a raw socket. Used only by the upgrade
  * path, which cannot go through `http.request()`: after the 101 the connection
@@ -355,6 +427,54 @@ export function upstreamDialSpec({tls: useTls, hostname, port}) {
 /** Open the socket a dial spec describes. The default `dialUpstream`. */
 function dialFromSpec(spec) {
   return spec.transport === 'tls' ? tls.connect(spec.options) : net.connect(spec.options)
+}
+
+// ---------------------------------------------------------------------------
+// disposition — what happened to the bytes
+// ---------------------------------------------------------------------------
+
+/**
+ * THE FIELD THE NETWORK AUDIT READS INSTEAD OF GUESSING.
+ *
+ * Every log record used to be `{at, method, path, status, ms, blocked}`, and
+ * `blocked: true` means exactly one thing: THE WRITE GUARD REFUSED THIS. A
+ * request refused by any other gate — the preflight, Mode 2's CSRF check, an
+ * origin handler that threw — recorded `blocked: false`, and
+ * `e2e/audit/predicates.mjs` read that absence as "forwarded to Sanity". The
+ * last E2E run reported six escaped writes that never left the process.
+ *
+ * The mirror image is what makes it unusable: a REAL escape answering anything
+ * but 403 was modelled identically, in the direction of a PASSING predicate. So
+ * the log now states the fact rather than leaving it to be inferred, and it is
+ * stated AT THE POINT OF THE DECISION — never reconstructed afterwards, because
+ * a reconstruction is the same guess with a longer code path.
+ *
+ * `blocked` keeps its narrow meaning and becomes redundant-but-consistent:
+ * `blocked === true` implies `disposition === 'local' && gate === 'write-guard'`,
+ * which the audit checks rather than assumes.
+ *
+ * @param {string} gate the stage that produced the whole response here
+ * @param {string} [refusal] that stage's own error code, when it has one
+ */
+function localDisposition(gate, refusal) {
+  const entry = {disposition: 'local', gate}
+  if (typeof refusal === 'string' && refusal !== '') entry.refusal = refusal
+  return entry
+}
+
+/**
+ * The proxy dialled the upstream and relayed.
+ *
+ * `target` is the REAL destination as `host:port`, because "forwarded" without a
+ * destination cannot distinguish a test double on 127.0.0.1 from
+ * `api.sanity.io:443`, and the audit's whole job is that distinction.
+ *
+ * A dial that was ATTEMPTED and failed is still `upstream`, flagged
+ * `dialFailed`. That is deliberately conservative: an attempted egress recorded
+ * as `local` is the one direction this field must never be wrong in.
+ */
+function upstreamDisposition(target, extra) {
+  return {disposition: 'upstream', upstream: target, ...extra}
 }
 
 /** Status code of an HTTP response whose first bytes are `chunk`. */
@@ -447,6 +567,25 @@ export function resolveProxyConfig(options = {}) {
     rewriteCookies: options.rewriteCookies ?? env.PROXY_REWRITE_COOKIES !== '0',
     logPath: options.logPath ?? env.PROXY_LOG ?? join(HERE, 'proxy-log.jsonl'),
     verbose: options.verbose ?? env.PROXY_VERBOSE === '1',
+    /* --- the HTTP/2 listener ------------------------------------------------
+     *
+     * ON BY DEFAULT, and read from the environment like every other switch
+     * about this machine. It is not a security control — it does not decide
+     * what may be forwarded, only which framings the same handler will accept —
+     * so the reasoning that keeps `origins` option-only does not apply.
+     *
+     * `PROXY_TLS=0` is the documented opt-out for a run that has no browser in
+     * it (curl, CI, the E2E suite's HTTP/1.1 relay). It costs nothing there and
+     * it costs everything in a browser: see README, "HTTP/2". */
+    tls: options.tls ?? env.PROXY_TLS !== '0',
+    tlsDir: options.tlsDir ?? env.PROXY_TLS_DIR ?? join(HERE, '.tls'),
+    tlsCertPath: options.tlsCertPath ?? env.PROXY_TLS_CERT,
+    tlsKeyPath: options.tlsKeyPath ?? env.PROXY_TLS_KEY,
+    /* `auto` walks the ladder in tlsMaterial.mjs. Tests pin `self-signed` so a
+     * developer's mkcert installation cannot change what they measure. */
+    tlsCertSource: options.tlsCertSource ?? env.PROXY_TLS_SOURCE ?? 'auto',
+    /** Extra certificate subject names, comma-separated. */
+    tlsNames: options.tlsNames ?? env.PROXY_TLS_NAMES ?? '',
     // Test seam ONLY, with no environment variable behind it on purpose: there
     // must be no way to weaken the upstream dial from outside the process.
     // `test/proxy-tls.test.ts` uses it to add a trust anchor for a self-signed
@@ -461,14 +600,27 @@ export function resolveProxyConfig(options = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * Build (but do not start) the proxy. The caller owns `listen()` so tests can
- * bind port 0 and the CLI can bind the configured port.
+ * THE PROXY ITSELF — the guard, the relay, the log — as three handlers and no
+ * server.
  *
- * @param {object} [options] see resolveProxyConfig
- * @returns {import('node:http').Server} with `.proxyConfig` attached
+ * WHY THIS IS FACTORED OUT. There are now two listeners: cleartext HTTP/1.1 on
+ * the port everyone already uses, and TLS on the same port, where a browser
+ * negotiates h2 and stops being limited to six concurrent connections. Two
+ * listeners is a licence to grow two behaviours, and one of them would be the
+ * one nobody tests — an h2 path that forgot the write guard, or forgot to log a
+ * disposition, is precisely the kind of divergence the whole evidence chain
+ * rests on not existing.
+ *
+ * So there are not two paths. There is one set of handlers, built once, and the
+ * two servers are two ways of arriving at it. Everything transport-dependent is
+ * decided PER REQUEST, from the request, by {@link isH2} and
+ * {@link isEncrypted} — never per server — so the TLS listener's own HTTP/1.1
+ * fallback (which is how Chrome opens a WebSocket) behaves like HTTP/1.1
+ * automatically.
+ *
+ * @param {ReturnType<typeof resolveProxyConfig>} config
  */
-export function createProxyServer(options = {}) {
-  const config = resolveProxyConfig(options)
+export function createProxyCore(config) {
   const {
     upstream: UPSTREAM,
     blockWrites: BLOCK_WRITES,
@@ -565,7 +717,8 @@ export function createProxyServer(options = {}) {
   function resolveUpstreamHostname(req) {
     const base = UPSTREAM.hostname
     if (!DERIVE_PROJECT_HOST) return base
-    const rawHost = (req.headers.host || '').split(':')[0].toLowerCase()
+    /* `requestAuthority`, not `req.headers.host`: HTTP/2 has no Host header. */
+    const rawHost = requestAuthority(req).split(':')[0].toLowerCase()
     if (!rawHost || IPV4.test(rawHost) || rawHost.startsWith('[')) return base
     if (!rawHost.endsWith('.localhost')) return base // only rewrite for the *.localhost case
     const label = rawHost.split('.')[0]
@@ -580,6 +733,12 @@ export function createProxyServer(options = {}) {
     const out = {}
     for (const [key, value] of Object.entries(req.headers)) {
       const k = key.toLowerCase()
+      /* h2 pseudo-headers (`:method`, `:path`, `:scheme`, `:authority`) have no
+       * HTTP/1.1 spelling. Forwarded verbatim they do not merely arrive wrong —
+       * `http.request` throws ERR_INVALID_HTTP_TOKEN and the request dies
+       * before a socket exists. Their information is carried by the request
+       * line and by `host`, both of which are set from them below. */
+      if (k.startsWith(':')) continue
       if (HOP_BY_HOP.has(k)) continue
       if (k === 'host') continue
       if (!FORWARD_ORIGIN && (k === 'origin' || k === 'referer')) continue
@@ -597,28 +756,55 @@ export function createProxyServer(options = {}) {
     return out
   }
 
-  function rewriteSetCookie(values) {
+  /**
+   * Make an upstream cookie usable on THIS leg.
+   *
+   * `Domain=.sanity.io` is rejected outright by a localhost origin, on any
+   * transport, so it goes unconditionally.
+   *
+   * `Secure` is transport-dependent, and it is the one rewrite that the h2
+   * listener changed. Over cleartext a `Secure` cookie is simply discarded by
+   * the browser, which is why it was stripped. Over TLS the opposite is true:
+   * Sanity's session cookie is `SameSite=None`, and Chrome REJECTS
+   * `SameSite=None` without `Secure` — so the strip that rescues the cleartext
+   * leg destroys the cookie on the TLS one, and cookie auth (README, "Cookies —
+   * the real blocker") stays broken for the exact topology that was supposed to
+   * fix it. Each leg therefore gets the cookie it can actually store, and both
+   * are self-consistent: whichever leg set it is the leg that can send it back.
+   */
+  function rewriteSetCookie(values, {overTls}) {
     if (!REWRITE_COOKIES) return values
     const list = Array.isArray(values) ? values : [values]
-    return list.map((cookie) =>
-      String(cookie)
-        // `Domain=.sanity.io` would be rejected outright by a localhost origin.
-        .replace(/;\s*Domain=[^;]*/gi, '')
-        // `Secure` is unusable over plain-HTTP localhost.
-        .replace(/;\s*Secure/gi, ''),
-    )
+    return list.map((cookie) => {
+      const withoutDomain = String(cookie).replace(/;\s*Domain=[^;]*/gi, '')
+      return overTls ? withoutDomain : withoutDomain.replace(/;\s*Secure/gi, '')
+    })
   }
 
   // -------------------------------------------------------------------------
   // request handling
   // -------------------------------------------------------------------------
 
-  const server = http.createServer((req, res) => {
+  const handleRequest = (req, res) => {
     const startedAt = Date.now()
     const {pathname, search, apiPath} = splitPath(req.url || '/')
+    const h2 = isH2(req)
+    const overTls = isEncrypted(req)
     let settled = false
 
-    const finish = (status, blocked) => {
+    /* Nothing may reap a listener stream: a document pane holds one open for as
+     * long as it is mounted. On h1 this is `server.timeout = 0` below; an h2
+     * stream carries its own. */
+    res.setTimeout?.(0)
+
+    /**
+     * @param {number} status
+     * @param {boolean} blocked the WRITE GUARD refused it — nothing wider
+     * @param {object} where {@link localDisposition} or {@link upstreamDisposition};
+     *   required, because a record that omits it is one the audit must treat as
+     *   unproven, and every call site here knows the answer
+     */
+    const finish = (status, blocked, where) => {
       if (settled) return
       settled = true
       logLine({
@@ -628,6 +814,14 @@ export function createProxyServer(options = {}) {
         status,
         ms: Date.now() - startedAt,
         blocked: Boolean(blocked),
+        /* WHICH LISTENER SERVED IT. Additive and omitted on HTTP/1.1, so every
+         * record the audit already knows how to read is byte-identical — but a
+         * log that could not tell the two transports apart could not show that
+         * the h2 path is guarded, and "the browser really used h2" would have
+         * to be taken on trust. Everything else about this record is the same
+         * on both, which is the property `proxy-h2.test.ts` pins. */
+        ...(h2 ? {h2: true} : {}),
+        ...where,
       })
     }
 
@@ -635,7 +829,7 @@ export function createProxyServer(options = {}) {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, preflightHeaders(req, ORIGINS, BLOCK_WRITES))
       res.end()
-      finish(204, false)
+      finish(204, false, localDisposition('preflight'))
       return
     }
 
@@ -668,7 +862,7 @@ export function createProxyServer(options = {}) {
       res.end(body)
       // Drain the request body so keep-alive survives a blocked POST.
       req.resume()
-      finish(403, true)
+      finish(403, true, localDisposition('write-guard', 'OVERLAY_WRITE_BLOCKED'))
       return
     }
 
@@ -695,7 +889,20 @@ export function createProxyServer(options = {}) {
         answered = Promise.reject(err)
       }
       answered
-        .then(() => finish(res.statusCode || 200, false))
+        .then(() =>
+          /**
+           * `res.overlayRefusalCode` is set by `origin.mjs`'s single `catch`
+           * chokepoint, which is the only place that turns an `OriginError` into
+           * a status. It is a plain property on the response object and NOT a
+           * response header: this is a security-sensitive surface and there is
+           * no reason to change the bytes on the wire to carry a log field.
+           *
+           * Without it the 415 above is indistinguishable from any other local
+           * answer, and the audit's finding reads "a write was refused" with no
+           * way to see WHICH gate refused it.
+           */
+          finish(res.statusCode || 200, false, localDisposition('origin', res.overlayRefusalCode)),
+        )
         .catch((err) => {
           if (!res.headersSent) {
             const body = JSON.stringify({
@@ -718,7 +925,7 @@ export function createProxyServer(options = {}) {
           } else {
             res.destroy()
           }
-          finish(500, false)
+          finish(500, false, localDisposition('origin-error', 'OVERLAY_ORIGIN_ERROR'))
         })
       return
     }
@@ -726,6 +933,15 @@ export function createProxyServer(options = {}) {
     // --- 4. Mode 1: forward upstream -------------------------------------------
     const hostname = resolveUpstreamHostname(req)
     const sse = isListenPath(apiPath)
+    /**
+     * Where the bytes are about to go, resolved BEFORE the dial and used by
+     * every `finish` below it.
+     *
+     * Past this line there is no local answer left to give: a 502, a 499 on a
+     * client abort and a `writeHead` that threw are all outcomes of a request
+     * this proxy chose to relay, and every one of them is recorded as an egress.
+     */
+    const relayTarget = `${hostname}:${upstreamPort}`
 
     const upstreamReq = transport.request(
       {
@@ -761,7 +977,7 @@ export function createProxyServer(options = {}) {
             continue
           }
           if (k === 'set-cookie') {
-            headers['Set-Cookie'] = rewriteSetCookie(value)
+            headers['Set-Cookie'] = rewriteSetCookie(value, {overTls})
             continue
           }
           if (sse && k === 'content-length') continue
@@ -776,14 +992,29 @@ export function createProxyServer(options = {}) {
           // Anything that could buffer the stream is neutralised here.
           setHeader(headers, 'Cache-Control', 'no-cache, no-transform')
           setHeader(headers, 'X-Accel-Buffering', 'no')
-          setHeader(headers, 'Connection', 'keep-alive')
+          /* HTTP/2 has no `Connection` header and Node throws
+           * ERR_HTTP2_INVALID_CONNECTION_HEADERS rather than send one — the
+           * stream is persistent by construction, so there is nothing to ask
+           * for. On h1 it still matters. */
+          if (!h2) setHeader(headers, 'Connection', 'keep-alive')
+        }
+
+        /* The last-moment framing filter. Everything above is a forwarding
+         * decision; this is the wire refusing to carry a shape. It runs on ALL
+         * h2 responses, not only SSE, so that no future edit anywhere above can
+         * reintroduce a header that turns a whole class of response into a
+         * 500 — which, for `/data/listen`, means every document pane. */
+        if (h2) {
+          for (const key of Object.keys(headers)) {
+            if (H2_ILLEGAL_RESPONSE_HEADERS.has(key.toLowerCase())) delete headers[key]
+          }
         }
 
         try {
           res.writeHead(status, headers)
         } catch (err) {
           upstreamRes.destroy()
-          finish(status, false)
+          finish(status, false, upstreamDisposition(relayTarget))
           return
         }
 
@@ -791,7 +1022,12 @@ export function createProxyServer(options = {}) {
           // Push headers to the client immediately and disable Nagle so every
           // SSE frame leaves the socket the moment it arrives from Sanity.
           res.flushHeaders()
-          res.socket?.setNoDelay(true)
+          /* `res.socket` on an h2 stream is a Proxy that THROWS on any direct
+           * manipulation — `setNoDelay` is one of the names it refuses
+           * (ERR_HTTP2_NO_SOCKET_MANIPULATION) — and the session has already
+           * disabled Nagle for itself, so there is nothing to ask for and
+           * asking would kill the stream. h1 only. */
+          if (!h2) res.socket?.setNoDelay(true)
           upstreamRes.socket?.setNoDelay(true)
         }
 
@@ -806,15 +1042,15 @@ export function createProxyServer(options = {}) {
         })
         upstreamRes.on('end', () => {
           res.end()
-          finish(status, false)
+          finish(status, false, upstreamDisposition(relayTarget))
         })
         upstreamRes.on('error', () => {
           res.destroy()
-          finish(status, false)
+          finish(status, false, upstreamDisposition(relayTarget))
         })
         upstreamRes.on('aborted', () => {
           res.destroy()
-          finish(status, false)
+          finish(status, false, upstreamDisposition(relayTarget))
         })
       },
     )
@@ -844,7 +1080,11 @@ export function createProxyServer(options = {}) {
       } else {
         res.destroy()
       }
-      finish(502, false)
+      /* The dial itself is what usually fails here (ECONNREFUSED, DNS, TLS), and
+       * it is STILL recorded as an egress: the request was routed onto the
+       * network path, and "we tried and it did not answer" must never be filed
+       * as "the proxy handled it locally". */
+      finish(502, false, upstreamDisposition(relayTarget, {dialFailed: true}))
     })
 
     // Client aborted (tab closed, pane unmounted, listener unsubscribed):
@@ -856,12 +1096,12 @@ export function createProxyServer(options = {}) {
     res.on('close', () => {
       if (!res.writableEnded) {
         abortUpstream()
-        finish(res.statusCode || 499, false)
+        finish(res.statusCode || 499, false, upstreamDisposition(relayTarget))
       }
     })
     req.on('error', () => {
       abortUpstream()
-      finish(400, false)
+      finish(400, false, upstreamDisposition(relayTarget))
     })
 
     // Body passthrough (POST /data/query, POST /data/actions, asset uploads, ...).
@@ -869,7 +1109,7 @@ export function createProxyServer(options = {}) {
     req.on('end', () => {
       /* upstreamReq is ended by the pipe */
     })
-  })
+  }
 
   // -------------------------------------------------------------------------
   // protocol upgrade (Studio's listener WebSocket)
@@ -910,8 +1150,22 @@ export function createProxyServer(options = {}) {
    *
    * The 403 is serialised by hand because there is no `ServerResponse` at this
    * point in the lifecycle — Node has already handed us the bare socket.
+   *
+   * WHAT HTTP/2 CHANGED HERE: NOTHING, AND THAT IS THE ANSWER.
+   * RFC 9113 §8.1 deleted the `Upgrade:` mechanism outright; h2's replacement
+   * is RFC 8441 Extended CONNECT, which a server must opt into by advertising
+   * `SETTINGS_ENABLE_CONNECT_PROTOCOL`. This proxy deliberately does NOT
+   * advertise it, so Chrome does what it does against any origin that has not:
+   * it opens `new WebSocket()` on a SEPARATE HTTP/1.1 TLS connection, which the
+   * same listener serves (`allowHTTP1: true`) and which arrives here as an
+   * ordinary upgrade. That is not a workaround, it is the better answer — the
+   * `Upgrade:` handshake is the shape the write guard, the frame guard and the
+   * 101 relay below all understand, and WebSockets have their own, far larger
+   * per-host budget, so this leg was never what the six-connection ceiling was
+   * about. If Extended CONNECT is ever wanted, it needs a frame guard that
+   * speaks it; until then, not advertising it is what keeps this handler true.
    */
-  server.on('upgrade', (req, clientSocket, head) => {
+  const handleUpgrade = (req, clientSocket, head) => {
     const startedAt = Date.now()
     const {pathname, search, apiPath} = splitPath(req.url || '/')
     let settled = false
@@ -924,7 +1178,7 @@ export function createProxyServer(options = {}) {
       if (!clientSocket.destroyed) clientSocket.destroy()
     })
 
-    const finish = (status, blocked = false) => {
+    const finish = (status, blocked, where) => {
       if (settled) return
       settled = true
       logLine({
@@ -935,6 +1189,7 @@ export function createProxyServer(options = {}) {
         ms: Date.now() - startedAt,
         blocked: Boolean(blocked),
         upgrade: true,
+        ...where,
       })
     }
 
@@ -967,13 +1222,17 @@ export function createProxyServer(options = {}) {
       } else {
         clientSocket.destroy()
       }
-      finish(403, true)
+      finish(403, true, localDisposition('write-guard', 'OVERLAY_WRITE_BLOCKED'))
       return
     }
 
     // --- MODE 2: the socket terminates here; there is nothing to tunnel to ----
     if (ORIGIN) {
       let status = 501
+      /* The handshake is completed, refused or 501'd entirely inside this
+       * process. There is no upstream in Mode 2, so there is no branch here
+       * that could produce anything but `local`. */
+      let where = localDisposition('origin-upgrade')
       try {
         if (typeof ORIGIN_HANDLER.handleUpgrade === 'function') {
           status = ORIGIN_HANDLER.handleUpgrade(req, clientSocket, head, {pathname, search, apiPath}) || 101
@@ -991,12 +1250,15 @@ export function createProxyServer(options = {}) {
           clientSocket.destroy()
         }
         status = 500
+        where = localDisposition('origin-upgrade-error', 'OVERLAY_ORIGIN_ERROR')
       }
-      finish(status)
+      finish(status, false, where)
       return
     }
 
     const hostname = resolveUpstreamHostname(req)
+    /** Same contract as the request path: every outcome below is an egress. */
+    const relayTarget = `${hostname}:${upstreamPort}`
     const headers = buildUpstreamHeaders(req, hostname, apiPath)
     // `Connection`/`Upgrade` are hop-by-hop for a proxied request — but for an
     // upgrade they *are* the request, so they are restored for this one hop.
@@ -1038,7 +1300,7 @@ export function createProxyServer(options = {}) {
       } else {
         clientSocket.destroy()
       }
-      finish(502)
+      finish(502, false, upstreamDisposition(relayTarget, {dialFailed: true}))
       return
     }
 
@@ -1081,6 +1343,12 @@ export function createProxyServer(options = {}) {
      * `{method:'authorization', params:{authorization:'Bearer <token>'}}`
      * (@sanity/bifur-client/src/createClient.ts:107-125); a guard that logged
      * payloads would write the user's credential to disk on every connection.
+     *
+     * THE DISPOSITION IS THE SOCKET'S, NOT THE FRAME'S. Every frame here is on
+     * an already-established Mode 1 tunnel — the Mode 2 branch returned long
+     * before this closure existed — so the byte path is upstream whatever the
+     * frame guard decides to do with any individual frame. `blocked` still says
+     * whether this one was stopped.
      */
     const logFrame = (verdict, enforced) => {
       logLine({
@@ -1091,6 +1359,7 @@ export function createProxyServer(options = {}) {
         ms: Date.now() - startedAt,
         blocked: Boolean(enforced),
         upgrade: true,
+        ...upstreamDisposition(relayTarget),
         frame: true,
         opcode: verdict.opcode,
         rpc: verdict.rpcMethod,
@@ -1149,7 +1418,7 @@ export function createProxyServer(options = {}) {
     // of the way: everything after it is opaque and must be relayed byte for byte
     // (the 101 and the first frames can share a single TCP segment).
     upstreamSocket.once('data', (chunk) => {
-      finish(parseStatusCode(chunk))
+      finish(parseStatusCode(chunk), false, upstreamDisposition(relayTarget))
       if (clientSocket.writable) clientSocket.write(chunk)
       upstreamSocket.pipe(clientSocket, {end: false})
     })
@@ -1171,7 +1440,7 @@ export function createProxyServer(options = {}) {
             body,
         )
       }
-      finish(502)
+      finish(502, false, upstreamDisposition(relayTarget, {dialFailed: true}))
       teardown()
     })
 
@@ -1195,58 +1464,290 @@ export function createProxyServer(options = {}) {
     // Either side going away ends the session: a half-open upgraded socket is a
     // leak on one leg and a silent stall on the other.
     upstreamSocket.on('close', () => {
-      finish(502)
+      finish(502, false, upstreamDisposition(relayTarget))
       teardown()
     })
     clientSocket.on('error', () => teardown())
     clientSocket.on('close', () => {
-      finish(499)
+      finish(499, false, upstreamDisposition(relayTarget))
       teardown()
     })
-  })
-
-  // Long-lived SSE connections must not be reaped by the server's own timers.
-  server.requestTimeout = 0
-  server.headersTimeout = 60_000
-  server.keepAliveTimeout = 75_000
-  server.timeout = 0
+  }
 
   // Malformed request lines / oversized headers must not take the process down.
-  server.on('clientError', (err, socket) => {
+  const handleClientError = (err, socket) => {
     if (socket.writable) {
       socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
     } else {
       socket.destroy()
     }
-  })
-
-  /* --- Mode 2: the same check again, against the address really bound -------
-   *
-   * `assertLoopbackBind(config.bind)` above reads the *config*. `listen()` takes
-   * its own host argument and never consults it, so a launcher that passed
-   * `server.listen(port)` — or `listen(port, '0.0.0.0')` — would sail past the
-   * construction-time check and publish a full-grant identity server on every
-   * interface. The authority on where a socket is bound is the socket, so the
-   * socket is asked, and a wrong answer closes it before the first request. */
-  if (ORIGIN) {
-    server.on('listening', () => {
-      const address = server.address()
-      const bound = address === null || typeof address === 'string' ? address : address.address
-      if (isLoopbackBind(bound)) return
-      server.close()
-      server.emit(
-        'error',
-        new Error(
-          `Mode 2 (origin) refused to serve: the socket bound ${String(bound)}, which is not a ` +
-            'loopback address. Its identity is synthetic and unauthenticated; it may only ' +
-            'listen on 127.0.0.0/8 or ::1.',
-        ),
-      )
-    })
   }
 
-  server.proxyConfig = config
+  return {config, handleRequest, handleUpgrade, handleClientError}
+}
+
+// ---------------------------------------------------------------------------
+// the two listeners
+// ---------------------------------------------------------------------------
+
+/** Long-lived SSE streams must not be reaped by a server's own timers. */
+function applyServerTimeouts(server) {
+  server.requestTimeout = 0
+  server.headersTimeout = 60_000
+  server.keepAliveTimeout = 75_000
+  server.timeout = 0
+}
+
+/**
+ * --- Mode 2: the same check again, against the address really bound ---------
+ *
+ * `assertLoopbackBind(config.bind)` reads the *config*. `listen()` takes its own
+ * host argument and never consults it, so a launcher that passed
+ * `server.listen(port)` — or `listen(port, '0.0.0.0')` — would sail past the
+ * construction-time check and publish a full-grant identity server on every
+ * interface. The authority on where a socket is bound is the socket, so the
+ * socket is asked, and a wrong answer closes it before the first request.
+ *
+ * @param {{close: Function, emit: Function, address: Function}} bound the thing
+ *   that actually owns the listening socket — the plain server in the
+ *   single-listener case, the polyglot listener in the stack's.
+ */
+function refuseNonLoopback(bound) {
+  const address = bound.address()
+  const where = address === null || typeof address === 'string' ? address : address.address
+  if (isLoopbackBind(where)) return
+  bound.close()
+  bound.emit(
+    'error',
+    new Error(
+      `Mode 2 (origin) refused to serve: the socket bound ${String(where)}, which is not a ` +
+        'loopback address. Its identity is synthetic and unauthenticated; it may only ' +
+        'listen on 127.0.0.0/8 or ::1.',
+    ),
+  )
+}
+
+/**
+ * Build (but do not start) the HTTP/1.1 proxy. The caller owns `listen()` so
+ * tests can bind port 0 and the CLI can bind the configured port.
+ *
+ * UNCHANGED, ON PURPOSE. This is what every existing embedder, test and script
+ * calls, and it still returns a bare `http.Server` that speaks cleartext
+ * HTTP/1.1 and nothing else. The HTTP/2 listener is {@link createProxyStack},
+ * which is additive: no caller of this function acquires a TLS socket, a
+ * certificate, or a new port by upgrading.
+ *
+ * @param {object} [options] see resolveProxyConfig
+ * @returns {import('node:http').Server} with `.proxyConfig` attached
+ */
+export function createProxyServer(options = {}) {
+  const core = createProxyCore(resolveProxyConfig(options))
+  const server = http.createServer(core.handleRequest)
+  server.on('upgrade', core.handleUpgrade)
+  server.on('clientError', core.handleClientError)
+  applyServerTimeouts(server)
+  if (core.config.origin) server.on('listening', () => refuseNonLoopback(server))
+  server.proxyConfig = core.config
   return server
+}
+
+/**
+ * Build (but do not start) the HTTP/2 + TLS listener, sharing `core`'s handlers.
+ *
+ * `allowHTTP1: true` is not a convenience. It is what makes a WebSocket work:
+ * Chrome opens `new WebSocket()` on its own HTTP/1.1 TLS connection unless the
+ * server advertises RFC 8441 Extended CONNECT, which this one does not (see
+ * `handleUpgrade`). Without the fallback the realtime socket would simply fail
+ * against the TLS listener while every other request succeeded.
+ */
+function createSecureListener(core, material) {
+  const server = http2.createSecureServer({
+    key: material.key,
+    cert: material.cert,
+    allowHTTP1: true,
+    /* Studio opens six listener streams per pane and Chrome will happily open
+     * more; the default of 100 is a ceiling of the same kind this listener
+     * exists to remove. */
+    settings: {maxConcurrentStreams: 256},
+  })
+  server.on('request', core.handleRequest)
+  server.on('upgrade', core.handleUpgrade)
+  server.on('clientError', core.handleClientError)
+  applyServerTimeouts(server)
+  /* A session lives as long as the pane that opened it. Nothing here may reap
+   * it, and `session.setTimeout(0)` is how an h2 session says so. */
+  server.on('session', (session) => session.setTimeout(0))
+  return server
+}
+
+/**
+ * The concrete hostnames a browser will ask this proxy for.
+ *
+ * `@sanity/client` prepends the project id as a label to the configured
+ * `apiHost`, so with `apiHost: https://localhost:3999` the browser resolves and
+ * requests `b1n03q3z.localhost`. That name must be IN the certificate — a
+ * `*.localhost` wildcard alone is a single-label-parent wildcard, which
+ * verifiers decline (see `tlsMaterial.mjs`).
+ *
+ * Both the configured upstream's project label and the declared one are
+ * covered, because a test double on `127.0.0.1` leaves the first with nothing
+ * usable and the developer's real project id is still the name their browser
+ * will ask for.
+ */
+function browserHostnames(config) {
+  const labels = new Set()
+  for (const host of [
+    config.upstream?.hostname,
+    new URL(DECLARED_UPSTREAM.SANITY_API_HOST).hostname,
+  ]) {
+    if (!host || IPV4.test(host) || host.startsWith('[')) continue
+    const [label] = host.split('.')
+    if (label && label !== 'localhost') labels.add(label)
+  }
+  const extra = String(config.tlsNames || '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean)
+  return [...[...labels].map((label) => `${label}.localhost`), ...extra]
+}
+
+/** The first byte of a TLS ClientHello: ContentType `handshake` (RFC 8446 §5.1). */
+const TLS_HANDSHAKE_BYTE = 0x16
+
+/**
+ * How long a connection may sit without sending its first byte.
+ *
+ * Not a policy, a leak fix: a socket that never speaks belongs to neither
+ * server and would otherwise be held forever. Well above any handshake, well
+ * below "forever".
+ */
+const SNIFF_TIMEOUT_MS = 30_000
+
+/**
+ * BOTH PROTOCOLS, ONE PORT.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY h2 IS ADDITIVE AND NOT A REPLACEMENT
+ *
+ * Everything that speaks to this proxy today speaks cleartext HTTP/1.1 to it:
+ * the CLI banner's URL, `curl http://localhost:3999/vX/ping`, every probe in
+ * README's verification checklist, `test/proxy-*.test.ts`, and — right now —
+ * `e2e/harness/dataPlaneFront.mjs`, which relays to it over HTTP/1.1. Replacing
+ * the listener would break all of them to fix a problem only a browser has.
+ *
+ * WHY ONE PORT AND NOT TWO
+ *
+ * A second port is a second thing to configure, to document, to collide with,
+ * and to get wrong; and the browser origin would then differ from the
+ * documented one by both scheme AND port. TLS is trivially distinguishable from
+ * an HTTP request line by its first byte — a ClientHello starts 0x16, and no
+ * HTTP method does — so the first byte is peeked, pushed back, and the socket is
+ * handed to whichever server owns that framing. The browser origin then differs
+ * from today's only by `https:`, and every cleartext client keeps the address it
+ * already has.
+ *
+ * The peek is the ONLY thing this layer does. It does not parse, classify, log
+ * or answer; a socket reaches one of the two servers built above with its bytes
+ * untouched, so nothing here can make a request look like anything other than
+ * what the guard and the log saw.
+ *
+ * @param {object} [options] see resolveProxyConfig
+ */
+export function createProxyStack(options = {}) {
+  const config = resolveProxyConfig(options)
+  const core = createProxyCore(config)
+
+  const plain = http.createServer(core.handleRequest)
+  plain.on('upgrade', core.handleUpgrade)
+  plain.on('clientError', core.handleClientError)
+  applyServerTimeouts(plain)
+
+  /* Minted (or read) at CONSTRUCTION, before a socket exists, so a machine that
+   * cannot produce a certificate fails where it can be read — not on the first
+   * browser request, three layers down, as a TLS alert. */
+  const material = config.tls
+    ? ensureTlsMaterial({
+        dir: config.tlsDir,
+        certPath: config.tlsCertPath,
+        keyPath: config.tlsKeyPath,
+        names: browserHostnames(config),
+        source: config.tlsCertSource,
+      })
+    : null
+  const secure = material ? createSecureListener(core, material) : null
+
+  const sockets = new Set()
+
+  const listener = net.createServer((socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+
+    /* Until a byte arrives this socket belongs to nobody, and an 'error' with no
+     * listener is THROWN. Both of these are removed the instant it is handed
+     * over, so the owning server's own error handling is not shadowed. */
+    const preDispatchError = () => socket.destroy()
+    const preDispatchTimeout = () => socket.destroy()
+    socket.once('error', preDispatchError)
+    socket.setTimeout(SNIFF_TIMEOUT_MS, preDispatchTimeout)
+
+    const dispatch = (first) => {
+      socket.off('error', preDispatchError)
+      socket.off('timeout', preDispatchTimeout)
+      /* `server.timeout` is 0 on both servers, and Node only calls
+       * `setTimeout` on a connection when the server's timeout is non-zero — so
+       * an armed sniff timer would survive the handover and reap the first
+       * listener stream at 30 seconds. Disarm explicitly. */
+      socket.setTimeout(0)
+      socket.unshift(first)
+      const target = first[0] === TLS_HANDSHAKE_BYTE ? secure : plain
+      if (target === null) {
+        /* TLS was asked for and this process has no certificate. Say so on the
+         * wire rather than hanging: the client sees a connection reset, and the
+         * banner said why at startup. */
+        socket.destroy()
+        return
+      }
+      target.emit('connection', socket)
+    }
+
+    /* `read(1)` may already have the byte, or may need one turn of the loop. */
+    const peek = () => {
+      const first = socket.read(1)
+      if (first === null) return false
+      dispatch(first)
+      return true
+    }
+    if (!peek()) socket.once('readable', peek)
+  })
+
+  if (config.origin) listener.on('listening', () => refuseNonLoopback(listener))
+
+  return {
+    config,
+    /** The HTTP/1.1 server. Never listens itself; it is fed sockets. */
+    plain,
+    /** The HTTP/2 + TLS server, or null when `PROXY_TLS=0`. */
+    secure,
+    /** The socket that is actually bound. */
+    listener,
+    /** What was minted or read, and what the developer still has to do. */
+    tls: material,
+    listen: (port = config.port, bind = config.bind) =>
+      new Promise((resolve, reject) => {
+        listener.once('error', reject)
+        listener.listen(port, bind, () => {
+          listener.off('error', reject)
+          const address = listener.address()
+          resolve({port: address?.port ?? port, address})
+        })
+      }),
+    address: () => listener.address(),
+    close: () =>
+      new Promise((resolve) => {
+        for (const socket of sockets) socket.destroy()
+        listener.close(() => resolve())
+      }),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,8 +1758,25 @@ const isDirectRun =
   Boolean(process.argv[1]) && pathToFileURL(process.argv[1]).href === import.meta.url
 
 if (isDirectRun) {
-  const server = createProxyServer()
-  const {port: PORT, bind: BIND, upstream: UPSTREAM, ...flags} = server.proxyConfig
+  /**
+   * THE CLI STARTS THE STACK, NOT THE BARE HTTP/1.1 SERVER.
+   *
+   * Mode 1 is the shipping topology and its whole point is a browser. A
+   * cleartext-only listener is unusable there past the sixth concurrent stream,
+   * so "started successfully" would be a lie the developer only discovers when
+   * a document pane never loads. Both framings, one port, and if a certificate
+   * cannot be produced this exits rather than starting something that looks
+   * healthy and is not — `PROXY_TLS=0` is the way to say you meant cleartext.
+   */
+  let stack
+  try {
+    stack = createProxyStack()
+  } catch (err) {
+    process.stderr.write(`${err.message}\n`)
+    process.exit(1)
+  }
+  const {port: PORT, bind: BIND, upstream: UPSTREAM, ...flags} = stack.config
+  const server = stack.listener
 
   server.on('error', (err) => {
     process.stderr.write(`[proxy] server error: ${err.stack || err.message}\n`)
@@ -1275,15 +1793,32 @@ if (isDirectRun) {
 
   const shutdown = (signal) => {
     process.stderr.write(`[proxy] ${signal} received, closing\n`)
-    server.close(() => process.exit(0))
+    stack.close().then(() => process.exit(0))
     setTimeout(() => process.exit(0), 1000).unref()
   }
   process.on('SIGINT', () => shutdown('SIGINT'))
   process.on('SIGTERM', () => shutdown('SIGTERM'))
 
-  server.listen(PORT, BIND, () => {
+  stack.listen(PORT, BIND).then(() => {
+    const host = BIND || 'localhost'
     process.stderr.write(
-      `[proxy] listening on http://${BIND || 'localhost'}:${PORT} -> ${UPSTREAM.origin}\n` +
+      `[proxy] listening on http://${host}:${PORT} -> ${UPSTREAM.origin}\n` +
+        (stack.tls
+          ? `[proxy] and on https://${host}:${PORT} — HTTP/2, which is what a BROWSER must use:\n` +
+            `[proxy]   Chromium allows six concurrent HTTP/1.1 connections per origin and Studio\n` +
+            `[proxy]   holds six listener streams open, so over http:// the seventh request (the\n` +
+            `[proxy]   document pane's first snapshot) is queued forever and no pane ever loads.\n` +
+            `[proxy]   In sanity.config.ts: apiHost: 'https://localhost:${PORT}'\n` +
+            `[proxy] certificate: ${describeTlsMaterial(stack.tls)}\n` +
+            (stack.tls.manualStep ? `[proxy] ONE-TIME STEP: ${stack.tls.manualStep}\n` : '') +
+            /* The placeholder in `manualStep`, filled in — a developer should
+             * not have to work out which URL "the origin" means. */
+            (stack.tls.trusted === 'yes' || trustVisitUrl(stack.tls, PORT) === null
+              ? ''
+              : `[proxy]   i.e. visit ${trustVisitUrl(stack.tls, PORT)} and accept it, ` +
+                'BEFORE loading the Studio\n')
+          : '[proxy] HTTP/2 listener DISABLED (PROXY_TLS=0). A browser talking to this proxy will\n' +
+            '[proxy]   stall at the seventh concurrent request; see README.md, "HTTP/2".\n') +
         `[proxy] write-guard: ${flags.blockWrites ? 'ON (PROXY_BLOCK_WRITES=1)' : 'off'}` +
         ` · project-host derivation: ${flags.deriveProjectHost ? 'on' : 'off'}` +
         ` · origin forwarding: ${flags.forwardOrigin ? 'on' : 'off (stripped)'}\n` +

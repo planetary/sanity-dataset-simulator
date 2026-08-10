@@ -6,13 +6,30 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "prepack": "node ../../scripts/build-package.mjs",
     "test": "echo 'tested via sanity-overlay-testkit'"
   },
   "dependencies": {
-    "groq-js": "2.0.0"
+    "groq-js": "2.0.0",
+    "sanity-overlay-client": "workspace:*",
+    "sanity-overlay-core": "workspace:*",
+    "sanity-overlay-query": "workspace:*",
+    "sanity-overlay-store-fs": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.20.1"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/src/index.d.ts",
+        "import": "./dist/src/index.js"
+      }
+    }
   }
 }

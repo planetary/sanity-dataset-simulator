@@ -31,9 +31,9 @@ import {
   checkOverlayInvariants,
   createOverlayState,
   verifyCheckpoint,
-} from '../../../sanity-overlay-core/src/index'
-import type {OverlayInvariantViolation} from '../../../sanity-overlay-core/src/index'
-import {readCheckpointDir} from '../../../sanity-overlay-store-fs/src/index'
+} from 'sanity-overlay-core'
+import type {OverlayInvariantViolation} from 'sanity-overlay-core'
+import {readCheckpointDir} from 'sanity-overlay-store-fs'
 import {usageError} from '../errors'
 import {EXIT} from '../exit'
 import {loadRecords, openOverlay} from '../overlay'

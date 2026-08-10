@@ -54,9 +54,10 @@
 import type {
   BaseCandidateRequest,
   QueryBaseSource,
-} from '../../../sanity-overlay-query/src/baseSource'
-import type {OverlaySource} from '../../../sanity-overlay-query/src/overlaySource'
-import type {QueryDocument} from '../../../sanity-overlay-query/src/types'
+} from 'sanity-overlay-query/baseSource'
+import type {OverlaySource} from 'sanity-overlay-query/overlaySource'
+import type {QueryDocument} from 'sanity-overlay-query/types'
+import {assetDedupReadPlan, deriveAssetDedupTargets} from './assetDedup'
 import {markOverlayRefusal} from './echo'
 import type {OverlayApproximation} from './findability'
 import {
@@ -259,6 +260,17 @@ function stagingBackedSource(
 ): QueryBaseSource {
   return {
     async fetchCandidates(request) {
+      /* An EMPTY id set cannot match anything anywhere, so `*[_id in []]` is a
+       * round trip whose answer is known before it is sent. Skipping it is not
+       * an optimisation: it removes a network dependency from every plan that
+       * happens to resolve to no ids, and a request nobody needs is a request
+       * that can hang (§5.5). */
+      if (request.kind === 'ids' && request.ids.length === 0) {
+        return await createBranchCandidateSource({
+          baseDocuments: [],
+          overlay,
+        }).fetchCandidates(request)
+      }
       const built = baseCandidateQuery(request, limit)
       /* Unrenderable request shape: refuse rather than widen the fetch. The
        * caller turns this into a recorded passthrough. */
@@ -371,17 +383,35 @@ export function createStudioReader(options: StudioReaderOptions): StudioReadRout
     if ('refusal' in reading) return degrade(query, reading.refusal, overlay)
     const {perspective} = reading
 
-    /* PRD §21.6 "Incoming references: Custom combined base plus overlay query".
-     * Tried FIRST, because the generic planner refuses this shape by design and
-     * would send it to staging — where a branch-created referring document does
-     * not exist. `incomingReferences.ts` states the boundary: it claims a query
-     * only when every `*[…]` in it is reference-filtered and nothing else in it
-     * is locally unanswerable, so nothing the generic planner handles better is
-     * taken away from it. */
     const startedAt = clock()
-    const incoming = deriveIncomingReferenceTargets(request.query, params)
+
+    /*
+     * TWO SHAPES ARE CLAIMED BEFORE THE GENERIC PLANNER, and for the same
+     * reason: the generic planner refuses each of them BY DESIGN and would send
+     * it to staging, where the branch's own contribution does not exist.
+     *
+     * §24 — the asset-deduplication probe. It is tried first of all because it
+     * sits in front of EVERY upload (`uploadSanityAsset`, `sanity@6.8.0`
+     * `lib/useBundleDocuments-BYW8M9LS.js:13450`) and nothing downstream of it
+     * runs until it emits. Delegated, a base that accepts the request and never
+     * answers leaves the image field saying "Uploading" for the life of the tab
+     * with no error anywhere — observed live 2026-08-09. `assetDedup.ts`
+     * answers it from the branch and issues no request at all.
+     *
+     * §21.6 — incoming references, "Custom combined base plus overlay query".
+     *
+     * Each module states its own boundary and neither takes a query the generic
+     * planner handles more tightly. They cannot both claim one query: an
+     * asset-dedup filter names `_type`, which `incomingReferences.ts` declines
+     * on (`hasGenericConstraint`).
+     */
     let plan: StudioReadPlan
-    if (incoming.supported) {
+    const dedup = deriveAssetDedupTargets(request.query, params)
+    const incoming = deriveIncomingReferenceTargets(request.query, params)
+
+    if (dedup.supported) {
+      plan = assetDedupReadPlan({query, targets: dedup.targets, overlay})
+    } else if (incoming.supported) {
       try {
         plan = await incomingReferenceReadPlan({
           query,
@@ -407,17 +437,22 @@ export function createStudioReader(options: StudioReaderOptions): StudioReadRout
      * make a tombstone stop matching the row it suppresses. */
     const readOverlay = perspectiveOverlaySource(overlay, perspective)
 
+    /* A `branchOnly` plan gets a candidate source with NO base half at all —
+     * not a base fetch that happens to be cheap. `createBranchCandidateSource`
+     * with an empty `baseDocuments` is the whole pool, so every candidate
+     * request the evaluator makes (including the §22.6 step 8-11 dereference
+     * walk) is answered from memory and the read cannot outlive the process. */
+    const candidates: QueryBaseSource = plan.branchOnly === true
+      ? createBranchCandidateSource({baseDocuments: [], overlay})
+      : stagingBackedSource(overlay, plan.definition.maxCandidates, request.baseFetch)
+
     try {
       const {result, diagnostics} = await evaluateStudioRead({
         plan,
         params,
         overlay: readOverlay,
         perspective,
-        base: perspectiveBaseSource(
-          stagingBackedSource(overlay, plan.definition.maxCandidates, request.baseFetch),
-          overlay,
-          perspective,
-        ),
+        base: perspectiveBaseSource(candidates, overlay, perspective),
       })
       record({
         query,

@@ -8,4 +8,4 @@
  * re-exports the *same* declarations — so `instanceof` and `isOverlayStoreError`
  * still hold across package boundaries.
  */
-export * from '../../sanity-overlay-core/src/store/intent'
+export * from 'sanity-overlay-core/store/intent'

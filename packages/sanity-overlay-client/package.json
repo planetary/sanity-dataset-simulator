@@ -3,8 +3,46 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "exports": {".": "./src/index.ts"},
+  "exports": {
+    ".": "./src/index.ts",
+    "./assets": "./src/assets.ts",
+    "./env": "./src/env.ts",
+    "./stagingHost": "./src/stagingHost.ts"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "prepack": "node ../../scripts/build-package.mjs",
     "test": "echo 'tested via sanity-overlay-testkit'"
+  },
+  "dependencies": {
+    "sanity-overlay-core": "workspace:*",
+    "sanity-overlay-query": "workspace:*",
+    "sanity-overlay-store-fs": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/src/index.d.ts",
+        "import": "./dist/src/index.js"
+      },
+      "./assets": {
+        "types": "./dist/src/assets.d.ts",
+        "import": "./dist/src/assets.js"
+      },
+      "./env": {
+        "types": "./dist/src/env.d.ts",
+        "import": "./dist/src/env.js"
+      },
+      "./stagingHost": {
+        "types": "./dist/src/stagingHost.d.ts",
+        "import": "./dist/src/stagingHost.js"
+      }
+    }
   }
 }

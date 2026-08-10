@@ -54,6 +54,13 @@ describe('the state set', () => {
       'disabled-unexpectedly',
       'unauthenticated',
       'offline',
+      /* Added 2026-08-09. The overlay API answers `409` when this session's view
+       * of the branch is behind another writer's and its own reconciliation did
+       * not close the gap; nothing this session sends will be accepted until the
+       * tab reloads. Placed below `offline` because an unreachable API cannot
+       * report it, and above everything below because it is the only remaining
+       * state in which writes are permanently refused rather than delayed. */
+      'branch-moved',
       'schema-mismatch',
       'hard-conflict',
       'soft-conflict',

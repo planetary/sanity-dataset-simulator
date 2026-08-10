@@ -1,0 +1,36 @@
+{
+  "assetDocumentId": "image-a11767ffdbe7de3abe04f22904d485255a326d92-3x3-png",
+  "assetId": "a11767ffdbe7de3abe04f22904d485255a326d92",
+  "checksum": "0f68806347def799fc55e8169aa698730232f620fa4d9ea8d3849e5dbef04f46",
+  "contentType": "image/png",
+  "createdAt": "2026-08-09T18:46:27.846Z",
+  "createdBy": {
+    "displayName": "Overlay local API",
+    "id": "overlay-local-api",
+    "type": "user"
+  },
+  "formatVersion": 1,
+  "kind": "image",
+  "metadata": {
+    "aspectRatio": 1,
+    "extension": "png",
+    "hasAlpha": true,
+    "height": 3,
+    "omitted": [
+      "metadata.blurHash",
+      "metadata.exif",
+      "metadata.isOpaque",
+      "metadata.location",
+      "metadata.lqip",
+      "metadata.palette",
+      "metadata.thumbHash"
+    ],
+    "width": 3
+  },
+  "originalFilename": "fresh-3x3.png",
+  "overlayId": "spike-a-local-echo",
+  "provider": "filesystem",
+  "sha1hash": "a11767ffdbe7de3abe04f22904d485255a326d92",
+  "size": 78,
+  "storageRef": "assets/blobs/0f68806347def799fc55e8169aa698730232f620fa4d9ea8d3849e5dbef04f46.bin"
+}

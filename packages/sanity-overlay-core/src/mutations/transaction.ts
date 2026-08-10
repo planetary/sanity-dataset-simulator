@@ -26,6 +26,7 @@ import {OVERLAY_FORMAT_VERSION} from '../types/format-version'
 import type {OverlayMutation} from '../types/operations'
 import type {OverlayTransactionRecord} from '../types/transaction'
 import {persistTransactionConflicts} from './conflicts'
+import {idempotencyReplayMismatch, idempotencyReuseMessage} from './idempotency'
 import {applyMutation, mutationTargetId, validateMutation, type MutationContext} from './mutation'
 import type {BaseDocumentSource, MergeResolver, StrongReferenceCheck} from './ports'
 import {getRecord, type OverlayState} from './state'
@@ -43,6 +44,16 @@ export interface TransactionOptions {
   allowTypeChange?: boolean
   checkStrongReferences?: StrongReferenceCheck
   requestId?: string
+  /**
+   * The logical ids this transaction is about, when the caller can state them.
+   *
+   * Only consulted on the §34.6 replay path, to tell a genuine retry from a
+   * reused key (`idempotency.ts`). `applyTransaction` derives it from the
+   * mutations and needs nothing here; `commitTransform` runs an arbitrary
+   * reducer whose targets no mutation spells, so a §18 document action states
+   * them explicitly or gets no cross-document protection at all.
+   */
+  targetDocumentIds?: readonly string[]
 }
 
 export interface TransactionCommit {
@@ -101,6 +112,65 @@ export function findByIdempotencyKey(
 }
 
 /**
+ * The documents a transaction is about, when they can be stated cheaply.
+ *
+ * `mutationTargetId` throws on a shape `validateMutation` has not vetted yet,
+ * and the replay check runs BEFORE validation — deliberately, because a replay
+ * must short-circuit before anything else can reject it. So an unreadable
+ * mutation contributes no target rather than an error: the guard below is a
+ * safety net, and a safety net that can itself throw on malformed input would
+ * change which error the caller sees for a bad payload.
+ */
+function statedTargets(
+  options: TransactionOptions,
+  mutations: readonly OverlayMutation[] | undefined,
+): string[] {
+  if (options.targetDocumentIds !== undefined) return [...options.targetDocumentIds]
+  const targets: string[] = []
+  for (const mutation of mutations ?? []) {
+    try {
+      targets.push(mutationTargetId(mutation))
+    } catch {
+      /* Unreadable here; `validateMutation` will report it properly. */
+    }
+  }
+  return targets
+}
+
+/**
+ * Refuse a "replay" that is really a reused key — see `idempotency.ts`.
+ *
+ * Called from both commit paths, because both resolve the same ledger and both
+ * used to answer with whatever record the key happened to name.
+ */
+function assertGenuineReplay(
+  replayed: OverlayTransactionRecord,
+  options: TransactionOptions,
+  mutations: readonly OverlayMutation[] | undefined,
+): void {
+  const outside = idempotencyReplayMismatch(
+    replayed.affectedDocumentIds,
+    statedTargets(options, mutations),
+  )
+  if (outside.length === 0) return
+  throw new OverlayMutationError(
+    'OVERLAY_IDEMPOTENCY_KEY_REUSED',
+    idempotencyReuseMessage(
+      options.idempotencyKey,
+      replayed.transactionId,
+      replayed.affectedDocumentIds,
+      outside,
+    ),
+    {
+      idempotencyKey: options.idempotencyKey,
+      replayedTransactionId: replayed.transactionId,
+      affectedDocumentIds: replayed.affectedDocumentIds,
+      unrelatedDocumentIds: outside,
+    },
+  )
+}
+
+/**
  * Apply a group of mutations atomically (PRD §13.7 "Multi-document transactions
  * group multiple mutations in one request and commit atomically").
  */
@@ -128,6 +198,7 @@ export function applyTransaction(
      stored record is returned unchanged and nothing is reapplied. */
   const replayed = findByIdempotencyKey(state, options.idempotencyKey)
   if (replayed !== null) {
+    assertGenuineReplay(replayed, options, Array.isArray(mutations) ? mutations : [])
     return {
       state,
       transaction: replayed,
@@ -245,6 +316,7 @@ export function commitTransform(
 ): TransactionCommit {
   const replayed = findByIdempotencyKey(state, options.idempotencyKey)
   if (replayed !== null) {
+    assertGenuineReplay(replayed, options, options.mutations)
     return {
       state,
       transaction: replayed,

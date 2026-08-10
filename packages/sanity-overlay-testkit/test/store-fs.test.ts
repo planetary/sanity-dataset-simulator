@@ -746,9 +746,13 @@ describe('filesystem layout (PRD §14.1)', () => {
     const runtime = (await readdir(harness.layout.runtimeDir)).sort()
     expect(runtime).toEqual(['indexes', 'materialized', 'revisions', 'transactions'])
 
+    /* Relative to the overlay directory, which is where this file is written —
+       these once carried a leading `.sanity-overlay/` and therefore matched
+       nothing. `store-scaffold-reconcile.test.ts` holds the `git check-attr`
+       oracle that can tell a working rule from a decorative one. */
     const attributes = await readFile(harness.layout.resolve('.gitattributes'), 'utf8')
-    expect(attributes).toContain('.sanity-overlay/snapshots/** linguist-generated=true')
-    expect(attributes).toContain('.sanity-overlay/.runtime/** export-ignore')
+    expect(attributes).toContain('snapshots/** linguist-generated=true')
+    expect(attributes).toContain('.runtime/** export-ignore')
   })
 
   it('requires an injected clock and an absolute root', async () => {

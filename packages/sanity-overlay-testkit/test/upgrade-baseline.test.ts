@@ -489,6 +489,18 @@ const CITED_SANITY_CHUNKS: Readonly<Record<string, readonly string[]>> = Object.
     'packages/sanity-overlay-studio/src/client/reads.ts',
   ],
   'structureTool-EN0gOzyJ.js': ['packages/sanity-overlay-studio/src/documentActions.ts'],
+  /*
+   * The form-builder chunk: `resolveUploader`, `uploadSanityAsset`,
+   * `fetchExisting`, `DatasetAssetSourceUploader`. Cited by the three modules
+   * that had to know what an image field ACTUALLY calls before an upload can
+   * send a byte — the dedup probe at `:13450` gates all of them, and answering
+   * it from base was the live "Uploading forever" defect (2026-08-09).
+   */
+  'useBundleDocuments-BYW8M9LS.js': [
+    'packages/sanity-overlay-studio/src/client/assetDedup.ts',
+    'packages/sanity-overlay-studio/src/client/facade.ts',
+    'packages/sanity-overlay-studio/src/client/reads.ts',
+  ],
 })
 
 describe('§3 the dist chunks our source cites still exist in the installed sanity', () => {

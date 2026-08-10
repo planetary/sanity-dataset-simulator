@@ -18,8 +18,8 @@ import {
   type OverlayDocumentHead,
   type OverlayDocumentRecord,
   type OverlayManifest,
-} from '../../sanity-overlay-core/src/index'
-import {FsOverlayStore} from '../../sanity-overlay-store-fs/src/index'
+} from 'sanity-overlay-core'
+import {FsOverlayStore} from 'sanity-overlay-store-fs'
 import {CliError, overlayError, usageError} from './errors'
 import {EXIT} from './exit'
 

@@ -8,8 +8,8 @@
  * what they can paste into a query or a patch. {@link formatPath} produces the
  * second and is display-only; nothing keys off it.
  */
-import {serialize} from '../../sanity-overlay-core/src/index'
-import type {OverlayPath} from '../../sanity-overlay-core/src/index'
+import {serialize} from 'sanity-overlay-core'
+import type {OverlayPath} from 'sanity-overlay-core'
 
 /** Display notation for an {@link OverlayPath}. Never used as an identity. */
 export function formatPath(path: OverlayPath): string {

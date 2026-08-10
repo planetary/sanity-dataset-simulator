@@ -52,9 +52,9 @@
  * Dependency-free apart from the query package's own port types.
  */
 
-import type {BaseCandidateRequest, QueryBaseSource} from '../../../sanity-overlay-query/src/baseSource'
-import type {OverlaySource} from '../../../sanity-overlay-query/src/overlaySource'
-import type {QueryDocument} from '../../../sanity-overlay-query/src/types'
+import type {BaseCandidateRequest, QueryBaseSource} from 'sanity-overlay-query/baseSource'
+import type {OverlaySource} from 'sanity-overlay-query/overlaySource'
+import type {QueryDocument} from 'sanity-overlay-query/types'
 import {toDraftId, toPublishedId} from '../ids'
 import {draftAddress} from './readSource'
 

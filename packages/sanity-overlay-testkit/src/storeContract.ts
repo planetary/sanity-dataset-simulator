@@ -28,7 +28,7 @@ import {
   sha256Hex,
   syntheticRev,
   verifyCheckpoint,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {
   OverlayActor,
   OverlayCanonicalBundle,
@@ -37,7 +37,7 @@ import type {
   OverlayDocumentRecord,
   OverlayStore,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 
 /* ------------------------------------------------------------------ *
  * Harness

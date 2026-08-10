@@ -26,7 +26,7 @@
 import type {
   OverlayChecksumIssue,
   OverlayRevalidationFailure,
-} from '../../../sanity-overlay-store-fs/src/index'
+} from 'sanity-overlay-store-fs'
 import {CLI_NAME} from '../cli'
 import {EXIT} from '../exit'
 import {openOverlay} from '../overlay'

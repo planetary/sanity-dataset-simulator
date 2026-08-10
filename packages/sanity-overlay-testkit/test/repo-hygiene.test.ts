@@ -87,6 +87,43 @@ function extensionOf(name: string): string {
   return dot > slash ? name.slice(dot).toLowerCase() : ''
 }
 
+/**
+ * Files this repository has DECLARED binary in a `.gitattributes`.
+ *
+ * The extension set above cannot answer for branch-local asset blobs: they are
+ * `assets/blobs/<sha256>.bin`, deliberately extension-less as to their real
+ * type, because the content is opaque bytes addressed by checksum. Adding
+ * `.bin` to the list would be worse than useless — it would excuse every stray
+ * `.bin` anyone ever commits.
+ *
+ * So the second source of truth is Git's own, which is also the reviewable one:
+ * a path escapes the text scan only if some `.gitattributes` says `binary`, and
+ * that file is itself in the diff. Declaring a path binary becomes a visible
+ * act rather than a silent extension match.
+ *
+ * `git check-attr` is asked once for the whole list; per-file invocation is
+ * thousands of processes.
+ */
+function declaredBinary(files: string[]): Set<string> {
+  if (files.length === 0) return new Set()
+  const stdout = execFileSync('git', ['check-attr', '--stdin', '-z', 'binary'], {
+    cwd: REPO_ROOT,
+    /* A Buffer, not a string: with `encoding: 'buffer'` Node tries to encode a
+       string input using that same encoding and rejects it as unknown. Bytes in,
+       bytes out — which is also what a path containing non-UTF-8 needs. */
+    input: Buffer.from(`${files.join('\0')}\0`, 'utf8'),
+    encoding: 'buffer',
+    maxBuffer: 64 * 1024 * 1024,
+  })
+  /* `-z` emits NUL-separated triples: <path> NUL <attr> NUL <value> NUL. */
+  const fields = stdout.toString('utf8').split('\0')
+  const declared = new Set<string>()
+  for (let index = 0; index + 2 < fields.length; index += 3) {
+    if (fields[index + 2] === 'set') declared.add(fields[index] as string)
+  }
+  return declared
+}
+
 function trackedFiles(): string[] {
   const stdout = execFileSync('git', ['ls-files', '-z'], {
     cwd: REPO_ROOT,
@@ -136,8 +173,12 @@ function scan(): {files: number; offences: Offence[]} {
   const offences: Offence[] = []
   let scanned = 0
 
-  for (const file of trackedFiles()) {
+  const tracked = trackedFiles()
+  const declared = declaredBinary(tracked)
+
+  for (const file of tracked) {
     if (BINARY_EXTENSIONS.has(extensionOf(file))) continue
+    if (declared.has(file)) continue
     const absolute = REPO_ROOT + file
     /* `git ls-files` still lists a tracked file that has been deleted in the
        working tree; that is not this test's business. */

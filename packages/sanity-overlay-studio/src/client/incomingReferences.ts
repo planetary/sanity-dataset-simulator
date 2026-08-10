@@ -36,16 +36,16 @@
 
 import {parse as parseGroq} from 'groq-js'
 
-import {extractReferences, toPublishedId} from '../../../sanity-overlay-core/src/index'
-import type {SanityDocument} from '../../../sanity-overlay-core/src/index'
-import type {BaseCandidateRequest} from '../../../sanity-overlay-query/src/baseSource'
-import type {OverlaySource} from '../../../sanity-overlay-query/src/overlaySource'
-import {planCandidateRequests} from '../../../sanity-overlay-query/src/planner'
+import {extractReferences, toPublishedId} from 'sanity-overlay-core'
+import type {SanityDocument} from 'sanity-overlay-core'
+import type {BaseCandidateRequest} from 'sanity-overlay-query/baseSource'
+import type {OverlaySource} from 'sanity-overlay-query/overlaySource'
+import {planCandidateRequests} from 'sanity-overlay-query/planner'
 import {
   defineOverlayQuery,
   queryTextChecksum,
-} from '../../../sanity-overlay-query/src/registry'
-import type {OverlayQueryDefinition} from '../../../sanity-overlay-query/src/types'
+} from 'sanity-overlay-query/registry'
+import type {OverlayQueryDefinition} from 'sanity-overlay-query/types'
 import {ID_PLAN_HEADROOM, STUDIO_MAX_REFERENCE_DEPTH, type StudioReadPlan} from './readPlan'
 
 type Rec = Record<string, unknown>

@@ -23,9 +23,9 @@
  * edited its draft.
  */
 
-import type {QueryBaseSource} from '../../../sanity-overlay-query/src/baseSource'
-import type {OverlaySource} from '../../../sanity-overlay-query/src/overlaySource'
-import type {QueryDocument} from '../../../sanity-overlay-query/src/types'
+import type {QueryBaseSource} from 'sanity-overlay-query/baseSource'
+import type {OverlaySource} from 'sanity-overlay-query/overlaySource'
+import type {QueryDocument} from 'sanity-overlay-query/types'
 import type {OverlayHydrationDocument} from './transport'
 
 type Rec = Record<string, unknown>

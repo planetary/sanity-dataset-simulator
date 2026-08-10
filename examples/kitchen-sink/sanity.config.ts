@@ -34,8 +34,25 @@ import {structureTool} from 'sanity/structure'
 import {schemaTypes} from './schemaTypes'
 import {studioIdentity} from './studioIdentity.mjs'
 import {spikeClientFactory} from './spikeA/instrumentedClient'
-import {defineOverlayConfig} from '../../packages/sanity-overlay-studio/src/config'
-import {createOverlayStatusLayout} from '../../packages/sanity-overlay-studio/src/ui/statusLayout'
+/*
+ * THE PACKAGE ENTRY POINT, NOT AN INTERNAL MODULE.
+ *
+ * This line used to read `.../src/config` and `.../src/ui/statusLayout`. A
+ * consumer cannot write that — `sanity-overlay-studio`'s manifest exposes one
+ * entry point — so the example was demonstrating an import nobody else can
+ * make, and it demonstrated it while the two spellings of `defineOverlayConfig`
+ * differed in completeness: the entry point attached the §21.7 document actions
+ * and the internal module defaulted them to nothing. The Studio installed
+ * cleanly, reported healthy, and had no overlay actions in it.
+ *
+ * `bindings.ts` has since moved that default one level below both, so the two
+ * spellings agree again — but the example should still import what a consumer
+ * imports, because the next divergence will be as silent as the last one.
+ */
+import {
+  createOverlayStatusLayout,
+  defineOverlayConfig,
+} from '../../packages/sanity-overlay-studio/src/index'
 
 /** The flags every Spike A evidence run sets. Any one of them selects the spike. */
 const SPIKE_FLAGS = [

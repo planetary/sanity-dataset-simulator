@@ -1,0 +1,43 @@
+{
+  "base": {
+    "publishedRevision": "V2rkHT6iCw5OR37gl8ZsX0",
+    "snapshotRef": "fb4a767dcf38d11366936519c0b74a467723f817b58d9d0bf49dc0d67325a5c7"
+  },
+  "checksum": "5f7c62ac6a648c452399f974667c499c131211e6ef2ed1ddd679e10dd05c33a4",
+  "conflicts": [],
+  "draft": {
+    "mode": "patch",
+    "overrides": [
+      {
+        "path": [
+          "portrait"
+        ],
+        "value": {
+          "_type": "image",
+          "_upload": {
+            "createdAt": "2026-08-09T18:46:27.702Z",
+            "file": {
+              "name": "fresh-3x3.png",
+              "type": "image/png"
+            },
+            "previewImage": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/4gHYSUNDX1BST0ZJTEUAAQEAAAHIAAAAAAQwAABtbnRyUkdCIFhZWiAH4AABAAEAAAAAAABhY3NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAA9tYAAQAAAADTLQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlkZXNjAAAA8AAAACRyWFlaAAABFAAAABRnWFlaAAABKAAAABRiWFlaAAABPAAAABR3dHB0AAABUAAAABRyVFJDAAABZAAAAChnVFJDAAABZAAAAChiVFJDAAABZAAAAChjcHJ0AAABjAAAADxtbHVjAAAAAAAAAAEAAAAMZW5VUwAAAAgAAAAcAHMAUgBHAEJYWVogAAAAAAAAb6IAADj1AAADkFhZWiAAAAAAAABimQAAt4UAABjaWFlaIAAAAAAAACSgAAAPhAAAts9YWVogAAAAAAAA9tYAAQAAAADTLXBhcmEAAAAAAAQAAAACZmYAAPKnAAANWQAAE9AAAApbAAAAAAAAAABtbHVjAAAAAAAAAAEAAAAMZW5VUwAAACAAAAAcAEcAbwBvAGcAbABlACAASQBuAGMALgAgADIAMAAxADb/2wBDAFA3PEY8MlBGQUZaVVBfeMiCeG5uePWvuZHI////////////////////////////////////////////////////2wBDAVVaWnhpeOuCguv/////////////////////////////////////////////////////////////////////////wAARCAB4AHgDASIAAhEBAxEB/8QAFgABAQEAAAAAAAAAAAAAAAAAAAEE/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/EABcBAQEBAQAAAAAAAAAAAAAAAAABAgP/xAAVEQEBAAAAAAAAAAAAAAAAAAAAEf/aAAwDAQACEQMRAD8AzAMuwAAAAAAAAAAAAAAICVRAKogFUQCqIBVEAqiAVRAKgCs0ACgAUACgAUACgAUACoIKzVEAqiAVRAKogFUQCqIBVEAoAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/9k=",
+            "progress": 2,
+            "updatedAt": "2026-08-09T18:46:27.702Z"
+          }
+        }
+      }
+    ]
+  },
+  "formatVersion": 1,
+  "logicalId": "author-3",
+  "tombstones": {
+    "draft": false,
+    "published": false
+  },
+  "touchedPaths": [
+    [
+      "portrait"
+    ]
+  ],
+  "type": "author"
+}

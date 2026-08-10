@@ -12,7 +12,7 @@ import type {
   LocalDocumentVersion,
   OverlayDocumentRecord,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 
 export type VersionKind = 'draft' | 'published'
 

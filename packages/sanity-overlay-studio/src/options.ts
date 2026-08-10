@@ -15,8 +15,8 @@ import {
   blankToUndefined,
   overlayEnvKeys,
   overlayEnvValue,
-} from '../../sanity-overlay-client/src/env'
-import {hostOfRequest, isSanityApiHost} from '../../sanity-overlay-client/src/stagingHost'
+} from 'sanity-overlay-client/env'
+import {hostOfRequest, isSanityApiHost} from 'sanity-overlay-client/stagingHost'
 
 /** PRD §11.1 `SanityOverlayConfig.mode`. */
 export const OVERLAY_MODES = ['off', 'fs', 'blob', 'memory'] as const

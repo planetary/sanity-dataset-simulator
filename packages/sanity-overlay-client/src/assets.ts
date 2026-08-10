@@ -36,8 +36,8 @@
  * private Vercel Blob in the §24.4 design). Nothing here opens a socket, so the
  * suite-wide outbound monitor and `stagingHost.ts` have nothing to refuse.
  */
-import {parseOverlayAssetRequest} from '../../sanity-overlay-core/src/index'
-import type {OverlayAssetRecord} from '../../sanity-overlay-core/src/index'
+import {parseOverlayAssetRequest} from 'sanity-overlay-core'
+import type {OverlayAssetRecord} from 'sanity-overlay-core'
 
 /** The provider surface a responder needs — implemented by `FsOverlayAssetStore`. */
 export interface OverlayAssetSource {

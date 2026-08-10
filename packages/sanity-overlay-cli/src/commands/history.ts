@@ -23,7 +23,7 @@
  * `NOT RETAINED` rather than printing an empty list that would read as "this
  * branch changed nothing".
  */
-import type {OverlayHistoryEntry} from '../../../sanity-overlay-store-fs/src/index'
+import type {OverlayHistoryEntry} from 'sanity-overlay-store-fs'
 import {usageError} from '../errors'
 import {EXIT} from '../exit'
 import {openOverlay} from '../overlay'

@@ -31,14 +31,14 @@ import {
   isSyntheticRev,
   toPublishedId,
   type SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {
   OverlayQueryError,
   emptyOverlaySource,
   type OverlaySource,
   type QueryDocument,
   type QueryPerspective,
-} from '../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
 import type {OverlayClientBaseSource, OverlayStateSnapshot} from './types'
 
 export interface BuildOverlaySourceInput {

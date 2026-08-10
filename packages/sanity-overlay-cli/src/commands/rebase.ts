@@ -25,15 +25,18 @@ import {
   applySyntheticSystemFields,
   autoRebase,
   canonicalEquals,
-} from '../../../sanity-overlay-core/src/index'
+  createBaseSource,
+  currentBaseForAncestor,
+} from 'sanity-overlay-core'
 import type {
   AutoRebaseRequest,
+  BaseDocumentSource,
   LocalDocumentVersion,
   OverlayActor,
   OverlayDocumentRecord,
   RebaseMode,
   SanityDocument,
-} from '../../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {confirmationRequired, usageError} from '../errors'
 import {EXIT} from '../exit'
 import {loadRecords, openOverlay, requireHead, sortedHeads} from '../overlay'
@@ -65,8 +68,20 @@ const REBASE_ACTOR: OverlayActor = {
 
 const MODES: readonly string[] = ['auto', ...REBASE_MODES]
 
-/** Read `--base` as an array of documents, or as an `{id: document}` map. */
-async function readBaseDocuments(path: string): Promise<Map<string, SanityDocument>> {
+/**
+ * Read `--base` as an array of documents, or as an `{id: document}` map.
+ *
+ * THE RESULT IS PERSPECTIVE-AWARE, not a single map keyed by id. This used to
+ * return `Map<_id, document>` and the caller only ever looked up the PUBLISHED
+ * address, so a base draft supplied in the file was silently ignored — including
+ * for a record whose §17.1 ancestor was captured from the base draft, which is
+ * every record whose document had an unpublished draft when the branch first
+ * touched it. `createBaseSource` keeps the two addresses apart and
+ * `currentBaseForAncestor` picks the one the record's `ancestorKind` names; the
+ * same pair of functions the overlay API's rebase endpoint uses, so the CLI and
+ * the endpoint cannot answer differently.
+ */
+async function readBaseDocuments(path: string): Promise<BaseDocumentSource> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
@@ -91,13 +106,18 @@ async function readBaseDocuments(path: string): Promise<Map<string, SanityDocume
       path,
     })
   }
-  const map = new Map<string, SanityDocument>()
+  const usable: SanityDocument[] = []
   for (const document of documents) {
     if (document === null || typeof document !== 'object') continue
-    const id = (document as SanityDocument)._id
-    if (typeof id === 'string') map.set(id, document as SanityDocument)
+    const candidate = document as SanityDocument
+    /* `createBaseSource` throws on a missing `_rev` (§13.4) with a bare Error.
+     * Skipping here keeps the CLI's own refusal — "no current base for X" —
+     * as the message the operator sees, rather than a stack from core. */
+    if (typeof candidate._id !== 'string') continue
+    if (typeof candidate._rev !== 'string' || candidate._rev.length === 0) continue
+    usable.push(candidate)
   }
-  return map
+  return createBaseSource(usable)
 }
 
 interface RebaseOutcome {
@@ -203,7 +223,7 @@ export async function runRebase(ctx: CommandContext, options: RebaseOptions): Pr
     }
 
     const local = localVersion(record, kind)!
-    const currentBase = baseById.get(record.logicalId) ?? null
+    const currentBase = currentBaseForAncestor(baseById, record.logicalId, local.ancestorKind)
     const request: AutoRebaseRequest = {
       documentId: record.logicalId,
       now,

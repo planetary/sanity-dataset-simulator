@@ -7,6 +7,9 @@
  *   SANITY_OVERLAY_MODE=fs    read `.sanity-overlay/` layered over base
  *   SANITY_OVERLAY_ROOT=…     the directory that CONTAINS `.sanity-overlay/`
  *   SANITY_OVERLAY_PERSPECTIVE=published|drafts   default: drafts
+ *   SANITY_OVERLAY_REVALIDATE=auto|explicit       default: auto. `explicit` is
+ *                             the `revalidateTag` model: the page changes only
+ *                             when `POST /revalidate` is called.
  *
  * The base dataset is the committed NDJSON snapshot unless a real project is
  * configured:
@@ -45,6 +48,16 @@ export interface SiteClientDescription {
   readonly summary: string
   /** Non-fatal notices the launcher should print. Never contains a credential. */
   readonly warnings: readonly string[]
+  /**
+   * The resolved revalidation model, for the launcher to act on.
+   *
+   * Reported as a value rather than left for `run.mjs` to grep out of
+   * {@link summary}: the launcher has to attach — or NOT attach — the
+   * filesystem watcher on the strength of it, and a watcher decided by a
+   * substring match on a banner is a control that breaks when the banner is
+   * reworded.
+   */
+  readonly autoRevalidate: boolean
 }
 
 export interface SiteBaseSourceDescription {
@@ -219,6 +232,17 @@ export function createSiteClient(
   const config = overlayClientConfigFromEnv(settled)
   const base = createSiteBaseSource(settled, options)
 
+  /**
+   * `auto` or `explicit`, and the banner says which.
+   *
+   * This used to be unset, which pinned every run of this example to `auto` and
+   * left `POST /revalidate` — the route this file's own README calls the
+   * `revalidateTag` substitution point — unreachable: the client re-probed
+   * before every read, so nothing it could have cleared was ever stale. A
+   * documented deployment model that cannot be selected is not a model.
+   */
+  const revalidate = config.autoRevalidate ? 'auto' : 'explicit'
+
   if (config.mode === 'off') {
     return {
       client: createOverlayClient({
@@ -227,9 +251,13 @@ export function createSiteClient(
         queries: SITE_QUERIES,
         perspective: config.perspective,
         caller: 'frontend',
+        autoRevalidate: config.autoRevalidate,
       }),
-      summary: `mode=off  base=${base.summary}`,
+      /* Named even in `off`, where it changes nothing: a banner that mentions a
+       * setting only sometimes is a banner nobody can read for absence. */
+      summary: `mode=off  base=${base.summary}  revalidate=${revalidate}`,
       warnings: base.warnings,
+      autoRevalidate: config.autoRevalidate,
     }
   }
 
@@ -244,8 +272,12 @@ export function createSiteClient(
       queries: SITE_QUERIES,
       perspective: config.perspective,
       caller: 'frontend',
+      autoRevalidate: config.autoRevalidate,
     }),
-    summary: `mode=fs  overlay=${overlay.root}/.sanity-overlay  base=${base.summary}  perspective=${config.perspective}`,
+    summary:
+      `mode=fs  overlay=${overlay.root}/.sanity-overlay  base=${base.summary}  ` +
+      `perspective=${config.perspective}  revalidate=${revalidate}`,
     warnings: base.warnings,
+    autoRevalidate: config.autoRevalidate,
   }
 }

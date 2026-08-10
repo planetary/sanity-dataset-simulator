@@ -50,8 +50,23 @@ const FORBIDDEN_RUNTIME_MODULES = [
   '@sanity/types',
 ]
 
-/** The only runtime dependency the package may take (PRD §5.5 pins it). */
+/** The only third-party runtime dependency the package may take (PRD §5.5 pins it). */
 const ALLOWED_EXTERNAL_MODULES = new Set(['groq-js'])
+
+/**
+ * A specifier that names a package in this workspace.
+ *
+ * These used to be relative paths (`../../sanity-overlay-core/src/checksum`)
+ * and are now package subpaths, because a relative path out of a package is
+ * unresolvable once the package is installed from a tarball — see
+ * `test/pack-install.test.ts`. The change of FORM must not change what the two
+ * checks below mean, so siblings are separated from third-party dependencies
+ * here rather than being folded into the third-party allowlist: "one external
+ * dependency, groq-js" stays exactly as strict as it was, and which core module
+ * the query layer may reach stays the subject of its own assertion.
+ */
+const isWorkspaceSibling = (specifier: string): boolean =>
+  specifier === 'sanity-overlay-core' || specifier.startsWith('sanity-overlay-core/')
 
 const NODE_BUILTINS = new Set([
   'assert', 'async_hooks', 'buffer', 'child_process', 'cluster', 'console', 'constants',
@@ -234,6 +249,7 @@ describe('PRD §10.1: sanity-overlay-query dependency boundaries', () => {
     for (const file of FILES) {
       for (const reference of file.analysis.modules) {
         if (!reference.runtime || isRelative(reference.specifier)) continue
+        if (isWorkspaceSibling(reference.specifier)) continue
         external.add(reference.specifier)
       }
     }
@@ -275,17 +291,26 @@ describe('PRD §10.1: sanity-overlay-query dependency boundaries', () => {
   })
 
   it('reaches into sanity-overlay-core only for pure, dependency-free helpers', () => {
-    // Cross-package imports are relative in this repo until `pnpm install`
-    // links the workspace. The rule that matters is which MODULE is reached,
-    // not the shape of the specifier: core's store and adapter modules are not
-    // the query layer's business.
+    // The rule that matters is which MODULE is reached, not the shape of the
+    // specifier: core's store and adapter modules are not the query layer's
+    // business. What changed is only the shape — this was
+    // `../../sanity-overlay-core/src/checksum`, a path that resolves in this
+    // checkout and nowhere else, and is now the `checksum` subpath that core's
+    // `exports` publishes. The reached module is the same one.
+    //
+    // Two forms are rejected here rather than one. A BARE `sanity-overlay-core`
+    // would pull core's whole barrel — 312 exports, including the store and
+    // adapter surface this test exists to keep out — so the subpath is
+    // load-bearing and the assertion is on the exact specifier. A relative
+    // escape is rejected because it cannot be installed at all.
     const crossPackage: string[] = []
     for (const file of FILES) {
       for (const reference of file.analysis.modules) {
         if (reference.specifier.includes('../../')) crossPackage.push(reference.specifier)
+        else if (isWorkspaceSibling(reference.specifier)) crossPackage.push(reference.specifier)
       }
     }
-    expect(crossPackage).toEqual(['../../sanity-overlay-core/src/checksum'])
+    expect([...new Set(crossPackage)]).toEqual(['sanity-overlay-core/checksum'])
   })
 })
 

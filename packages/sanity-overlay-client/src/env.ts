@@ -27,16 +27,37 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 import {OVERLAY_CLIENT_MODES, type OverlayClientMode} from './types'
-import type {QueryPerspective} from '../../sanity-overlay-query/src/index'
+import type {QueryPerspective} from 'sanity-overlay-query'
 
 export interface OverlayClientEnvConfig {
   readonly mode: OverlayClientMode
   /** Directory containing `.sanity-overlay/`. Present only for `mode: 'fs'`. */
   readonly overlayRoot?: string
   readonly perspective: QueryPerspective
+  /**
+   * `OVERLAY_REVALIDATE`, resolved to {@link OverlayClientOptions.autoRevalidate}.
+   *
+   * `auto` (the default) probes the overlay before every read — right for a
+   * local filesystem, where the probe is one small file. `explicit` pins the
+   * client to the snapshot it loaded until `revalidate()` is called, which is
+   * the model a Next.js/Blob deployment runs: an external trigger
+   * (`revalidateTag`) decides when the page rebuilds, because there is no
+   * filesystem to probe and no watcher to attach.
+   *
+   * IT IS HERE BECAUSE IT WAS OTHERWISE UNREACHABLE. `createOverlayClient` has
+   * always taken `autoRevalidate`, and nothing that reads configuration ever set
+   * it — so the deployment model the client documents could not be selected by
+   * any deployment, and `revalidate()` was dead in every configuration a person
+   * could actually start.
+   */
+  readonly autoRevalidate: boolean
 }
 
 const PERSPECTIVES: readonly QueryPerspective[] = ['published', 'drafts', 'raw']
+
+/** `OVERLAY_REVALIDATE` values, and what each means for the read cache. */
+export const OVERLAY_REVALIDATE_MODES = ['auto', 'explicit'] as const
+export type OverlayRevalidateMode = (typeof OVERLAY_REVALIDATE_MODES)[number]
 
 /**
  * Accepted prefixes, in precedence order.
@@ -135,7 +156,27 @@ export function overlayClientConfigFromEnv(
   }
   const perspective = rawPerspective as QueryPerspective
 
-  if (mode === 'off') return {mode, perspective}
+  /*
+   * A DEFAULT, and a refusal for anything else.
+   *
+   * `auto` keeps the behaviour every existing deployment already has, so the
+   * key is additive. An unrecognised value is refused rather than falling back:
+   * the two models differ in whether the page EVER updates on its own, and
+   * silently picking one for a misspelling of the other is the same class of
+   * failure as `OVERLAY_MODE` defaulting to `off`.
+   */
+  const rawRevalidate = overlayEnvValue(env, 'OVERLAY_REVALIDATE') ?? 'auto'
+  if (!(OVERLAY_REVALIDATE_MODES as readonly string[]).includes(rawRevalidate)) {
+    throw new Error(
+      `[sanity-overlay] OVERLAY_REVALIDATE=${JSON.stringify(rawRevalidate)} is not a ` +
+        `revalidation model. Supported: ${OVERLAY_REVALIDATE_MODES.join(', ')}. "auto" probes ` +
+        `the overlay before every read; "explicit" pins the view until \`revalidate()\` is ` +
+        `called, which is what a \`revalidateTag\` deployment does.`,
+    )
+  }
+  const autoRevalidate = rawRevalidate === 'auto'
+
+  if (mode === 'off') return {mode, perspective, autoRevalidate}
 
   const overlayRoot = overlayEnvValue(env, 'OVERLAY_ROOT')
   if (overlayRoot === undefined) {
@@ -145,5 +186,5 @@ export function overlayClientConfigFromEnv(
     )
   }
 
-  return {mode, overlayRoot, perspective}
+  return {mode, overlayRoot, perspective, autoRevalidate}
 }

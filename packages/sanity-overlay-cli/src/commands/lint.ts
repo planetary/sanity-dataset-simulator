@@ -20,8 +20,8 @@ import {
   M_LOCAL_QUERIES,
   checkSourcesForUnregisteredQueries,
   formatQueryLintReport,
-} from '../../../sanity-overlay-query/src/index'
-import type {QueryLintMode, RegisteredQuerySummary} from '../../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
+import type {QueryLintMode, RegisteredQuerySummary} from 'sanity-overlay-query'
 import {usageError} from '../errors'
 import {EXIT} from '../exit'
 import {collectSources} from '../sources'

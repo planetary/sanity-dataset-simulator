@@ -38,7 +38,7 @@ import {
   type OverlayConflict,
   type OverlayConflictResolutionType,
   type OverlayConflictSeverity,
-} from '../../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {
   conflictPanelModel,
   formatConflictPath,

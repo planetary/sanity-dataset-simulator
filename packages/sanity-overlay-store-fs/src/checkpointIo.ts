@@ -18,11 +18,11 @@ import {
   CHECKPOINT_CHECKSUMS_FILE,
   isGovernedCheckpointPath,
   parse,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {
   OverlayCheckpointChecksums,
   OverlayCheckpointFiles,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {BROKEN_SUFFIX, HISTORY_DIR, LOCKS_DIR, RUNTIME_DIR, TEMP_PREFIX, assertWithinRoot} from './layout'
 
 const SKIPPED_DIRS = new Set([RUNTIME_DIR, LOCKS_DIR, HISTORY_DIR])

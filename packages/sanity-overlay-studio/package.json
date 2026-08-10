@@ -4,13 +4,23 @@
   "version": "0.0.0",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./features": "./src/features.ts",
+    "./options": "./src/options.ts"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "prepack": "node ../../scripts/build-package.mjs",
     "test": "echo 'tested via sanity-overlay-testkit'"
   },
   "dependencies": {
-    "groq-js": "2.0.0"
+    "groq-js": "2.0.0",
+    "sanity-overlay-client": "workspace:*",
+    "sanity-overlay-core": "workspace:*",
+    "sanity-overlay-query": "workspace:*"
   },
   "peerDependencies": {
     "@sanity/client": "7.26.0",
@@ -26,6 +36,22 @@
     },
     "sanity": {
       "optional": false
+    }
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/src/index.d.ts",
+        "import": "./dist/src/index.js"
+      },
+      "./features": {
+        "types": "./dist/src/features.d.ts",
+        "import": "./dist/src/features.js"
+      },
+      "./options": {
+        "types": "./dist/src/options.d.ts",
+        "import": "./dist/src/options.js"
+      }
     }
   }
 }

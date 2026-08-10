@@ -63,6 +63,7 @@ import {
   PORTS,
   PROJECT_ID,
   PROXY_LOG,
+  PROXY_TLS_DIR,
   REPO_ROOT,
   URLS,
 } from './e2e/harness/paths.mjs'
@@ -94,7 +95,34 @@ const SHARED_ENV: Record<string, string> = {
   SANITY_STUDIO_OVERLAY_MODE: 'fs',
   SANITY_OVERLAY_MODE: 'fs',
   SANITY_STUDIO_OVERLAY_API_URL: URLS.overlayApi,
-  SANITY_STUDIO_OVERLAY_API_HOST: URLS.proxy,
+  /**
+   * The browser is pointed straight at the transport, over TLS.
+   *
+   * Chromium allows six concurrent HTTP/1.1 connections per origin, and
+   * `sanity@6.8.0` holds six listener streams open against the data host — so
+   * over plain HTTP the seventh request, which is the document pair's initial
+   * snapshot, is queued forever and no document pane ever loads. That is what
+   * the first full run measured: every content assertion timed out and the
+   * branch never left revision 0. Content Lake is HTTP/2 and has no such budget.
+   *
+   * The suite used to close that gap with its own TLS+h2 terminator
+   * (`e2e/harness/dataPlaneFront.mjs`) in front of the proxy. The proxy now
+   * terminates h2 itself, additively on the same port — `createProxyStack`
+   * peeks the first byte and routes a TLS ClientHello to
+   * `http2.createSecureServer` — so the front was doing nothing the product does
+   * not do, while standing between the browser and the component under test.
+   * It is gone: the log the network audit reads is written by the process the
+   * browser actually spoke to.
+   */
+  SANITY_STUDIO_OVERLAY_API_HOST: URLS.dataPlane,
+
+  /* The h2 listener's certificate. See `PROXY_TLS_DIR` in `paths.mjs` for why
+   * self-signed into the run directory is the right unattended answer, and
+   * `PROXY_BROWSER_ORIGIN` for why the project host has to be named explicitly
+   * rather than left to the `*.localhost` wildcard. */
+  PROXY_TLS_DIR,
+  PROXY_TLS_SOURCE: 'self-signed',
+  PROXY_TLS_NAMES: `${PROJECT_ID}.localhost`,
 
   /* The run's own overlay root. NOT `examples/kitchen-sink`, which holds
    * committed overlay state the suite must never write to. */
@@ -157,6 +185,10 @@ export default defineConfig({
 
   use: {
     baseURL: URLS.studio,
+    /* The proxy mints a throwaway certificate into the run directory on every
+     * start. It is not trusted and must not be — nothing outside this run ever
+     * sees it, and the run directory is wiped before the next one. */
+    ignoreHTTPSErrors: true,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'off',

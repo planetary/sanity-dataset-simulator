@@ -99,8 +99,8 @@ export type {FsOverlayStateLoader, FsOverlayStateLoaderOptions} from './fsLoader
 export {buildOverlaySource} from './overlaySource'
 export type {BuildOverlaySourceInput} from './overlaySource'
 
-export {overlayClientConfigFromEnv} from './env'
-export type {OverlayClientEnvConfig} from './env'
+export {OVERLAY_REVALIDATE_MODES, overlayClientConfigFromEnv} from './env'
+export type {OverlayClientEnvConfig, OverlayRevalidateMode} from './env'
 
 export {OVERLAY_CLIENT_MODES} from './types'
 export type {

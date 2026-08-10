@@ -75,9 +75,47 @@ export interface OverlayManifest {
     hard: number
     soft: number
   }
+  /**
+   * PRD §13.1 — the last checkpoint this overlay took.
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * "CHECKPOINT WRITTEN" AND "CHECKPOINT ATTRIBUTED TO A COMMIT" ARE TWO FACTS.
+   *
+   * `commitSha` used to be required, and the consequence was that the field was
+   * never written at all. A checkpoint taken from a Studio CANNOT name a commit:
+   * the checkpoint is what PRODUCES the files that will be committed, so the
+   * commit does not exist yet, by construction. A required sha therefore left
+   * the only writer with two choices — fabricate one (§5.5 forbids it) or write
+   * nothing — and it wrote nothing. `sanity-overlay status` and CI's §29.6
+   * policy then reported "never checkpointed" immediately after a checkpoint,
+   * and `touchedSinceCheckpoint` could never be derived by anyone.
+   *
+   * So the field now records the checkpoint EVENT, and `commitSha` is the
+   * separate, optional fact of ATTRIBUTION:
+   *
+   *   present, no `commitSha`  the checkpoint was taken at `overlayRevision`
+   *                            and is not yet known to be in Git
+   *   present, with `commitSha` a commit is known to carry it
+   *   absent                    no checkpoint has ever been taken
+   *
+   * Every §29.6 predicate the PRD states is written in terms of
+   * `checkpoint.overlayRevision`, never the sha, so the unattributed form
+   * satisfies the policy the PRD actually specifies.
+   *
+   * WHY THERE IS NO "STAMP THE SHA AFTERWARDS" PATH. The sha would have to be
+   * written into `manifest.json`, and `manifest.json` is itself a file of the
+   * checkpoint tree that was just committed. Writing it back makes the store's
+   * manifest differ from the committed one, and reconciling that needs a second
+   * commit — which needs a third sha. The circularity is the shape of the
+   * problem, not an implementation detail, so `commitSha` is written only by a
+   * caller that already held it (a CI job that knows its target commit) and is
+   * otherwise left out. Where the tree landed is a question Git answers.
+   * ─────────────────────────────────────────────────────────────────────────
+   */
   checkpoint?: {
     overlayRevision: number
-    commitSha: string
+    /** Present only when the caller could name the commit without inventing it. */
+    commitSha?: string
     createdAt: string
   }
   promotion?: {

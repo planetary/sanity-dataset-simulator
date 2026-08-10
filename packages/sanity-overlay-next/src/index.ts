@@ -23,7 +23,7 @@
  * claimed by this package.
  */
 
-export {OverlayApiError} from './errors'
+export {OverlayApiError, overlayApiStatusForErrorCode} from './errors'
 export type {OverlayApiErrorCode} from './errors'
 
 export {

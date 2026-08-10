@@ -24,6 +24,8 @@ export type OverlayStoreErrorCode =
   | 'DOCUMENT_REVISION_CONFLICT'
   | 'OVERLAY_STORE_UNAVAILABLE'
   | 'INVALID_REQUEST'
+  /** One key, two different writes — see {@link OverlayIdempotencyKeyReuseError}. */
+  | 'IDEMPOTENCY_KEY_REUSED'
   /* Store-level additions. */
   | 'OVERLAY_ALREADY_EXISTS'
   | 'CHECKSUM_MISMATCH'
@@ -133,6 +135,46 @@ export class OverlayDocumentRevisionConflictError extends OverlayStoreError {
     this.documentId = documentId
     this.expectedRevision = expectedRevision
     this.actualRevision = actualRevision
+  }
+}
+
+/**
+ * One idempotency key was presented for two different writes (PRD §13.10, §34.6).
+ *
+ * NOT retryable, and NOT a conflict. The caller's view of the branch is fine and
+ * their payload is well formed; what is wrong is the KEY, and resending the same
+ * request under the same key reproduces this exactly. The fix is a new key, so
+ * the API renders it as a 422 rather than a 409 — a 409 would tell the Studio
+ * "the branch moved, reload", which is false and would send an editor looking
+ * for another writer that does not exist.
+ *
+ * See `mutations/idempotency.ts` for why a reused key is detectable at all.
+ */
+export class OverlayIdempotencyKeyReuseError extends OverlayStoreError {
+  readonly idempotencyKey: string
+  readonly replayedTransactionId: string
+  readonly unrelatedDocumentIds: readonly string[]
+
+  constructor(
+    idempotencyKey: string,
+    replayedTransactionId: string,
+    affectedDocumentIds: readonly string[],
+    unrelatedDocumentIds: readonly string[],
+    message: string,
+  ) {
+    super('IDEMPOTENCY_KEY_REUSED', message, {
+      retryable: false,
+      details: {
+        idempotencyKey,
+        replayedTransactionId,
+        affectedDocumentIds: [...affectedDocumentIds],
+        unrelatedDocumentIds: [...unrelatedDocumentIds],
+      },
+    })
+    this.name = 'OverlayIdempotencyKeyReuseError'
+    this.idempotencyKey = idempotencyKey
+    this.replayedTransactionId = replayedTransactionId
+    this.unrelatedDocumentIds = [...unrelatedDocumentIds]
   }
 }
 

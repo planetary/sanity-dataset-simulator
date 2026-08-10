@@ -311,7 +311,50 @@ describe('every write plane is intercepted (PRD §11.3)', () => {
       {transactionId: 'studio-tx-9'},
     )
     await settle()
-    expect(transport.commits[0]?.idempotencyKey).toBe('studio-tx-9')
+    /*
+     * DERIVED FROM IT, NOT EQUAL TO IT — changed 2026-08-10.
+     *
+     * The subject of this test is that the facade adopts Studio's transaction id
+     * rather than minting one of its own, and it still does. What changed is
+     * that one Studio call can plan MORE THAN ONE commit, so the ledger key is
+     * now per BATCH — see the test below and `facade.ts` `persistAndEcho`.
+     */
+    expect(transport.commits[0]?.idempotencyKey).toBe('studio-tx-9#0')
+  })
+
+  /**
+   * ONE KEY PER BATCH — the §34.6 property, asserted where it is decided.
+   *
+   * One `client.action([...])` can plan two commits, and they used to be posted
+   * under one idempotency key: one key, two different writes. That survives
+   * today only because the two overlay endpoints file the key into disjoint
+   * spaces (`commitMutations` verbatim, `commitDocumentActions` as `${key}#0`),
+   * which is a coincidence of routing in another package rather than a
+   * guarantee. This is the test that goes red if the keys are collapsed again.
+   */
+  it('gives every batch of one Studio call its own idempotency key', async () => {
+    const {wrapped, transport} = harness()
+    /* sanity 6.8.0's "save this edit, then publish it". */
+    await (wrapped.action as CallableFunction)(
+      [
+        {
+          actionType: 'sanity.action.document.edit',
+          draftId: 'drafts.a',
+          publishedId: 'a',
+          patch: {set: {title: 'edited'}},
+        },
+        {actionType: 'sanity.action.document.publish', draftId: 'drafts.a', publishedId: 'a'},
+      ],
+      {transactionId: 'studio-tx-10'},
+    )
+    await settle()
+
+    expect(transport.commits.map((commit) => commit.kind)).toEqual([
+      'actions',
+      'documentActions',
+    ])
+    const keys = transport.commits.map((commit) => commit.idempotencyKey)
+    expect(new Set(keys).size, `both batches posted ${keys[0]}`).toBe(2)
   })
 })
 
@@ -720,6 +763,16 @@ describe('the write ledger the banner reads', () => {
   it('records every intercepted write with its outcome', async () => {
     const seen: Rec[] = []
     const echo = createOverlayEcho()
+    /*
+     * The document has to be one the echo has a REVISION for, and that is not
+     * scaffolding — it is the precondition for a patch frame existing at all.
+     * `@sanity/mutator`'s `Document.considerIncoming` only consults
+     * `appliesToMissingDocument()` when HEAD is null, and a `[{patch: …}]` frame
+     * fails it, so a patch echoed at an address the pane holds no revision for is
+     * buffered for ever rather than applied. The echo now refuses to emit one —
+     * see the test below, which pins the refusal.
+     */
+    echo.seedFromResult({_id: 'a', _type: 'article', _rev: 'lake-1'}, true)
     const client = fakeClient()
     const wrapped = wrapWithOverlay(client as unknown as SanityClient, {
       echo,
@@ -732,6 +785,27 @@ describe('the write ledger the banner reads', () => {
 
     expect(seen).toHaveLength(1)
     expect(seen[0]).toMatchObject({method: 'mutate', echoed: true, committed: 'ok'})
+  })
+
+  it('records a write it could not echo as unechoed, loudly, rather than as clean', async () => {
+    const seen: Rec[] = []
+    const errors: string[] = []
+    const echo = createOverlayEcho({onError: (message) => errors.push(message)})
+    const client = fakeClient()
+    const wrapped = wrapWithOverlay(client as unknown as SanityClient, {
+      echo,
+      transport: recordingTransport(),
+      onWrite: (entry) => seen.push(entry as unknown as Rec),
+      onError: (message) => errors.push(message),
+    }) as unknown as Rec
+
+    /* Nothing is known about `ghost`: no revision, no body. */
+    await (wrapped.mutate as CallableFunction)([{patch: {id: 'ghost', set: {x: 1}}}])
+    await settle()
+
+    expect(seen[0]).toMatchObject({method: 'mutate', echoed: false, committed: 'ok'})
+    expect(errors.join(' ')).toMatch(/ghost/)
+    expect(errors.join(' ')).toMatch(/re-read|cannot echo/i)
   })
 
   it('marks a degraded commit rather than reporting it as clean', async () => {

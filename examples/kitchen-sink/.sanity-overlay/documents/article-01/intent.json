@@ -3,7 +3,7 @@
     "publishedRevision": "V2rkHT6iCw5OR37gl8ZtfG",
     "snapshotRef": "f9b578d03271c086bf6ee806aa265816d4adbf045b13cbc58697c4b042546519"
   },
-  "checksum": "f09c8e5a1cd544213183c456a72df8c482f211f68074ead9896b1c49709dcfe9",
+  "checksum": "69fd75d7da9bcf1b26548c3c2e43e386ddd1ecd662fa57e9aa26c97386a7c5de",
   "conflicts": [],
   "draft": {
     "mode": "patch",
@@ -12,7 +12,7 @@
         "path": [
           "title"
         ],
-        "value": "ISR091737-BROWSERTEST-𝔘𝔫𝔦-✅-Article 1 — OVERLAY EDIT ✅ 日本語"
+        "value": "RESTARTTEST-ISR091737-BROWSERTEST-𝔘𝔫𝔦-✅-Article 1 — OVERLAY EDIT ✅ 日本語"
       }
     ]
   },

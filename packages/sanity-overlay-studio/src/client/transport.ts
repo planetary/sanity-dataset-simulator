@@ -1,17 +1,56 @@
 /**
- * The overlay API transport (PRD §25, §33).
+ * The overlay API transport (PRD §25, §33, §5.5).
  *
- * Three outcomes, no fourth, because §11.3's last line is absolute — *"Never
- * fall back from failed overlay writes to native Sanity writes."*
+ * FOUR OUTCOMES, and the axis that separates them is *what the editor should
+ * believe about their keystrokes*, not what the HTTP status happens to be:
  *
- *   `ok`       the overlay accepted and persisted it            → editor: saved
- *   `degraded` transient (5xx, offline, malformed answer)       → editor: saved, loudly
- *   `fatal`    401/403; it provably cannot ever land            → editor: NOT saved
+ *   `ok`       the overlay accepted and persisted it            → saved
+ *   `degraded` transient (5xx, offline, timeout, bad answer)    → saved, loudly;
+ *                                                                 retrying can work
+ *   `stale`    409; this session's view of the branch is behind → NOT saved, and
+ *                                                                 resending will not
+ *                                                                 help — reload
+ *   `fatal`    401/403/413/422; it provably cannot ever land    → NOT saved
  *
  * `degraded` is deliberately not a failure: the echo has already updated the
  * pane, an outage is transient, and shouting is more useful to the editor than
- * discarding their keystrokes. A 401 is not transient — that is the distinction.
+ * discarding their keystrokes.
  *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY `stale` EXISTS, ADDED 2026-08-09.
+ *
+ * It used to be `degraded`, along with every other non-2xx that was not 401/403.
+ * `degraded` means "saved, loudly" — so a 409, which is a write that did NOT
+ * land and will not land until the tab reloads, was reported to the banner as a
+ * saved edit. Observed in a browser the same day: after a second process touched
+ * the overlay, every edit in the open Studio stopped committing with no error,
+ * no toast and a frozen revision, and only restarting the API cleared it.
+ *
+ * The server now distinguishes the two facts (`errors.ts`: 409 says "your view
+ * is stale", 400 says "your payload was wrong"), and this is the half that acts
+ * on it. `stale` is NOT retryable and NOT an auth failure: the credential is
+ * fine, the branch moved.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY A 2xx IS NOT AUTOMATICALLY A SAVE.
+ *
+ * The API answers `200 {ok: true, committed: false}` in four situations, and
+ * exactly one of them is a success:
+ *
+ *   `replayed: true`   the idempotency ledger already holds this key. The
+ *                      transaction it names is saved; THIS call applied nothing.
+ *                      Reported, never rendered as a fresh save — see
+ *                      {@link readNotCommitted}.
+ *   `unsupported: […]` the write had no overlay spelling. Nothing landed.
+ *   `documents: […]`   a rebase blocked by §28.5 preconditions. Nothing landed.
+ *   `checkpoint: {…}`  a checkpoint export, which records no transaction.
+ *
+ * A `committed: false` carrying NONE of those is a server contract breach, and
+ * the one shape that would otherwise reach the editor as a silent no-op. It is
+ * reported as `degraded` with a message that says exactly that, because "did
+ * nothing and will not say why" must never render as "saved".
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  * ENDING THE SESSION IS A SEPARATE DECISION FROM `fatal`. This transport only
  * ever talks to the overlay, so a 401/403 here is our own server's refusal and
  * says nothing about the editor's Sanity credential. It is reported as an auth
@@ -24,12 +63,12 @@
 import {
   assertNoStagingWrite,
   createStagingSafeFetch,
-} from '../../../sanity-overlay-client/src/stagingHost'
+} from 'sanity-overlay-client/stagingHost'
 import {isOverlayRefusal, type OverlayCommit} from './echo'
 
 type Rec = Record<string, unknown>
 
-export type OverlayTransportOutcome = 'ok' | 'degraded' | 'fatal'
+export type OverlayTransportOutcome = 'ok' | 'degraded' | 'stale' | 'fatal'
 
 /** One document as the overlay materializes it. */
 export interface OverlayHydrationDocument {
@@ -67,16 +106,78 @@ export interface OverlayTransportResult {
   transactionId?: string
   unsupported?: string[]
   documents?: OverlayHydrationDocument[]
+  /**
+   * The server's machine-readable error code, verbatim.
+   *
+   * The MESSAGE is for a human and the code is for a caller, and collapsing the
+   * two is how `PAYLOAD_TOO_LARGE` and `OVERLAY_STORE_UNAVAILABLE` came to be
+   * indistinguishable to everything downstream of here.
+   */
+  code?: string
+  /**
+   * Can resending this exact request ever succeed?
+   *
+   * Not derivable from `outcome`: `degraded` is retryable and `stale`/`fatal`
+   * are not, but a caller that wants to know whether to hold the edit in the
+   * local buffer is asking THIS question, and it should not have to re-derive it
+   * from a status code the transport already looked at.
+   */
+  retryable: boolean
+  /** The server's own `committed` flag, when it stated one. */
+  committed?: boolean
+  /** The server's own `replayed` flag — the write had already landed. */
+  replayed?: boolean
+  /**
+   * Why nothing was committed, in one sentence, when `committed === false`.
+   *
+   * Always present when `committed === false`, including for the contract
+   * breach — "the overlay reported no reason" is itself the reason.
+   */
+  notCommittedReason?: string
 }
 
 export interface OverlayTransportOptions {
   apiUrl: string
   fetch?: typeof fetch
-  onError?: (message: string) => void
+  /**
+   * Every message this transport wants a human to see, with the CONTEXT needed
+   * to tell "the server never answered" from "the server answered, and said no".
+   *
+   * The second argument was added on 2026-08-09 because the runtime read every
+   * message as a connectivity failure and rendered `offline` — "Edits are held
+   * locally and will be retried" — over a 409, which is neither offline nor
+   * retryable. `status === undefined` is the only shape that means no HTTP
+   * response arrived.
+   */
+  onError?: (message: string, context: {status?: number; outcome: OverlayTransportOutcome}) => void
   onAuthFailure?: (failure: {status: number; source: 'write' | 'read'; message: string}) => void
   /** Extra headers, e.g. a preview session token. */
   headers?: Record<string, string>
+  /**
+   * Deadline for one call. See {@link DEFAULT_REQUEST_TIMEOUT_MS}.
+   * `0` or negative disables it.
+   */
+  requestTimeoutMs?: number
 }
+
+/**
+ * Sixty seconds on one overlay API call.
+ *
+ * `fetch` has no timeout of its own, so a server that accepts the connection and
+ * never writes a response leaves the commit promise pending for the life of the
+ * tab — and a pending commit is exactly the indefinite `Saving…` this file's
+ * header describes, with nothing in any channel to explain it. §5.5: a stated
+ * failure beats an unbounded pending state.
+ *
+ * Shorter than the asset uploader's two minutes because the payloads differ by
+ * three orders of magnitude: a commit is a JSON document patch, not an image. A
+ * commit that has not been answered in a minute is not slow, it is gone.
+ *
+ * The timeout is reported as `degraded`, i.e. RETRYABLE, and that is the right
+ * reading: an unanswered request may still have landed, so the edit is kept in
+ * the pane and the idempotency key makes the retry safe (§34.6).
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000
 
 export interface OverlayCommitContext {
   idempotencyKey: string
@@ -213,6 +314,158 @@ function messageOf(body: Rec | undefined, fallback: string): string {
   return fallback
 }
 
+/** The server's `{error: {code}}`, or a top-level `code`. */
+function codeOf(body: Rec | undefined): string | undefined {
+  const error = body?.error
+  if (isRec(error) && typeof error.code === 'string') return error.code
+  if (typeof body?.code === 'string') return body.code
+  return undefined
+}
+
+/**
+ * The one place a status becomes a verdict.
+ *
+ * A TABLE, not a chain of `if`s scattered through `call()`, because the property
+ * that matters is TOTALITY: every status reaches the editor as something, and
+ * the only way to keep that true as statuses are added is to have one function
+ * whose output type forces it.
+ *
+ * `retryable` is stated per row rather than derived from `outcome` because the
+ * two answer different questions, and the row where they come apart is the one
+ * that caused this work: a 409 is not retryable and not fatal.
+ */
+function classifyStatus(status: number): {
+  outcome: OverlayTransportOutcome
+  retryable: boolean
+  /** Prefixed to the server's own message, when the code alone would not explain it. */
+  advice?: string
+} {
+  if (AUTH_STATUSES.has(status)) return {outcome: 'fatal', retryable: false}
+
+  /* §22.9 / `errors.ts`: "your view of this resource is stale". The server has
+   * already reconciled once and re-derived the request; a second refusal means
+   * something else is writing continuously. Resending cannot fix that. */
+  if (status === 409) {
+    return {
+      outcome: 'stale',
+      retryable: false,
+      advice:
+        'the branch moved underneath this session and this edit was NOT saved. Reload the ' +
+        'Studio to pick up the current branch state before editing again — retrying will not ' +
+        'help, and nothing was written to Sanity',
+    }
+  }
+
+  /* Refusals about the REQUEST. Resending the identical bytes reproduces them
+   * exactly, which is why they are not `degraded`: a client that treats them as
+   * transient retries forever, which is the loop `errors.ts` names. */
+  if (status === 413 || status === 422 || status === 415) {
+    return {
+      outcome: 'fatal',
+      retryable: false,
+      advice: 'the overlay API refused this request as it stands, and resending it will not help',
+    }
+  }
+
+  /* Everything else — 5xx, 429, 404, a stray 400 — is treated as transient.
+   * Wrong in the safe direction: the edit stays in the pane and is retried,
+   * rather than being discarded over a status nobody has classified yet. */
+  return {outcome: 'degraded', retryable: true}
+}
+
+/**
+ * Why a 2xx did not commit, and whether that is alarming.
+ *
+ * `breach: true` is reserved for the shape the server's own contract forbids —
+ * see below. Everything else stays `ok` and travels on `notCommittedReason`.
+ */
+function readNotCommitted(body: Rec): {reason: string; alarming: boolean; breach: boolean} {
+  if (body.replayed === true) {
+    /*
+     * REPORTED, NOT SILENT — CHANGED 2026-08-10.
+     *
+     * This used to be `alarming: false`, on the reasoning that "the write DID
+     * land, earlier, and shouting about it would train an editor to ignore this
+     * channel". That reasoning holds only for a replay the client MEANT to
+     * cause — a retry after a timeout, where the key is being reused on purpose.
+     *
+     * It did not hold for the failure this comment replaces. `echo.ts` issued
+     * the same idempotency key on every page load, so the first document action
+     * after any reload was answered from the ledger with somebody else's
+     * transaction, and this branch was the one place that could have said so. It
+     * said nothing, and the editor was shown a save.
+     *
+     * The generator is fixed, so a replay is now a rare and genuinely
+     * interesting event rather than routine noise — which is exactly when a
+     * channel should speak. Still NOT `breach`: the outcome stays `ok` and no
+     * retry is advertised, because the named write really is in the ledger.
+     */
+    return {
+      reason:
+        'this write had already been committed under the same idempotency key, so the overlay ' +
+        'replayed the earlier transaction and applied NOTHING now (PRD §34.6). If you did not ' +
+        'retry this write, what you just did was not saved — re-read the document before ' +
+        'relying on it',
+      alarming: true,
+      breach: false,
+    }
+  }
+
+  const unsupported = Array.isArray(body.unsupported)
+    ? body.unsupported.filter((entry): entry is string => typeof entry === 'string')
+    : []
+  if (unsupported.length > 0) {
+    return {
+      reason: `the overlay could not represent this write: ${unsupported.join('; ')}`,
+      alarming: true,
+      breach: false,
+    }
+  }
+
+  if (isRec(body.checkpoint)) {
+    return {
+      reason:
+        'a checkpoint was exported. Checkpoints record no transaction, so `committed` is false ' +
+        'by design and nothing is missing',
+      alarming: false,
+      breach: false,
+    }
+  }
+
+  const blocked = Array.isArray(body.documents)
+    ? body.documents.filter(
+        (entry) => isRec(entry) && Array.isArray(entry.blockedBy) && entry.blockedBy.length > 0,
+      )
+    : []
+  if (blocked.length > 0) {
+    const reasons = blocked
+      .map((entry) => {
+        const row = entry as Rec
+        const by = (row.blockedBy as unknown[]).join(', ')
+        return `${String(row.logicalId)} (${by})`
+      })
+      .join('; ')
+    return {reason: `blocked and not applied: ${reasons}`, alarming: true, breach: false}
+  }
+
+  /*
+   * THE CONTRACT BREACH, and the reason this function returns a reason rather
+   * than `undefined`. The overlay API's own contract is that a `committed:
+   * false` always carries `replayed`, `unsupported`, `checkpoint` or a blocked
+   * `documents` list. One that carries none of them did nothing and will not say
+   * why — which, reported as `ok`, is precisely the silent no-op §5.5 forbids
+   * and precisely what an editor experiences as a frozen revision.
+   */
+  return {
+    reason:
+      'the overlay API answered 2xx with `committed: false` and gave no `replayed`, ' +
+      '`unsupported`, `checkpoint` or blocked-document reason. Nothing was saved and the ' +
+      'server did not say why — treat this edit as unsaved and reload',
+    alarming: true,
+    breach: true,
+  }
+}
+
 export function createOverlayTransport(options: OverlayTransportOptions): OverlayTransport {
   const base = options.apiUrl.replace(/\/+$/, '')
 
@@ -268,9 +521,23 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
     const url = `${base}${path}`
     if (doFetch === undefined) {
       const message = `[sanity-overlay-studio] no fetch implementation available for ${url}`
-      noteError(message)
-      return {outcome: 'degraded', message}
+      noteError(message, {outcome: 'degraded'})
+      return {outcome: 'degraded', retryable: false, message}
     }
+
+    /* THE DEADLINE. Cleared in `finally`, always: an uncleared 60-second timer
+     * keeps a Node process — and any test runner hosting one — alive. */
+    const limit = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    const controller =
+      limit > 0 && typeof AbortController === 'function' ? new AbortController() : undefined
+    let timedOut = false
+    const timer =
+      controller === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true
+            controller.abort()
+          }, limit)
 
     let status = 0
     let text = ''
@@ -279,15 +546,24 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
         method: init.method,
         headers: {'content-type': 'application/json', ...(options.headers ?? {})},
         ...(init.body === undefined ? {} : {body: JSON.stringify(init.body)}),
+        ...(controller === undefined ? {} : {signal: controller.signal}),
       })) as unknown as {status: number; text: () => Promise<string>}
       status = response.status
       text = await response.text()
     } catch (error) {
-      const message =
-        `[sanity-overlay-studio] the overlay API at ${url} is unreachable: ` +
-        `${error instanceof Error ? error.message : String(error)}`
-      noteError(message)
-      return {outcome: 'degraded', message}
+      /* RETRYABLE, and deliberately so: an unanswered request may still have
+       * landed, so the edit stays in the pane and §34.6's idempotency key makes
+       * the retry safe. What must not happen is that it stays pending. */
+      const message = timedOut
+        ? `[sanity-overlay-studio] the overlay API at ${url} did not answer within ${limit}ms; ` +
+          `the request was abandoned. The edit is still in the editor and nothing was sent to ` +
+          `Sanity — if the overlay did receive it, the idempotency key makes a retry safe.`
+        : `[sanity-overlay-studio] the overlay API at ${url} is unreachable: ` +
+          `${error instanceof Error ? error.message : String(error)}`
+      noteError(message, {outcome: 'degraded'})
+      return {outcome: 'degraded', retryable: true, message}
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
     }
 
     let body: Rec | undefined
@@ -298,27 +574,52 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
       const message =
         `[sanity-overlay-studio] the overlay API at ${url} answered ${status} with a body that ` +
         `is not JSON (${text.slice(0, 120)})`
-      noteError(message)
-      return {outcome: 'degraded', status, message}
+      noteError(message, {outcome: 'degraded', status})
+      return {outcome: 'degraded', retryable: true, status, message}
     }
 
-    if (AUTH_STATUSES.has(status)) {
-      const message = `[sanity-overlay-studio] ${url} answered ${status}: ${messageOf(body, 'unauthorized')}`
-      noteError(message)
-      /* Fatal either way. Session-ending only when the overlay declared that the
-       * refusal came from Sanity rather than from itself. */
-      if (declaresUpstreamAuthOrigin(body)) options.onAuthFailure?.({status, source, message})
-      return {outcome: 'fatal', status, body, message}
-    }
+    const code = codeOf(body)
 
     if (status < 200 || status >= 300 || body.ok === false) {
-      const message = `[sanity-overlay-studio] ${url} answered ${status}: ${messageOf(body, 'no detail')}`
-      noteError(message)
-      return {outcome: 'degraded', status, body, message}
+      const verdict = classifyStatus(status)
+      const message =
+        `[sanity-overlay-studio] ${url} answered ${status}` +
+        `${code === undefined ? '' : ` (${code})`}: ${messageOf(body, 'no detail')}` +
+        `${verdict.advice === undefined ? '' : `. ${verdict.advice}`}`
+      noteError(message, {outcome: verdict.outcome, status})
+      /* Fatal either way for a 401/403. Session-ending only when the overlay
+       * declared that the refusal came from Sanity rather than from itself. */
+      if (AUTH_STATUSES.has(status) && declaresUpstreamAuthOrigin(body)) {
+        options.onAuthFailure?.({status, source, message})
+      }
+      return {
+        outcome: verdict.outcome,
+        retryable: verdict.retryable,
+        status,
+        body,
+        message,
+        ...(code === undefined ? {} : {code}),
+      }
+    }
+
+    /* A 2xx. Success unless the body itself says otherwise. */
+    const committed = typeof body.committed === 'boolean' ? body.committed : undefined
+    const notCommitted = committed === false ? readNotCommitted(body) : undefined
+
+    if (notCommitted !== undefined && notCommitted.alarming) {
+      noteError(`[sanity-overlay-studio] ${url} answered ${status} but ${notCommitted.reason}`, {
+        outcome: notCommitted.breach ? 'degraded' : 'ok',
+        status,
+      })
     }
 
     return {
-      outcome: 'ok',
+      /* The contract breach — nothing committed and no stated reason — is the
+       * one 2xx that must not read as a save. Every other `committed: false`
+       * has an explanation the caller can act on, so it stays `ok` and travels
+       * on `notCommittedReason` instead of being dressed up as a failure. */
+      outcome: notCommitted?.breach === true ? 'degraded' : 'ok',
+      retryable: notCommitted?.breach === true,
       status,
       body,
       revision: typeof body.revision === 'number' ? body.revision : undefined,
@@ -330,6 +631,10 @@ export function createOverlayTransport(options: OverlayTransportOptions): Overla
       documents: Array.isArray(body.documents)
         ? (body.documents as OverlayHydrationDocument[])
         : undefined,
+      ...(code === undefined ? {} : {code}),
+      ...(committed === undefined ? {} : {committed}),
+      ...(typeof body.replayed === 'boolean' ? {replayed: body.replayed} : {}),
+      ...(notCommitted === undefined ? {} : {notCommittedReason: notCommitted.reason}),
     }
   }
 

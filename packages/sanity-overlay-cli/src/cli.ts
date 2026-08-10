@@ -187,6 +187,9 @@ const COMMAND_OPTIONS: Record<CliCommand, Record<string, unknown>> = {
     output: {type: 'string'},
     bundle: {type: 'string'},
     'no-transactions': {type: 'boolean'},
+    /* PRD §13.1 `manifest.checkpoint`. Opt-in — see `commands/checkpoint.ts`. */
+    'mark-checkpoint': {type: 'boolean'},
+    'commit-sha': {type: 'string'},
   },
   import: {
     input: {type: 'string'},
@@ -280,7 +283,8 @@ const USAGE_SUMMARY: Record<CliCommand, string> = {
   rebase: 'replace the merge ancestor with the current base (destructive — needs --confirm)',
   conflicts: 'list unresolved conflicts and the resolution actions that apply',
   query: 'evaluate a REGISTERED query against the branch',
-  export: 'write a checkpoint tree (--output) or a portable bundle (--bundle)',
+  export:
+    'write a checkpoint tree (--output) or a portable bundle (--bundle); --mark-checkpoint records it in the manifest',
   import: 'load a checkpoint tree (--input) or a portable bundle (--bundle)',
   normalize:
     're-run the §14.4 direct-edit checks; --repair-checksums recomputes stale ones',
@@ -418,6 +422,10 @@ async function dispatch(
         ...(typeof values.output === 'string' ? {output: values.output} : {}),
         ...(typeof values.bundle === 'string' ? {bundle: values.bundle} : {}),
         noTransactions: values['no-transactions'] === true,
+        markCheckpoint: values['mark-checkpoint'] === true,
+        ...(typeof values['commit-sha'] === 'string'
+          ? {commitSha: values['commit-sha']}
+          : {}),
       })
     case 'import':
       return runImport(ctx, {

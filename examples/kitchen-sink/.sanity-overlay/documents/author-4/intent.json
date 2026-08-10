@@ -1,0 +1,37 @@
+{
+  "base": {
+    "publishedRevision": "V2rkHT6iCw5OR37gl8ZsX0",
+    "snapshotRef": "1bf36d26cc2072ef15e1ca2b47991daf2668eabfb14ad8ef3f742fe9bb307f08"
+  },
+  "checksum": "9d44f071f9991e98c2027dd8a07755043ceb006b82d29cfe8ab5560f2708e722",
+  "conflicts": [],
+  "draft": {
+    "mode": "patch",
+    "overrides": [
+      {
+        "path": [
+          "portrait"
+        ],
+        "value": {
+          "_type": "image",
+          "asset": {
+            "_ref": "image-a11767ffdbe7de3abe04f22904d485255a326d92-3x3-png",
+            "_type": "reference"
+          }
+        }
+      }
+    ]
+  },
+  "formatVersion": 1,
+  "logicalId": "author-4",
+  "tombstones": {
+    "draft": false,
+    "published": false
+  },
+  "touchedPaths": [
+    [
+      "portrait"
+    ]
+  ],
+  "type": "author"
+}

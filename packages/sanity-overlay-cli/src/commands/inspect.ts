@@ -6,8 +6,8 @@
  * `inspect --document drafts.x` and `inspect --document x` must be the same
  * question, not two.
  */
-import {toPublishedId} from '../../../sanity-overlay-core/src/index'
-import type {OverlayDocumentRecord} from '../../../sanity-overlay-core/src/index'
+import {toPublishedId} from 'sanity-overlay-core'
+import type {OverlayDocumentRecord} from 'sanity-overlay-core'
 import {overlayError} from '../errors'
 import {EXIT} from '../exit'
 import {openOverlay, requireHead, sortedHeads} from '../overlay'

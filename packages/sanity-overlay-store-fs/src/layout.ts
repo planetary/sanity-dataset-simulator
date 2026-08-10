@@ -21,7 +21,7 @@ import {
   isEncodedLogicalId,
   isOverlayAssetDocumentId,
   toPublishedId,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {OverlayInvalidRequestError, OverlayPathEscapeError} from './errors'
 
 export const OVERLAY_DIR = '.sanity-overlay'
@@ -61,10 +61,22 @@ export const TEMP_PREFIX = '.tmp-'
  * addressed by their SHA-256; marking it `binary` stops Git attempting a text
  * diff or a line-ending conversion on content whose checksum is its identity —
  * a CRLF rewrite would silently invalidate every record that names it.
+ *
+ * PATTERNS ARE RELATIVE TO THIS FILE'S OWN DIRECTORY, which is
+ * `.sanity-overlay/` — this file is written INSIDE the overlay, not at the
+ * repository root. They were once spelled with a leading `.sanity-overlay/`,
+ * which made Git look for `.sanity-overlay/.sanity-overlay/…`; all three rules
+ * matched nothing and were silent no-ops, while the blobs meanwhile inherited
+ * `text=auto` from the repository root and were eligible for exactly the
+ * line-ending rewrite the third rule exists to prevent.
+ *
+ * `store-scaffold-reconcile.test.ts` pins this by asking `git check-attr`
+ * rather than by matching strings, because a string assertion cannot tell a
+ * working rule from a decorative one.
  */
-export const GITATTRIBUTES_CONTENT = `${OVERLAY_DIR}/${SNAPSHOTS_DIR}/** linguist-generated=true
-${OVERLAY_DIR}/${RUNTIME_DIR}/** export-ignore
-${OVERLAY_DIR}/${ASSETS_DIR}/${ASSET_BLOBS_DIR}/** binary
+export const GITATTRIBUTES_CONTENT = `${SNAPSHOTS_DIR}/** linguist-generated=true
+${RUNTIME_DIR}/** export-ignore
+${ASSETS_DIR}/${ASSET_BLOBS_DIR}/** binary
 `
 
 /** PRD §14.1 "Runtime-only files must be ignored", expressed relative to `.sanity-overlay/`. */
@@ -74,6 +86,56 @@ ${HISTORY_DIR}/
 *${BROKEN_SUFFIX}
 ${TEMP_PREFIX}*
 `
+
+/**
+ * Merge the lines a scaffold REQUIRES into whatever is already on disk.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS NOT A WRITE-IF-ABSENT, AND NOT AN OVERWRITE EITHER.
+ *
+ * The housekeeping files were originally written once, at `createOverlay`, and
+ * never revisited. That is right up until the recommended content gains a line,
+ * at which point every overlay created by an earlier version keeps its stale
+ * copy forever and no code path repairs it.
+ *
+ * That happened. `assets/blobs/** binary` arrived with branch-local assets, and
+ * an overlay scaffolded weeks earlier never received it — so the first uploaded
+ * PNG was committed as a file Git believed was text. The failure mode is not
+ * cosmetic: an asset blob is addressed BY its SHA-256, so a line-ending rewrite
+ * on checkout invalidates every record naming it, silently.
+ *
+ * Overwriting instead would trade one silent loss for another. The scaffolded
+ * README invites hand-editing this directory, so a developer's own rules must
+ * survive. Hence: additive. Existing content is preserved verbatim and in order;
+ * only genuinely missing required lines are appended.
+ *
+ * Idempotent by construction — a line already present is never appended, so
+ * repairing twice is identical to repairing once.
+ *
+ * Comparison is on the trimmed line. A required rule that differs only in
+ * leading whitespace is the same rule to Git, and appending a duplicate that
+ * Git then treats as a redefinition is worse than leaving it alone.
+ */
+export function reconcileScaffold(existing: string, required: string): string {
+  const present = new Set(
+    existing
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== ''),
+  )
+
+  const missing = required
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !present.has(line))
+
+  if (missing.length === 0) return existing
+
+  /* Keep exactly one newline between the old body and the appended rules, so a
+     file that already ended in one does not grow a blank line every repair. */
+  const body = existing.endsWith('\n') || existing === '' ? existing : `${existing}\n`
+  return `${body}${missing.join('\n')}\n`
+}
 
 export const README_CONTENT = `# Sanity branch overlay
 

@@ -12,8 +12,8 @@
  * The report is emitted on stdout even in the refusal case, because the point of
  * refusing is to show the operator what they were about to lose.
  */
-import type {OverlayActor} from '../../../sanity-overlay-core/src/index'
-import {toPublishedId} from '../../../sanity-overlay-core/src/index'
+import type {OverlayActor} from 'sanity-overlay-core'
+import {toPublishedId} from 'sanity-overlay-core'
 import {confirmationRequired, usageError} from '../errors'
 import {EXIT} from '../exit'
 import {openOverlay, requireHead, sortedHeads} from '../overlay'

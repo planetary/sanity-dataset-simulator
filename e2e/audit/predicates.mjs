@@ -45,6 +45,26 @@
  * asks whether the guard and that allowlist disagree in the dangerous direction.
  * Any one of them can catch an escape the other two are blind to; all three
  * failing at once is what an actual escape looks like.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * AND ALL THREE ASK IT OF A RECORDED FACT, NOT OF AN ABSENCE
+ *
+ * A3/A4 used to decide "was this forwarded?" with `record.blocked !== true`.
+ * `blocked: true` means one thing only — the write guard refused it — so a
+ * request refused by any OTHER gate recorded `blocked: false` and was read as
+ * forwarded. The audit's last run reported six escaped writes that never left
+ * the process (Mode 2's CSRF check answered them 415, and Mode 2 has no upstream
+ * to dial). The mirror image is what makes it unusable rather than merely noisy:
+ * a genuine escape answering anything but 403 was modelled the same way, in the
+ * direction of a PASSING predicate.
+ *
+ * So the proxy now records `disposition` — `local` or `upstream`, decided where
+ * the decision is made — and these predicates read it via
+ * {@link dispositionOf}, which infers nothing. A record that does not say is
+ * `unknown`, and unknown FAILS: default-deny, exactly as `readAllowlist.mjs`
+ * already treats an endpoint it has not heard of. The failure note separates
+ * RELAYED (the log says it left) from UNPROVEN (the log cannot say), because
+ * those are different findings and only one of them is an escape.
  */
 import {execFileSync} from 'node:child_process'
 
@@ -52,6 +72,9 @@ import {classify as classifyIndependently} from './readAllowlist.mjs'
 import {
   HTTP_METHODS,
   describe,
+  describeRelay,
+  describeUnproven,
+  dispositionOf,
   frameRecords,
   isSuccess,
   readLog,
@@ -69,6 +92,48 @@ try {
 }
 
 const RESULT = (id, title, pass, note = '') => ({id, title, pass, note})
+
+/** `formatResults` indents a note by 12 columns; a second line must match. */
+const NOTE_BREAK = '\n            '
+
+/**
+ * Score a population of write-capable records on WHERE THEIR BYTES WENT.
+ *
+ * Two failure categories, never merged:
+ *
+ *   RELAYED   the log says the proxy dialled an upstream and relayed this. That
+ *             is an escape, and the destination is part of the finding —
+ *             "forwarded" with no host:port cannot distinguish a test double
+ *             from api.sanity.io.
+ *   UNPROVEN  the log says nothing. Not an escape, and not a clean bill of
+ *             health either: the run produced no evidence in either direction,
+ *             so it fails, the same way an unknown endpoint fails the read
+ *             allowlist.
+ *
+ * Reporting the second as the first is what made this audit cry wolf over six
+ * requests that never left the process. Reporting the second as a PASS is what
+ * would make it worthless.
+ */
+function egressVerdict(id, title, suspects, cleanNote) {
+  const relayed = suspects.filter((record) => dispositionOf(record) === 'upstream')
+  const unproven = suspects.filter((record) => dispositionOf(record) === 'unknown')
+
+  const parts = []
+  if (relayed.length > 0) {
+    parts.push(`RELAYED (${relayed.length}): ${relayed.slice(0, 5).map(describeRelay).join(' | ')}`)
+  }
+  if (unproven.length > 0) {
+    parts.push(
+      `UNPROVEN (${unproven.length}): ${unproven.slice(0, 5).map(describeUnproven).join(' | ')}`,
+    )
+  }
+  return RESULT(
+    id,
+    title,
+    parts.length === 0,
+    parts.length === 0 ? cleanNote : parts.join(NOTE_BREAK),
+  )
+}
 
 /* ═══════════════════════════════════════════════════ A — the Sanity plane ══ */
 
@@ -100,7 +165,13 @@ function isVerbSafe(record) {
   return index >= 2 && segments[index - 2] === 'datasets'
 }
 
-export function auditProxyLog({log, runStartedAt}) {
+/**
+ * @param {{log: object, runStartedAt: string, expectNoUpstream?: boolean}} options
+ *   `expectNoUpstream` declares that this run had NO upstream at all — Mode 2 /
+ *   `E2E_MODE=local`, where the branch is served from disk. It turns on A12, the
+ *   structural control; see there for why it is opt-in rather than inferred.
+ */
+export function auditProxyLog({log, runStartedAt, expectNoUpstream = false}) {
   const results = []
   const {exists, raw, lines, records, parseError} = log
 
@@ -140,31 +211,31 @@ export function auditProxyLog({log, runStartedAt}) {
     ),
   )
 
-  /* ── A3, the classifier-free net ─────────────────────────────────────── */
-  const verbEscapes = R.filter((record) => record.blocked !== true && !isVerbSafe(record))
+  /* ── A3, the classifier-free net ─────────────────────────────────────── *
+   *
+   * `blocked` is deliberately NOT consulted. The question is where the bytes
+   * went, and only `disposition` answers it; a guard refusal is simply one of
+   * the ways a record comes to be `local`. */
+  const verbWrites = R.filter((record) => !isVerbSafe(record))
   results.push(
-    RESULT(
+    egressVerdict(
       'A3',
-      'no request with a mutating verb was forwarded (classifier-free)',
-      verbEscapes.length === 0,
-      verbEscapes.length === 0
-        ? `${R.length} forwarded requests, all GET/HEAD/OPTIONS or POST …/query`
-        : `ESCAPED: ${verbEscapes.slice(0, 5).map(describe).join(' | ')}`,
+      'every request with a mutating verb was answered locally (classifier-free)',
+      verbWrites,
+      `${R.length} request records; ${verbWrites.length} carried a mutating verb and every ` +
+        'one of those was answered locally, with no upstream socket',
     ),
   )
 
   /* ── A4, the independent allowlist ───────────────────────────────────── */
-  const allowlistEscapes = R.filter(
-    (record) => !classifyIndependently(record).read && record.blocked !== true,
-  )
+  const allowlistWrites = R.filter((record) => !classifyIndependently(record).read)
   results.push(
-    RESULT(
+    egressVerdict(
       'A4',
-      'every request the independent read allowlist calls a write was blocked',
-      allowlistEscapes.length === 0,
-      allowlistEscapes.length === 0
-        ? 'no unblocked writes'
-        : `ESCAPED: ${allowlistEscapes.slice(0, 5).map(describe).join(' | ')}`,
+      'every request the independent read allowlist calls a write was answered locally',
+      allowlistWrites,
+      `${allowlistWrites.length} of ${R.length} request records classify as writes, and every ` +
+        'one was answered locally',
     ),
   )
 
@@ -252,6 +323,105 @@ export function auditProxyLog({log, runStartedAt}) {
           ? `${unreasonedFrames.length} frames carry no classification reason`
           : `${F.length} frame records, all classified`,
     ),
+  )
+
+  /* ── A10, completeness — the predicate that makes A3/A4 mean something ── *
+   *
+   * A3 and A4 fail an UNPROVEN record, so a log with no dispositions at all
+   * already fails them — but only where a write-capable request happens to
+   * appear. A10 asks the question of every record, so "the audit could not see"
+   * is reported as its own finding rather than inferred from the shape of the
+   * traffic that happened to occur. */
+  const undecided = R.filter((record) => dispositionOf(record) === 'unknown')
+  results.push(
+    RESULT(
+      'A10',
+      'COMPLETENESS: every request record says what happened to its bytes',
+      undecided.length === 0,
+      undecided.length === 0
+        ? `all ${R.length} request records carry a disposition`
+        : `${undecided.length} of ${R.length} request records carry no usable disposition — ` +
+          `a record that cannot answer is not evidence: ` +
+          undecided.slice(0, 3).map(describeUnproven).join(' | '),
+    ),
+  )
+
+  /* ── A11, writer consistency ─────────────────────────────────────────── *
+   *
+   * `blocked` keeps its narrow meaning — the WRITE GUARD refused this — so it is
+   * now redundant with, and must never contradict, the disposition. A record
+   * claiming `blocked: true` while its bytes went upstream, or while some other
+   * gate answered it, means the two writers have drifted, and the audit reads
+   * only one of them. Evaluated over records that HAVE a disposition: a record
+   * without one is A10's finding, not this one's. */
+  const decided = R.filter((record) => dispositionOf(record) !== 'unknown')
+  const guardRefusals = decided.filter((record) => record.blocked === true)
+  const inconsistent = guardRefusals.filter(
+    (record) => !(dispositionOf(record) === 'local' && record.gate === 'write-guard'),
+  )
+  results.push(
+    RESULT(
+      'A11',
+      'a record marked `blocked` was refused locally, by the write guard, and by nothing else',
+      inconsistent.length === 0,
+      inconsistent.length === 0
+        ? `${guardRefusals.length} guard refusals, every one recorded local/write-guard`
+        : `INCONSISTENT (${inconsistent.length}): ` +
+          inconsistent
+            .slice(0, 5)
+            .map(
+              (record) =>
+                `${describe(record)} disposition=${dispositionOf(record)} ` +
+                `gate=${record.gate ?? '(none)'}`,
+            )
+            .join(' | '),
+    ),
+  )
+
+  /* ── A12, structural egress control ──────────────────────────────────── *
+   *
+   * A3/A4 ask whether a WRITE left. This asks whether ANYTHING did. When the
+   * proxy ran with no upstream configured at all — Mode 2, `E2E_MODE=local` —
+   * the claim available is much stronger than "no writes escaped": no byte of
+   * this run's traffic reached the network, and one `upstream` record anywhere,
+   * even on a GET or a WebSocket frame, falsifies it.
+   *
+   * OPT-IN, AND SAID OUT LOUD WHEN IT IS OFF. It is a property of how the run
+   * was launched, which no log can establish about itself: a Mode 1 run that
+   * simply made no upstream request produces a log indistinguishable from a
+   * Mode 2 one. Emitting this as a PASS whenever nobody claimed it would be the
+   * exact vacuous certification this file exists to refuse.
+   *
+   * But OMITTING it is the same bug wearing the other hat, and it is the bug
+   * this whole file was just rewritten to remove: a reader who scans the report
+   * and sees no A12 line reads the absence as "nothing to say here", which is
+   * indistinguishable from "this run never claimed it". So the line is always
+   * printed, and when it is not asserted it is printed as NOT ASSERTED with the
+   * reason — `pass: null`, which `formatResults` renders distinctly from PASS
+   * and does not count towards `ok`. An absence must never be readable as
+   * safety, including the absence of a predicate. */
+  const egress = records.filter((record) => dispositionOf(record) === 'upstream')
+  const silent = records.filter((record) => dispositionOf(record) === 'unknown')
+  results.push(
+    expectNoUpstream === true
+      ? RESULT(
+          'A12',
+          'STRUCTURAL: this run had no upstream, and not one record says otherwise',
+          egress.length === 0,
+          egress.length === 0
+            ? `${records.length} records, none upstream ` +
+              `(${silent.length} carry no disposition — A10 owns those)`
+            : `EGRESS FROM A RUN THAT HAD NO UPSTREAM (${egress.length}): ` +
+              egress.slice(0, 5).map(describeRelay).join(' | '),
+        )
+      : RESULT(
+          'A12',
+          'STRUCTURAL: no byte of this run reached the network',
+          null,
+          'NOT ASSERTED — the caller did not declare `expectNoUpstream`, and no log can ' +
+            'establish that a proxy HAD no upstream: a Mode 1 run that happened to relay ' +
+            `nothing looks identical. ${egress.length} records are recorded as upstream.`,
+        ),
   )
 
   return results
@@ -384,11 +554,15 @@ export function auditPinnedEvidence({pinnedPath, expectedLines, repoRoot}) {
  *
  * @param {{proxyLogPath: string, overlayLogPath: string, runStartedAt: string,
  *          pinnedPath: string, expectedPinnedLines: number, repoRoot: string,
- *          expectCommits?: boolean}} options
+ *          expectCommits?: boolean, expectNoUpstream?: boolean}} options
  */
 export function auditAll(options) {
   return [
-    ...auditProxyLog({log: readLog(options.proxyLogPath), runStartedAt: options.runStartedAt}),
+    ...auditProxyLog({
+      log: readLog(options.proxyLogPath),
+      runStartedAt: options.runStartedAt,
+      expectNoUpstream: options.expectNoUpstream ?? false,
+    }),
     ...auditOverlayLog({
       log: readLog(options.overlayLogPath),
       runStartedAt: options.runStartedAt,
@@ -402,11 +576,21 @@ export function auditAll(options) {
   ]
 }
 
-/** Human-readable report. Returns `{ok, text}`. */
+/**
+ * Human-readable report. Returns `{ok, text}`.
+ *
+ * THREE VERDICTS, NOT TWO. `pass: null` means the predicate was NOT EVALUATED,
+ * and it prints as `n/a ` rather than being dropped: a reader who sees no line
+ * for a predicate cannot tell "nothing to report" from "nobody asked", and that
+ * is the identical absence-read-as-safety bug the disposition schema exists to
+ * remove. A non-evaluated predicate is not a failure — `ok` ignores it — but it
+ * is never invisible.
+ */
 export function formatResults(results) {
-  const ok = results.every((result) => result.pass)
+  const ok = results.every((result) => result.pass !== false)
+  const label = (result) => (result.pass === null ? 'n/a ' : result.pass ? 'PASS' : 'FAIL')
   const text = results
-    .map((result) => `${result.pass ? 'PASS' : 'FAIL'}  ${result.id.padEnd(4)} ${result.title}${result.note ? `\n            ${result.note}` : ''}`)
+    .map((result) => `${label(result)}  ${result.id.padEnd(4)} ${result.title}${result.note ? `\n            ${result.note}` : ''}`)
     .join('\n')
   return {ok, text: `${text}\n\n${ok ? 'NETWORK AUDIT PASSES' : 'NETWORK AUDIT FAILED'}`}
 }

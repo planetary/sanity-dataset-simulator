@@ -24,13 +24,13 @@
  * reached the server and vanished without a word is the one failure mode the
  * local API must never have.
  */
-import {isForbiddenKey} from '../../sanity-overlay-core/src/index'
+import {isForbiddenKey} from 'sanity-overlay-core'
 import type {
   OverlayMutation,
   OverlayOperation,
   OverlayPath,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 
 type Rec = Record<string, unknown>
 

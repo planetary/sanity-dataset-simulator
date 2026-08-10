@@ -7,14 +7,14 @@
  * the overlay port is a separate object from the base port, so "did the client
  * read the overlay" is an observable fact rather than a claim.
  */
-import type {OverlayRecordMap} from '../../sanity-overlay-core/src/index'
+import type {OverlayRecordMap} from 'sanity-overlay-core'
 import type {
   OverlayQueryDefinition,
   OverlayQueryDiagnostics,
   QueryBaseSource,
   QueryCaller,
   QueryPerspective,
-} from '../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
 
 /**
  * PRD §11.1 `overlay.mode`, restricted to what this slice implements.

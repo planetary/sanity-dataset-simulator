@@ -201,20 +201,50 @@ describe('strict mode, composed with a non-empty branch', () => {
     for (const entry of SHIPPED_WORKLOAD) {
       if ((await outcomeOf(entry, NON_EMPTY_BRANCH)) === 'refused') refused.push(entry.query)
     }
-    expect(refused).toEqual([
-      '*[!(_id in path("drafts.**"))]',
-      '*[_type == $documentType && sha1hash == $hash][0]',
-      '*[_type == $type &&_id == $ref][0]{mimeType, originalFilename}',
-    ])
+    /*
+     * ─────────────────────────────────────────────────────────────────────
+     * UPDATED 2026-08-09, AND THE TWO ASSET ENTRIES ARE GONE ON PURPOSE.
+     *
+     * The comment above asked the owner to decide between `options.ts:221` and
+     * `reads.ts:18-23`. The answer turned out to be neither: both asset
+     * refusals were wrong on their own terms, and both are now answered.
+     *
+     *   `sha1hash`   the dedup probe. `client/assetDedup.ts` answers it from
+     *                the branch — the branch HOLDS the `sanity.*Asset`
+     *                documents since §24.3, so its candidate set really is
+     *                complete for the branch, and the answer cannot change the
+     *                resulting `asset._ref` because asset ids are
+     *                content-addressed. Delegating it was also the live
+     *                image-upload hang: nothing is uploaded until it emits.
+     *
+     *   `_id == $ref` the file/image input's asset read. It names the id
+     *                EXACTLY, so `_type` beside it can only narrow.
+     *                `readPlan.ts` was refusing on the `_type` conjunct before
+     *                it had looked at the `_id` one — order of conjuncts
+     *                deciding completeness — and the consequence was that a
+     *                BRANCH-uploaded file rendered with no filename and no
+     *                mime type, because base does not hold it.
+     *
+     * What remains is the one genuine gap: a dataset-wide ID-pattern scan.
+     * Still an equality on the whole set, so a drift in either direction fails.
+     * ─────────────────────────────────────────────────────────────────────
+     */
+    expect(refused).toEqual(['*[!(_id in path("drafts.**"))]'])
   })
 
   /**
-   * The asset refusals are decided by a runtime PARAMETER VALUE, not by the
-   * query text: the identical query is answered for an ordinary type and
-   * refused for a hosted system type. A registry keyed on query text could
-   * never have caught this, which is why it is pinned separately.
+   * THE FINDING THIS PINNED, AND WHY IT NOW READS THE OTHER WAY.
+   *
+   * It was written to record that the identical GROQ had two fates decided by a
+   * runtime PARAMETER VALUE — answered for `article`, refused for
+   * `sanity.fileAsset`. That asymmetry was the bug, not a property worth
+   * keeping: this query names `_id` exactly, so the candidate set is the id,
+   * and the `_type` conjunct beside it can only narrow it.
+   *
+   * The pin survives as an equality on BOTH fates, because the thing worth
+   * catching is still divergence between them.
    */
-  it('refuses on the parameter value, not the query text — same GROQ, two fates', async () => {
+  it('answers on the id, whatever the type parameter says — same GROQ, one fate', async () => {
     const query = '*[_type == $type &&_id == $ref][0]{mimeType, originalFilename}'
     const entry = {query, surface: 'asset input'} as const
     const asAsset = await outcomeOf(
@@ -225,8 +255,25 @@ describe('strict mode, composed with a non-empty branch', () => {
       {...entry, params: {type: 'article', ref: 'article-1'}},
       NON_EMPTY_BRANCH,
     )
-    expect(asAsset).toBe('refused')
+    expect(asAsset).toBe('overlay')
     expect(asOrdinary).toBe('overlay')
+  })
+
+  /**
+   * The type guard is NOT gone — it still refuses a system-type SCAN, which has
+   * no bounded candidate plan. Only the id-bounded shape was wrong.
+   */
+  it('still refuses a bare system-type scan, which no id bounds', async () => {
+    expect(
+      await outcomeOf(
+        {
+          query: '*[_type == $type]',
+          params: {type: 'sanity.imageAsset'},
+          surface: 'system-type scan',
+        },
+        NON_EMPTY_BRANCH,
+      ),
+    ).toBe('refused')
   })
 
   it('refuses NOTHING while the branch is still empty, which is the documented mitigation', async () => {
@@ -318,8 +365,9 @@ describe('the plannable majority is answered over the branch either way', () => 
   })
 
   /**
-   * The five that DO survive the strict default, named individually rather than
-   * counted — a count would still pass if the set drifted.
+   * The ones that DO survive the strict default, named individually rather than
+   * counted — a count would still pass if the set drifted. Two asset reads
+   * joined this list on 2026-08-09; see the refusal test above for why.
    */
   it('answers the surviving shipped queries from the overlay, under the strict default', async () => {
     const answered: string[] = []
@@ -330,6 +378,8 @@ describe('the plannable majority is answered over the branch either way', () => 
       '*[_id == $id][0]',
       '*[_id in $ids]{_id, cdnAccessPolicy}',
       '*[_id in $draftIds]._id',
+      '*[_type == $documentType && sha1hash == $hash][0]',
+      '*[_type == $type &&_id == $ref][0]{mimeType, originalFilename}',
       '*[sanity::versionOf($publishedId)][0]._type',
       '*[references($docId)]',
     ])

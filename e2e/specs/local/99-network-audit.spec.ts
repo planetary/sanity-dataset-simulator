@@ -35,6 +35,16 @@
  * editor silently did nothing produces a spotless proxy log. B2 — *at least one
  * write was committed to the overlay* — is what makes a clean A-side mean
  * something.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THIS DIRECTORY IS `local/`, SO THIS RUN HAD NO UPSTREAM AT ALL.
+ *
+ * `E2E_MODE=local` starts the proxy in Mode 2, which serves the branch from
+ * `.sanity-overlay/` and never dials anything. That licenses a much stronger
+ * claim than "no write escaped": NOTHING escaped, not even a GET. A12 asserts
+ * it, and it has to be told — no log can establish it about itself, since a
+ * Mode 1 run that merely happened to make no upstream request writes an
+ * identical file. Hence `expectNoUpstream: true`, here and nowhere else.
  */
 import {test, expect} from '@playwright/test'
 
@@ -50,6 +60,9 @@ import {
 import {runStartedAt} from '../../harness/runDir.mjs'
 
 const RUN_STARTED_AT = runStartedAt()
+
+/** Mode 2 has no upstream. See the header: A12 is opt-in because it must be. */
+const EXPECT_NO_UPSTREAM = true
 
 /** Report every failure at once — a one-at-a-time audit hides the second one. */
 function assertAll(results: ReturnType<typeof auditProxyLog>) {
@@ -73,7 +86,13 @@ test.describe('network audit — server-side logs only', () => {
   })
 
   test('no write escaped towards Sanity — the proxy plane', () => {
-    assertAll(auditProxyLog({log: readLog(PROXY_LOG), runStartedAt: RUN_STARTED_AT}))
+    assertAll(
+      auditProxyLog({
+        log: readLog(PROXY_LOG),
+        runStartedAt: RUN_STARTED_AT,
+        expectNoUpstream: EXPECT_NO_UPSTREAM,
+      }),
+    )
   })
 
   test('the writes actually happened, and landed on the overlay — the overlay plane', () => {
@@ -105,33 +124,78 @@ test.describe('network audit — server-side logs only', () => {
     ).toBeGreaterThan(0)
   })
 
-  test('the guard refusals from 07-guard-403 are visible in the SERVER log', () => {
-    /* `07-guard-403.spec.ts` reads statuses in the browser as a convenience.
-     * This is the same claim made from the artefact the project trusts. */
+  test('the refusals from 07-guard-403 are visible in the SERVER log, by gate', () => {
+    /**
+     * `07-guard-403.spec.ts` reads statuses in the browser as a convenience.
+     * This is the same claim made from the artefact the project trusts.
+     *
+     * IT USED TO ASK THE WRONG QUESTION. It required `blocked === true &&
+     * status === 403` for `/data/mutate/` and `/data/actions/`, and in Mode 2
+     * those are the two OVERLAY-OWNED write routes: the transport's guard passes
+     * them through on purpose, and the origin refuses them 415
+     * `OVERLAY_ORIGIN_UNSUPPORTED_MEDIA_TYPE`. So the assertion demanded a
+     * record the design guarantees will not exist, and it demanded it in the
+     * name of "was this refused?" — which is not a question `blocked` can
+     * answer. That is the same conflation the disposition schema was added to
+     * remove, one layer up.
+     *
+     * The claim worth making, and the one the log can now support, has two
+     * halves and neither implies the other:
+     *
+     *   1. the write guard ran, and refused something with its own 403;
+     *   2. the mutation plane WAS exercised, and every request on it was
+     *      answered inside this process — `disposition: 'local'` — by a gate
+     *      that named itself, with an `OVERLAY_*` code.
+     */
     const proxy = readLog(PROXY_LOG)
     expect(proxy.records).not.toBeNull()
+    const requests = proxy.records!.filter((record) => record.frame !== true)
 
-    const blocked = proxy
-      .records!.filter((record) => record.frame !== true)
-      .filter((record) => record.blocked === true && record.status === 403)
-
+    const guardRefusals = requests.filter(
+      (record) =>
+        record.blocked === true &&
+        record.status === 403 &&
+        record.disposition === 'local' &&
+        record.gate === 'write-guard',
+    )
     expect(
-      blocked.length,
-      'the proxy log records no refusals at all — either the guard is off, or the ' +
-        'probes never reached the proxy. Both invalidate the whole audit.',
+      guardRefusals.length,
+      'the proxy log records no write-guard refusals at all — either the guard is off, ' +
+        'or the probes never reached the proxy. Both invalidate the whole audit.',
     ).toBeGreaterThan(0)
 
     for (const path of ['/data/mutate/', '/data/actions/']) {
+      const onPlane = requests.filter(
+        (record) => String(record.path).includes(path) && record.method !== 'OPTIONS',
+      )
       expect(
-        blocked.some((record) => String(record.path).includes(path)),
-        `no blocked record for ${path} — the mutation plane was never exercised`,
-      ).toBe(true)
+        onPlane.length,
+        `no request on ${path} at all — the mutation plane was never exercised, so the ` +
+          `clean audit above says nothing about it`,
+      ).toBeGreaterThan(0)
+
+      const escaped = onPlane.filter((record) => record.disposition !== 'local')
+      expect(
+        escaped.map((record) => `${record.method} ${record.path} → ${record.status}`),
+        `a request on ${path} was not answered inside the proxy`,
+      ).toEqual([])
+
+      const unnamed = onPlane.filter((record) => !String(record.refusal ?? '').startsWith('OVERLAY_'))
+      expect(
+        unnamed.map((record) => `${record.method} ${record.path} → ${record.status}`),
+        `a request on ${path} was answered locally but by no named gate — the refusal code ` +
+          `is the only thing that distinguishes our refusal from an upstream one`,
+      ).toEqual([])
     }
   })
 
   test('the audit as a whole passes, and the report is attached to the run', async ({}, testInfo) => {
     const results = [
-      ...auditProxyLog({log: readLog(PROXY_LOG), runStartedAt: RUN_STARTED_AT}),
+      ...auditProxyLog({
+        log: readLog(PROXY_LOG),
+        runStartedAt: RUN_STARTED_AT,
+        expectNoUpstream: EXPECT_NO_UPSTREAM,
+      }),
       ...auditOverlayLog({log: readLog(OVERLAY_LOG), runStartedAt: RUN_STARTED_AT}),
       ...auditPinnedEvidence({
         pinnedPath: PINNED_PROXY_LOG,

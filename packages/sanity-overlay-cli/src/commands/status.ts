@@ -4,8 +4,8 @@
  * Reads the manifest only. It never opens a document record, so it stays fast
  * and stays useful on an overlay whose `.runtime/` was never committed.
  */
-import {OVERLAY_DOCUMENT_STATES} from '../../../sanity-overlay-core/src/index'
-import type {OverlayManifest} from '../../../sanity-overlay-core/src/index'
+import {OVERLAY_DOCUMENT_STATES} from 'sanity-overlay-core'
+import type {OverlayManifest} from 'sanity-overlay-core'
 import {EXIT} from '../exit'
 import {openOverlay} from '../overlay'
 import {field} from '../render'
@@ -54,6 +54,31 @@ export function statusReport(manifest: OverlayManifest): StatusReport {
   }
 }
 
+/**
+ * The `checkpoint` line.
+ *
+ * THREE OUTCOMES, NOT TWO. `manifest.checkpoint` records that a checkpoint was
+ * TAKEN; `commitSha` records that a commit is known to CARRY it, and only a
+ * caller who already held the sha can supply it — the commit does not exist
+ * when the checkpoint is written. Printing `undefined at revision N` for the
+ * unattributed case (which is what a template expecting a sha produced) told an
+ * operator nothing; printing `none` — which is what happened while the marker
+ * was never written at all — told them something false.
+ */
+function checkpointLine(report: StatusReport): string {
+  if (report.checkpoint === null) {
+    return `none  (${report.uncheckpointedRevisions} uncheckpointed revisions)`
+  }
+  const where =
+    report.checkpoint.commitSha === undefined
+      ? 'not attributed to a commit yet — commit the checkpoint tree'
+      : `commit ${report.checkpoint.commitSha}`
+  return (
+    `revision ${report.checkpoint.overlayRevision}, ${where}  ` +
+    `(${report.uncheckpointedRevisions} uncheckpointed)`
+  )
+}
+
 /** Human rendering shared by `status` and the header of `inspect`. */
 export function renderStatus(report: StatusReport): string[] {
   const states = Object.entries(report.documents.byState)
@@ -86,12 +111,7 @@ export function renderStatus(report: StatusReport): string[] {
       'conflicts',
       `${report.conflicts.total}  (hard ${report.conflicts.hard}, soft ${report.conflicts.soft})`,
     ),
-    field(
-      'checkpoint',
-      report.checkpoint === null
-        ? `none  (${report.uncheckpointedRevisions} uncheckpointed revisions)`
-        : `${report.checkpoint.commitSha} at revision ${report.checkpoint.overlayRevision}  (${report.uncheckpointedRevisions} uncheckpointed)`,
-    ),
+    field('checkpoint', checkpointLine(report)),
     field('expires', report.expiresAt ?? 'never'),
   ]
 }

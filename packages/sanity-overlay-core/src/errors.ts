@@ -30,6 +30,14 @@ export type OverlayErrorCode =
   | 'OVERLAY_ID_CHANGE_NOT_ALLOWED'
   | 'OVERLAY_ACTION_BLOCKED'
   | 'OVERLAY_TRANSACTION_INVALID'
+  /**
+   * One idempotency key was presented for two different writes (PRD §34.6).
+   *
+   * Its own code, not `OVERLAY_TRANSACTION_INVALID`: the request is perfectly
+   * well formed and the caller's fix is a new key, not a corrected payload. See
+   * `mutations/idempotency.ts`.
+   */
+  | 'OVERLAY_IDEMPOTENCY_KEY_REUSED'
   /* W4 — references (PRD §19.4 truncation, §19.5 integrity). */
   | 'OVERLAY_REFERENCE_DEPTH_EXCEEDED'
   | 'OVERLAY_REFERENCE_INTEGRITY'

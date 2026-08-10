@@ -21,14 +21,14 @@ import {
   createMemoryBaseSource,
   createQueryRegistry,
   evaluateOverlayQuery,
-} from '../../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
 import type {
   QueryCaller,
   QueryDocument,
   QueryPerspective,
-} from '../../../sanity-overlay-query/src/index'
-import {buildOverlaySource} from '../../../sanity-overlay-client/src/index'
-import type {OverlayRecordMap} from '../../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-query'
+import {buildOverlaySource} from 'sanity-overlay-client'
+import type {OverlayRecordMap} from 'sanity-overlay-core'
 import {CliError, usageError} from '../errors'
 import {EXIT} from '../exit'
 import {loadRecords, openOverlay} from '../overlay'

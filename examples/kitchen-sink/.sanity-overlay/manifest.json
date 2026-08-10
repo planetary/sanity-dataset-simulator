@@ -4,6 +4,10 @@
     "dataset": "parity",
     "projectId": "b1n03q3z"
   },
+  "checkpoint": {
+    "createdAt": "2026-08-09T17:58:41.500Z",
+    "overlayRevision": 16
+  },
   "conflictSummary": {
     "hard": 0,
     "soft": 0,
@@ -17,16 +21,16 @@
   },
   "documentHeads": {
     "article-01": {
-      "checksum": "5e0e709b88a3a97f6476722739fd879159ee5d8413c4399db4d41dd710d1e62f",
+      "checksum": "d71b612ba991ad20f4b3ec2cbf0442208b2d35ca6758bd3681d49a957adce8bc",
       "hasConflict": false,
       "hasDraft": true,
       "hasPublished": false,
       "logicalId": "article-01",
-      "runtimeRevision": "overlay.7.e9cf21505d7a",
+      "runtimeRevision": "overlay.12.9af0b8c227ae",
       "schemaType": "article",
       "state": "modified",
-      "storageRef": ".runtime/revisions/article-01/5e0e709b88a3a97f6476722739fd879159ee5d8413c4399db4d41dd710d1e62f.json",
-      "updatedAt": "2026-08-07T13:08:11.805Z",
+      "storageRef": ".runtime/revisions/article-01/d71b612ba991ad20f4b3ec2cbf0442208b2d35ca6758bd3681d49a957adce8bc.json",
+      "updatedAt": "2026-08-09T17:42:42.497Z",
       "updatedBy": {
         "displayName": "Overlay local API",
         "id": "overlay-local-api",
@@ -44,6 +48,74 @@
       "state": "modified",
       "storageRef": ".runtime/revisions/author-2/eda6724f00d702292cbf5926e0ea36ff1ece8737e240a83f42bb9fd85857a65d.json",
       "updatedAt": "2026-08-07T13:56:10.528Z",
+      "updatedBy": {
+        "displayName": "Overlay local API",
+        "id": "overlay-local-api",
+        "type": "user"
+      }
+    },
+    "author-3": {
+      "checksum": "7349a5085e87a85241f1b63bb3e36b217d3a8b45740f9adc87864fc117aac65f",
+      "hasConflict": false,
+      "hasDraft": true,
+      "hasPublished": false,
+      "logicalId": "author-3",
+      "runtimeRevision": "overlay.20.42f82e086407",
+      "schemaType": "author",
+      "state": "modified",
+      "storageRef": ".runtime/revisions/author-3/7349a5085e87a85241f1b63bb3e36b217d3a8b45740f9adc87864fc117aac65f.json",
+      "updatedAt": "2026-08-09T18:46:28.708Z",
+      "updatedBy": {
+        "displayName": "Overlay local API",
+        "id": "overlay-local-api",
+        "type": "user"
+      }
+    },
+    "author-4": {
+      "checksum": "c57fd3f40e6b6d38f6c57e756fa646eb74c106600b4c0ea957ea08ff3c9e12bd",
+      "hasConflict": false,
+      "hasDraft": true,
+      "hasPublished": false,
+      "logicalId": "author-4",
+      "runtimeRevision": "overlay.22.ed02050cd84f",
+      "schemaType": "author",
+      "state": "modified",
+      "storageRef": ".runtime/revisions/author-4/c57fd3f40e6b6d38f6c57e756fa646eb74c106600b4c0ea957ea08ff3c9e12bd.json",
+      "updatedAt": "2026-08-09T18:48:17.187Z",
+      "updatedBy": {
+        "displayName": "Overlay local API",
+        "id": "overlay-local-api",
+        "type": "user"
+      }
+    },
+    "image-23ebda0ced54001ca658d9d443f7e290759b6810-2x2-png": {
+      "checksum": "ff345599941363a99971b70ed8ad9f03ce51d6d3099962222165774484ef207e",
+      "hasConflict": false,
+      "hasDraft": false,
+      "hasPublished": true,
+      "logicalId": "image-23ebda0ced54001ca658d9d443f7e290759b6810-2x2-png",
+      "runtimeRevision": "overlay.15.aeb9af04fcdb",
+      "schemaType": "sanity.imageAsset",
+      "state": "created",
+      "storageRef": ".runtime/revisions/image-23ebda0ced54001ca658d9d443f7e290759b6810-2x2-png/ff345599941363a99971b70ed8ad9f03ce51d6d3099962222165774484ef207e.json",
+      "updatedAt": "2026-08-09T17:45:54.381Z",
+      "updatedBy": {
+        "displayName": "Overlay local API",
+        "id": "overlay-local-api",
+        "type": "user"
+      }
+    },
+    "image-a11767ffdbe7de3abe04f22904d485255a326d92-3x3-png": {
+      "checksum": "3bf1affc3f5d3276e9664fce89cea1c18afeeeaff03882cc8c80c2612877966a",
+      "hasConflict": false,
+      "hasDraft": false,
+      "hasPublished": true,
+      "logicalId": "image-a11767ffdbe7de3abe04f22904d485255a326d92-3x3-png",
+      "runtimeRevision": "overlay.19.ff67fa1c6873",
+      "schemaType": "sanity.imageAsset",
+      "state": "created",
+      "storageRef": ".runtime/revisions/image-a11767ffdbe7de3abe04f22904d485255a326d92-3x3-png/3bf1affc3f5d3276e9664fce89cea1c18afeeeaff03882cc8c80c2612877966a.json",
+      "updatedAt": "2026-08-09T18:46:27.850Z",
       "updatedBy": {
         "displayName": "Overlay local API",
         "id": "overlay-local-api",
@@ -87,14 +159,14 @@
   },
   "formatVersion": 1,
   "overlayId": "spike-a-local-echo",
-  "revision": 11,
+  "revision": 22,
   "source": {
     "branch": "spike/a-local-echo",
     "repositoryId": "github:planetary/sanity-branch-overlay"
   },
   "status": "active",
-  "transactionHead": "tx-20260807135610534-000003-7a60e388",
-  "updatedAt": "2026-08-07T13:56:10.534Z",
+  "transactionHead": "tx-20260809184817190-000005-16dd3ebc",
+  "updatedAt": "2026-08-09T18:48:17.190Z",
   "updatedBy": {
     "displayName": "Overlay local API",
     "id": "overlay-local-api",

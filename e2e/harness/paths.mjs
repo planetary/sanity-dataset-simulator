@@ -33,6 +33,22 @@ export const OVERLAY_ROOT = resolve(RUN_DIR, 'overlay-root')
 export const PROXY_LOG = resolve(RUN_DIR, 'proxy-log.jsonl')
 export const OVERLAY_LOG = resolve(RUN_DIR, 'overlay-log.jsonl')
 
+/**
+ * Where the proxy mints the certificate its HTTP/2 listener serves.
+ *
+ * INSIDE THE RUN DIRECTORY, which is wiped at the start of every run, so the key
+ * is thrown away with it and nothing durable or trusted is ever created on the
+ * machine. `PROXY_TLS_SOURCE=self-signed` pins the rung as well: the `auto`
+ * ladder would use `mkcert` when a developer happens to have it installed and
+ * `openssl` when they do not, and a suite must not measure a different thing on
+ * a different laptop. mkcert is also wrong for CI on its own terms — its trust
+ * rung needs `mkcert -install`, which writes to the system trust store and asks
+ * for a password, and `tlsMaterial.mjs` says out loud that it will not run it
+ * for you. The browser context sets `ignoreHTTPSErrors`, which is what makes a
+ * throwaway self-signed certificate the correct unattended answer.
+ */
+export const PROXY_TLS_DIR = resolve(RUN_DIR, 'tls')
+
 /** Written by global setup; carries the timestamp the freshness predicates use. */
 export const RUN_MANIFEST = resolve(RUN_DIR, 'run.json')
 
@@ -57,7 +73,25 @@ export const LOCAL_SITE = resolve(REPO_ROOT, 'examples/local-site')
  */
 export const PORTS = Object.freeze({
   studio: 3333,
-  /** Transport proxy (Track B). Studio's `apiHost`. */
+  /**
+   * The transport proxy (Track B), and Studio's `apiHost`. ONE PORT, BOTH
+   * FRAMINGS.
+   *
+   * Chromium allows six concurrent HTTP/1.1 connections per origin and
+   * `sanity@6.8.0` holds six listener streams open against the data host, so
+   * over HTTP/1.1 the seventh request — the document pair's initial snapshot —
+   * is queued forever and no pane ever loads. Content Lake is HTTP/2 and has no
+   * such limit.
+   *
+   * The suite used to fix that with its own TLS+h2 terminator on 3995
+   * (`dataPlaneFront.mjs`), relaying here over HTTP/1.1. The proxy now
+   * terminates h2 itself — `createProxyStack` peeks the first byte of every
+   * connection and hands a TLS ClientHello (0x16) to `http2.createSecureServer`
+   * and everything else to the HTTP/1.1 server, on this one socket. So the
+   * workaround is gone, and with it the last thing standing between the browser
+   * and the component under test: what the network audit reads is now written by
+   * the process the browser actually spoke to.
+   */
   proxy: 3999,
   /** What the Studio talks to. The recording pass-through, not the real server. */
   overlayApi: 3998,
@@ -73,7 +107,13 @@ export const PORTS = Object.freeze({
 
 export const URLS = Object.freeze({
   studio: `http://localhost:${PORTS.studio}`,
+  /** Cleartext, for anything on this host that speaks HTTP/1.1 to the proxy. */
   proxy: `http://localhost:${PORTS.proxy}`,
+  /**
+   * What the browser is told, and the same socket as `proxy`. TLS, because
+   * browsers only negotiate h2 over TLS.
+   */
+  dataPlane: `https://localhost:${PORTS.proxy}`,
   overlayApi: `http://localhost:${PORTS.overlayApi}`,
   control: `http://127.0.0.1:${PORTS.control}`,
   siteBranch: `http://127.0.0.1:${PORTS.siteBranch}`,
@@ -109,8 +149,15 @@ export const API_VERSION = '2025-02-19'
 /**
  * `@sanity/client` does not use `apiHost` verbatim: with `useProjectHostname`
  * (the default) it builds `<projectId>.<apiHost>`. So a Studio told
- * `apiHost: http://localhost:3999` actually requests
- * `http://b1n03q3z.localhost:3999`. Chromium resolves `*.localhost` to loopback
+ * `apiHost: https://localhost:3999` actually requests
+ * `https://b1n03q3z.localhost:3999`. Chromium resolves `*.localhost` to loopback
  * per RFC 6761; WebKit does not, which is why the suite is Chromium-only.
+ *
+ * The proxy's certificate therefore has to carry this EXACT name, not just a
+ * `DNS:*.localhost` wildcard: `*.localhost` has a single-label parent, which is
+ * the wildcard shape verifiers decline (`tlsMaterial.mjs` has the measurement).
+ * `browserHostnames()` derives its extra names from the configured upstream,
+ * which Mode 2 does not have — so the config passes this one explicitly through
+ * `PROXY_TLS_NAMES`.
  */
-export const PROXY_BROWSER_ORIGIN = `http://${PROJECT_ID}.localhost:${PORTS.proxy}`
+export const PROXY_BROWSER_ORIGIN = `https://${PROJECT_ID}.localhost:${PORTS.proxy}`

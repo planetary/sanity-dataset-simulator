@@ -30,7 +30,8 @@ import {fileURLToPath} from 'node:url'
 
 register('./tsResolveHook.mjs', import.meta.url)
 
-const {createProxyServer} = await import('./proxy.mjs')
+const {createProxyStack} = await import('./proxy.mjs')
+const {describeTlsMaterial} = await import('./tlsMaterial.mjs')
 const {isOriginModeRequested, originStartupBanner} = await import('./originSafety.mjs')
 const {loadExplicitEnv} = await import('../../explicitEnv.mjs')
 const {DECLARED_STUDIO_IDENTITY, STUDIO_IDENTITY_KEYS, studioIdentity} = await import(
@@ -109,26 +110,48 @@ const handler = await createOriginHandler({
   },
 })
 
-const server = createProxyServer({
-  origin: true,
-  originHandler: handler,
-  port,
-  bind,
-  ...(flags.log === undefined ? {} : {logPath: flags.log}),
-})
+/**
+ * THE STACK, NOT THE BARE HTTP/1.1 SERVER — for the same reason Mode 1 uses it.
+ *
+ * Mode 2 is talked to by a browser exactly as Mode 1 is, so it meets exactly
+ * the same wall: Chromium allows six concurrent HTTP/1.1 connections per
+ * origin, Studio holds six listener streams open, and the seventh request — the
+ * document pane's first snapshot — is queued forever. Both framings are served
+ * on the one port, so nothing that speaks cleartext to `--port` changes.
+ */
+let stack
+try {
+  stack = createProxyStack({
+    origin: true,
+    originHandler: handler,
+    port,
+    bind,
+    ...(flags.log === undefined ? {} : {logPath: flags.log}),
+  })
+} catch (error) {
+  process.stderr.write(`${error.message}\n`)
+  process.exit(1)
+}
+const server = stack.listener
 
 server.on('error', (error) => {
   process.stderr.write(`[proxy] server error: ${error.stack || error.message}\n`)
   process.exit(1)
 })
 
-server.listen(port, bind, () => {
+stack.listen(port, bind).then(() => {
   process.stderr.write(
     `${originStartupBanner({bind, port, root: handler.root, projectId, dataset})}\n` +
       `[proxy] overlay id  : ${handler.overlayId} (revision ${handler.revision})\n` +
       '[proxy] write-guard : ON and not overridable in Mode 2\n' +
-      '[proxy] in Studio   : set apiHost to http://localhost:' +
-      `${port} in sanity.config.ts\n`,
+      (stack.tls
+        ? `[proxy] certificate : ${describeTlsMaterial(stack.tls)}\n` +
+          (stack.tls.manualStep ? `[proxy] ONE-TIME    : ${stack.tls.manualStep}\n` : '') +
+          `[proxy] in Studio   : set apiHost to https://localhost:${port} — HTTP/2, which is\n` +
+          '[proxy]               what a browser needs past six concurrent listener streams\n'
+        : '[proxy] HTTP/2      : DISABLED (PROXY_TLS=0); a browser stalls at the seventh\n' +
+          '[proxy]               concurrent request — see spikeB-proxy/README.md\n' +
+          `[proxy] in Studio   : set apiHost to http://localhost:${port} in sanity.config.ts\n`),
   )
 })
 
@@ -142,7 +165,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
      * `server.close()` waits for every open connection. */
     handler
       .close()
-      .then(() => new Promise((resolve) => server.close(resolve)))
+      .then(() => stack.close())
       .then(
         () => process.exit(0),
         (error) => {

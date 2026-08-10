@@ -287,7 +287,9 @@ describe('POST /query/plan', () => {
       query: `${BY_ID.query} // edited without re-registering`,
       params: {id: 'article-1'},
     })
-    expect(status).toBe(400)
+    /* PRD §22.9 assigns 422 to `QUERY_CHANGED`. It was 400 until the §22.9 table
+     * was wired into `failure()` — see `failure-api.test.ts`. */
+    expect(status).toBe(422)
     expect(json.error.code).toBe('QUERY_CHANGED')
   })
 })
@@ -337,7 +339,8 @@ describe('POST /query', () => {
       params: {s: 1},
       baseDocuments: [BASE_ARTICLE],
     })
-    expect(status).toBe(400)
+    /* §33 "Query not registered → Return 422", and §5.5's refusal in the body. */
+    expect(status).toBe(422)
     expect(json.ok).toBe(false)
     expect(json.error.code).toBe('UNSUPPORTED_QUERY')
     expect(json.error.message).toMatch(/never approximated/)

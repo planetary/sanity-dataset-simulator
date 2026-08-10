@@ -36,16 +36,31 @@ import {
   setField,
   waitForSettled,
 } from '../../playwright/interactions'
+import {seedArticleReferencing, seedPublishedAuthor} from '../../playwright/seed'
 import {STUDIO} from '../../playwright/selectors'
 
-/** The structure list for one document type. */
+/**
+ * The list of DOCUMENTS for one type.
+ *
+ * NOT `structure-tool-list-pane`, which is what this used to read. That id is
+ * the *structure* pane — the root menu, `Content / Author / Article / Page /
+ * Site settings` — and it renders at `data-pane-index="0"` on every screen, so
+ * `.last()` resolved to it even at `/structure/article` and the assertion below
+ * was reading the sidebar. The first real run reported it verbatim:
+ * `Received string: "ContentAuthorArticlePageSite settings"`.
+ *
+ * The documents themselves are in `document-list-pane`, which is the pane whose
+ * contents the findability path actually fills.
+ */
 function listPane(page: import('@playwright/test').Page) {
-  return page.getByTestId(STUDIO.structureListPane).last()
+  return page.getByTestId(STUDIO.documentListPane).last()
 }
 
 async function openArticleList(page: import('@playwright/test').Page) {
   await page.goto('/structure/article', {waitUntil: 'domcontentloaded'})
-  await expect(page.getByTestId(STUDIO.pane).first()).toBeVisible({timeout: 60_000})
+  /* The document list, not just any pane: waiting on `pane` was satisfied by
+   * the root menu before the type list had rendered at all. */
+  await expect(listPane(page)).toBeVisible({timeout: 60_000})
 }
 
 test.describe('list panes render branch state', () => {
@@ -91,12 +106,40 @@ test.describe('list panes render branch state', () => {
     }
   })
 
+  /**
+   * A TOMBSTONE NEEDS A PUBLISHED DOCUMENT, AND THE PUBLISH NEEDS A VALID ONE.
+   *
+   * Two constraints shape this test, both of them facts about the product
+   * rather than preferences. `04-document-actions.spec.ts` states each at
+   * length; the short forms:
+   *
+   *   - Deleting a never-published document cannot tombstone. `del.execute`
+   *     sends `version.discard` for an empty version list when there is no
+   *     published snapshot, so the request is empty or clears the draft, and
+   *     `tombstones` stays `{draft: false, published: false}`. This test used to
+   *     ask for exactly that state and timed out on it every time.
+   *   - `Publish` is disabled until all four required fields are set, and the
+   *     required `author` reference can only be set by the seed (the picker
+   *     cannot see overlay documents; a strong reference must resolve to a
+   *     published document — `playwright/seed.ts`).
+   *
+   * And one about the harness: every document action here happens in ONE page
+   * load. The facade keys document actions with a per-page-load counter against
+   * a durable idempotency ledger, so the first action after a reload replays the
+   * first action of an earlier load. The list assertions are page loads, so both
+   * `Publish` and `Delete` are performed in the load between them.
+   */
   test('a TOMBSTONED document disappears from the list', async ({page, studio, overlay}) => {
     const id = 'e2e-list-tombstoned'
     const title = 'Doomed article'
 
+    await seedPublishedAuthor(`${id}-author`, 'Reference target')
+    await seedArticleReferencing(id, `${id}-author`)
+
     await studio.openDocument('article', id)
     await setField(page, 'Title', title)
+    await setField(page, 'Slug', id)
+    await setField(page, 'Published At', '2026-08-06 12:00')
     await waitForSettled(page)
     await overlay.waitForIntent(id, (value) => overrideAt(value, ['title']) === title)
 
@@ -104,6 +147,13 @@ test.describe('list panes render branch state', () => {
     await expect(listPane(page)).toContainText(title, {timeout: 30_000})
 
     await studio.openDocument('article', id)
+    await expect(page.getByTestId('action-publish').last()).toBeEnabled({timeout: 40_000})
+    await runDocumentAction(page, 'Publish')
+    await confirmIfAsked(page)
+    await overlay.waitForIntent(id, (value) => overrideAt(value, ['title'], 'published') === title, {
+      what: 'the published layer, which is the only thing a delete can tombstone',
+    })
+
     await runDocumentAction(page, 'Delete')
     await confirmIfAsked(page)
     await overlay.waitForIntent(
@@ -136,9 +186,27 @@ test.describe('list panes render branch state', () => {
     expect(overlay.ids()).toContain(id)
 
     await openArticleList(page)
-    await expect(listPane(page).getByTestId(STUDIO.previewHeading).first()).toBeVisible({
-      timeout: 30_000,
-    })
+
+    /**
+     * THE EMPTY-STATE STRING, NOT A PREVIEW TEST ID.
+     *
+     * This asked for `default-preview__heading` inside the pane and never found
+     * one on the first real run, while the sibling tests above happily matched
+     * the title text in the same pane — so the id is not what a document row in
+     * a `document-list-pane` renders, and asserting it was asserting the
+     * harness's guess rather than the product.
+     *
+     * `No documents of this type` is what the pane renders when findability
+     * returned nothing (seen verbatim in the run's own snapshots), which is the
+     * precise failure this test exists for. Both halves are asserted: the empty
+     * state is gone AND the document is there, so a pane that rendered neither —
+     * still loading, or broken — cannot pass.
+     */
+    await expect(
+      listPane(page),
+      'the pane is showing its empty state while the overlay holds a document',
+    ).not.toContainText('No documents of this type', {timeout: 30_000})
+    await expect(listPane(page)).toContainText('Findability probe', {timeout: 30_000})
   })
 
   /**

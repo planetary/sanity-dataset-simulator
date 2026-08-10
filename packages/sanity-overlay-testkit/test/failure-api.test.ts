@@ -44,13 +44,14 @@ import {join} from 'node:path'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {parse} from '../../sanity-overlay-core/src/index'
 import type {OverlayManifest} from '../../sanity-overlay-core/src/index'
-import {startOverlayApiServer} from '../../sanity-overlay-next/src/index'
+import {overlayApiStatusForErrorCode, startOverlayApiServer} from '../../sanity-overlay-next/src/index'
 import type {OverlayApiServer} from '../../sanity-overlay-next/src/index'
 import {
   createQueryRegistry,
   M_LOCAL_QUERIES,
-  OverlayQueryError,
+  queryTextChecksum,
 } from '../../sanity-overlay-query/src/index'
+import type {OverlayQueryRegistry} from '../../sanity-overlay-query/src/index'
 import {createOverlayEcho} from '../../sanity-overlay-studio/src/client/echo'
 import {createOverlayTransport} from '../../sanity-overlay-studio/src/client/transport'
 import {createFailureLedger, endsWith, errnoError, settle, until} from '../src/failureInjection'
@@ -98,6 +99,21 @@ async function boot(
      * would only add noise to a failure-injection assertion. */
     watchIntervalMs: 0,
     origins: [STUDIO_ORIGIN],
+  })
+  running.push(server)
+  return server
+}
+
+/** `boot`, with a query registry of the caller's choosing. */
+async function bootWith(registry: OverlayQueryRegistry): Promise<OverlayApiServer> {
+  const server = await startOverlayApiServer({
+    root: await makeRoot(),
+    port: 0,
+    overlayId: OVERLAY_ID,
+    now: makeClock(),
+    watchIntervalMs: 0,
+    origins: [STUDIO_ORIGIN],
+    registry,
   })
   running.push(server)
   return server
@@ -690,107 +706,377 @@ describe('§33 query gateway failures', () => {
     expect(result.json.result).toBeUndefined()
   })
 
-  /**
-   * ─────────────────────────────── DEFECT D-3 ────────────────────────────────
-   * QUERY REFUSALS LOSE THEIR HTTP STATUS AT THE API BOUNDARY.
-   *
-   * `sanity-overlay-query/src/errors.ts` carries the §22.9 table verbatim and
-   * puts it on every error as `httpStatus` — 422 for `QUERY_NOT_REGISTERED`,
-   * `QUERY_CHANGED`, `UNSUPPORTED_GROQ` and `REFERENCE_DEPTH_EXCEEDED`, 413 for
-   * `CANDIDATE_LIMIT_EXCEEDED`, 403 for `QUERY_CALLER_NOT_ALLOWED`.
-   *
-   * `sanity-overlay-next/src/api.ts` `failure()` reads `api?.status`, which only
-   * exists on `OverlayApiError`, and otherwise flattens every code-carrying
-   * error to 400. So the whole table is dead at the one boundary it was written
-   * for, and §33's "Query not registered → Return 422" is not met.
-   *
-   * The CODE survives, so nothing silently approximates and no caller is misled
-   * about what happened — which is why this is reported as a defect rather than
-   * a safety failure. `sanity-overlay-next` is not owned by this work; the fix
-   * is `error.httpStatus` in `failure()`'s status resolution.
-   * ───────────────────────────────────────────────────────────────────────────
-   */
-  it('DEFECT D-3: every query refusal is flattened to 400 regardless of its §22.9 status', async () => {
-    const root = await makeRoot()
-    const server = await boot(root)
+  it('answers a candidate-limit refusal with §22.9’s 413, not a malformed-request 400', async () => {
+    const registry = createQueryRegistry(
+      M_LOCAL_QUERIES.map((definition) =>
+        definition.id === 'article-type-list' ? {...definition, maxCandidates: 1} : definition,
+      ),
+    )
+    const server = await bootWith(registry)
+    const result = await post(server, '/query', {
+      queryId: 'article-type-list',
+      query: registry.get('article-type-list').query,
+      params: {},
+      baseDocuments: [BASE_ARTICLE, {...BASE_ARTICLE, _id: 'article-2'}],
+    })
+    /* §22.9 assigns 413 to `CANDIDATE_LIMIT_EXCEEDED`; a capacity error that
+     * arrives as 400 is indistinguishable from a malformed request. */
+    expect(result.status).toBe(413)
+  })
+})
 
-    const unregistered = await post(server, '/query', {
+/* ================================================================== *
+ * PRD §22.9 QUERY ERROR POLICY — THE WHOLE TABLE, AT THE BOUNDARY
+ * ================================================================== *
+ *
+ * WAS DEFECT D-3. `sanity-overlay-query/src/errors.ts` carried the §22.9 table
+ * verbatim and put a `httpStatus` on every error it raised; `api.ts`'s
+ * `failure()` read only `OverlayApiError.status` and flattened everything else
+ * with a `code` to 400. The whole table was dead at the one boundary it was
+ * written for: a §33 "candidate set too large" capacity error reached the
+ * caller indistinguishable from a malformed request, and §33's "Query not
+ * registered → Return 422" was not met.
+ *
+ * WHY THIS SUITE IS TABLE-SHAPED RATHER THAN TWO FIXES. The defect was never
+ * "two codes have the wrong number"; it was one missing lookup that collapsed
+ * NINE rows at once. Fixing the two that were noticed would leave the same
+ * boundary silently wrong for the other seven, so every row §22.9 states is
+ * asserted here — each one over a REAL HTTP round trip against the real server,
+ * reading `response.status` off the wire rather than any value the handler
+ * computed.
+ *
+ * THE ORACLE IS THE PRD, TRANSCRIBED. {@link SECTION_22_9} below is the table
+ * from `docs/PRD-v1.md` §22.9 copied by hand. It is deliberately NOT derived
+ * from `httpStatusForQueryErrorCode`, because a test that reads the mapping out
+ * of the implementation it is checking asserts nothing.
+ */
+
+/** PRD §22.9, transcribed. Do not import this from the implementation. */
+const SECTION_22_9: ReadonlyArray<{readonly code: string; readonly status: number}> = [
+  {code: 'QUERY_NOT_REGISTERED', status: 422},
+  {code: 'QUERY_CHANGED', status: 422},
+  {code: 'UNSUPPORTED_GROQ', status: 422},
+  {code: 'CANDIDATE_LIMIT_EXCEEDED', status: 413},
+  {code: 'REFERENCE_DEPTH_EXCEEDED', status: 422},
+  {code: 'INVALID_GROQ', status: 400},
+  {code: 'GROQ_EVALUATION_FAILED', status: 500},
+  {code: 'BASE_UNAVAILABLE', status: 503},
+  {code: 'OVERLAY_STORE_UNAVAILABLE', status: 503},
+]
+
+/**
+ * §22.4 registers `allowedCallers` and `perspectives`, and §22.9 assigns no code
+ * to a registered query invoked outside its registration. `sanity-overlay-query`
+ * documents these two as extensions rather than PRD rows; they are asserted for
+ * the same reason as the rest — a refusal whose status is 400 is a refusal a
+ * caller cannot act on.
+ */
+const EXTENSIONS: ReadonlyArray<{readonly code: string; readonly status: number}> = [
+  {code: 'QUERY_CALLER_NOT_ALLOWED', status: 403},
+  {code: 'QUERY_PERSPECTIVE_NOT_REGISTERED', status: 422},
+]
+
+/** A registry with one bespoke entry appended to `[M-LOCAL]`. */
+function registryWith(definition: {
+  id: string
+  query: string
+  candidatePlan: unknown
+  maxCandidates?: number
+  maxReferenceDepth?: number
+}): OverlayQueryRegistry {
+  return createQueryRegistry([
+    ...M_LOCAL_QUERIES,
+    {
+      id: definition.id,
+      description: `§22.9 boundary probe: ${definition.id}`,
+      query: definition.query,
+      queryChecksum: queryTextChecksum(definition.query),
+      allowedCallers: ['frontend', 'studio', 'agent', 'test'],
+      perspectives: ['published', 'drafts'],
+      candidatePlan: definition.candidatePlan,
+      systemTimestampPolicy: 'preserve-base',
+      maxCandidates: definition.maxCandidates ?? 64,
+      maxReferenceDepth: definition.maxReferenceDepth ?? 3,
+      status: 'tier-a',
+    } as never,
+  ])
+}
+
+const AUTHOR_1 = {
+  _id: 'author-1',
+  _type: 'author',
+  _rev: 'lake-author-1',
+  name: 'A. Author',
+  editor: {_type: 'reference', _ref: 'editor-1'},
+}
+const EDITOR_1 = {_id: 'editor-1', _type: 'author', _rev: 'lake-editor-1', name: 'E. Editor'}
+const ARTICLE_WITH_AUTHOR = {...BASE_ARTICLE, author: {_type: 'reference', _ref: 'author-1'}}
+
+describe('§22.9 query error policy is carried by the HTTP status', () => {
+  /**
+   * One real request per row, and the row's status read off the wire.
+   *
+   * Each entry states how the code is PROVOKED, so the case is a description of
+   * a reachable failure rather than a mock of one. `QUERY_NOT_REGISTERED` and
+   * the two 503 rows are handled after this loop — see their own cases.
+   */
+  const REACHABLE: ReadonlyArray<{
+    readonly code: string
+    readonly run: () => Promise<{status: number; json: Record<string, any>}>
+  }> = [
+    {
+      code: 'QUERY_CHANGED',
+      run: async () =>
+        post(await boot(await makeRoot()), '/query/plan', {
+          queryId: 'article-by-id',
+          query: '*[_type == "article"] /* rewritten in the app, never re-registered */',
+          params: {id: 'article-1'},
+        }),
+    },
+    {
+      code: 'UNSUPPORTED_GROQ',
+      run: async () =>
+        /* `unconstrained-star` is registered `status: 'unsupported'` precisely so
+         * "must fail structurally" is executable (§22.3 Tier C). */
+        post(await boot(await makeRoot()), '/query', {
+          queryId: 'unconstrained-star',
+          caller: 'test',
+          perspective: 'published',
+          params: {},
+          baseDocuments: [BASE_ARTICLE],
+        }),
+    },
+    {
+      code: 'CANDIDATE_LIMIT_EXCEEDED',
+      run: async () => {
+        const registry = createQueryRegistry(
+          M_LOCAL_QUERIES.map((definition) =>
+            definition.id === 'article-type-list' ? {...definition, maxCandidates: 1} : definition,
+          ),
+        )
+        return post(await bootWith(registry), '/query', {
+          queryId: 'article-type-list',
+          params: {},
+          baseDocuments: [BASE_ARTICLE, {...BASE_ARTICLE, _id: 'article-2'}],
+        })
+      },
+    },
+    {
+      code: 'REFERENCE_DEPTH_EXCEEDED',
+      run: async () => {
+        /* Two deref hops (article → author → editor) against a registered depth
+         * budget of one, so §22.6 step 11 cannot prove the candidate set
+         * complete. */
+        const registry = registryWith({
+          id: 'chained-deref',
+          query: '*[_id == $id][0]{title, author->{name, editor->{name}}}',
+          candidatePlan: {type: 'ids', idsFromParams: ['id']},
+          maxReferenceDepth: 1,
+        })
+        return post(await bootWith(registry), '/query', {
+          queryId: 'chained-deref',
+          params: {id: 'article-1'},
+          baseDocuments: [ARTICLE_WITH_AUTHOR, AUTHOR_1, EDITOR_1],
+        })
+      },
+    },
+    {
+      code: 'INVALID_GROQ',
+      run: async () => {
+        /* Registered text that `groq-js` cannot parse. The registry checks the
+         * checksum, not the grammar, so this is a registration a real project
+         * could hold — and §22.9 gives it 400 because the query itself is the
+         * malformed thing. */
+        const registry = registryWith({
+          id: 'unparseable',
+          query: '*[_type == "article"',
+          candidatePlan: {type: 'types', types: ['article']},
+        })
+        return post(await bootWith(registry), '/query', {
+          queryId: 'unparseable',
+          params: {},
+          baseDocuments: [BASE_ARTICLE],
+        })
+      },
+    },
+    {
+      code: 'GROQ_EVALUATION_FAILED',
+      run: async () => {
+        /* Parses cleanly; the pinned `groq-js` throws `not implemented` when it
+         * runs. That is a fault in THIS process, so §22.9 assigns it 500 — the
+         * one row in the table that is not the caller's fault. */
+        const registry = registryWith({
+          id: 'evaluator-throws',
+          query: '*[_type == "article"]{"d": geo::distance(1, 2)}',
+          candidatePlan: {type: 'types', types: ['article']},
+        })
+        return post(await bootWith(registry), '/query', {
+          queryId: 'evaluator-throws',
+          params: {},
+          baseDocuments: [BASE_ARTICLE],
+        })
+      },
+    },
+    {
+      code: 'QUERY_CALLER_NOT_ALLOWED',
+      run: async () =>
+        post(await boot(await makeRoot()), '/query', {
+          queryId: 'unconstrained-star',
+          caller: 'frontend',
+          perspective: 'published',
+          params: {},
+          baseDocuments: [BASE_ARTICLE],
+        }),
+    },
+    {
+      code: 'QUERY_PERSPECTIVE_NOT_REGISTERED',
+      run: async () =>
+        post(await boot(await makeRoot()), '/query', {
+          queryId: 'article-by-id',
+          caller: 'frontend',
+          perspective: 'raw',
+          params: {id: 'article-1'},
+          baseDocuments: [BASE_ARTICLE],
+        }),
+    },
+  ]
+
+  const expectedFor = (code: string): number => {
+    const row = [...SECTION_22_9, ...EXTENSIONS].find((entry) => entry.code === code)
+    if (row === undefined) throw new Error(`no §22.9 row transcribed for ${code}`)
+    return row.status
+  }
+
+  for (const probe of REACHABLE) {
+    it(`answers ${probe.code} with ${expectedFor(probe.code)}`, async () => {
+      const result = await probe.run()
+
+      /* The provocation actually provoked what it claims to. Without this the
+       * status assertion below could pass for an unrelated refusal. */
+      expect(result.json.ok).toBe(false)
+      expect(result.json.error.code).toBe(probe.code)
+      expect(result.status).toBe(expectedFor(probe.code))
+
+      /* §5.5: a refusal never carries a result, whatever its status. */
+      expect(result.json.result).toBeUndefined()
+      expect(result.json.exact).toBeUndefined()
+    })
+  }
+
+  /**
+   * §33 "Query not registered → Return 422".
+   *
+   * `/query` answers an unregistered query with its own `UNSUPPORTED_QUERY`
+   * rather than the §22.9 `QUERY_NOT_REGISTERED` — deliberately, because the
+   * §22.5 passthrough licence belongs to the credential holder and not to this
+   * endpoint (`queries.ts`). The STATUS is the §22.9 one either way: the row is
+   * about what the caller may conclude, and "this overlay will not answer that
+   * query" is not "your request was malformed".
+   */
+  it('answers an unregistered query with 422, naming the query', async () => {
+    const server = await boot(await makeRoot())
+    const result = await post(server, '/query', {
       queryId: 'not-a-registered-query',
       query: '*[_type == "article"]{_id}',
       params: {},
       baseDocuments: [BASE_ARTICLE],
     })
-    const changed = await post(server, '/query/plan', {
-      queryId: 'article-by-id',
-      query: '*[_type == "article"] /* drifted */',
-      params: {id: 'article-1'},
-    })
 
-    const oversized = await (async () => {
-      const registry = createQueryRegistry(
-        M_LOCAL_QUERIES.map((definition) =>
-          definition.id === 'article-type-list' ? {...definition, maxCandidates: 1} : definition,
-        ),
-      )
-      const capped = await startOverlayApiServer({
-        root: await makeRoot(),
-        port: 0,
-        overlayId: OVERLAY_ID,
-        now: makeClock(),
-        watchIntervalMs: 0,
-        origins: [STUDIO_ORIGIN],
-        registry,
-      })
-      running.push(capped)
-      return post(capped, '/query', {
-        queryId: 'article-type-list',
-        query: registry.get('article-type-list').query,
-        params: {},
-        baseDocuments: [BASE_ARTICLE, {...BASE_ARTICLE, _id: 'article-2'}],
-      })
-    })()
-
-    /* The §22.9 statuses these codes carry, straight off the error class. */
-    expect(new OverlayQueryError('QUERY_CHANGED', 'x').httpStatus).toBe(422)
-    expect(new OverlayQueryError('CANDIDATE_LIMIT_EXCEEDED', 'x').httpStatus).toBe(413)
-
-    /* What the boundary actually answers: 400 for all of them. */
-    expect(changed.json.error.code).toBe('QUERY_CHANGED')
-    expect(oversized.json.error.code).toBe('CANDIDATE_LIMIT_EXCEEDED')
-    expect(unregistered.status).toBe(400)
-    expect(changed.status).toBe(400)
-    expect(oversized.status).toBe(400)
+    expect(result.status).toBe(422)
+    expect(result.json.error.code).toBe('UNSUPPORTED_QUERY')
+    expect(JSON.stringify(result.json)).toContain('not-a-registered-query')
+    expect(result.json.result).toBeUndefined()
   })
 
-  it.fails(
-    'REQUIRED (§22.9 / §33 "Candidate set too large → capacity error"): the refusal carries its §22.9 status — currently DEFECT D-3',
-    async () => {
-      const registry = createQueryRegistry(
-        M_LOCAL_QUERIES.map((definition) =>
-          definition.id === 'article-type-list' ? {...definition, maxCandidates: 1} : definition,
-        ),
-      )
-      const server = await startOverlayApiServer({
-        root: await makeRoot(),
-        port: 0,
-        overlayId: OVERLAY_ID,
-        now: makeClock(),
-        watchIntervalMs: 0,
-        origins: [STUDIO_ORIGIN],
-        registry,
-      })
-      running.push(server)
-      const result = await post(server, '/query', {
-        queryId: 'article-type-list',
-        query: registry.get('article-type-list').query,
-        params: {},
-        baseDocuments: [BASE_ARTICLE, {...BASE_ARTICLE, _id: 'article-2'}],
-      })
-      /* §22.9 assigns 413 to `CANDIDATE_LIMIT_EXCEEDED`; a capacity error that
-       * arrives as 400 is indistinguishable from a malformed request. */
-      expect(result.status).toBe(413)
-    },
-  )
+  /**
+   * `OVERLAY_STORE_UNAVAILABLE` is raised by the real store when a writer cannot
+   * take the `.locks/` critical section inside its timeout. §22.9 calls it 503
+   * — a retryable outage — and it reached the caller as 400, which tells a
+   * client to change its request rather than to try again.
+   *
+   * THE INJECTION IS A REAL LOCK, not a stub: a second server is pointed at the
+   * same root with a one-millisecond lock timeout while the first is held inside
+   * its commit by a `beforeRename` hook.
+   */
+  it('answers a store-unavailable failure with 503, not 400', async () => {
+    const root = await makeRoot()
+
+    let armed = false
+    let release = (): void => {}
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let announceHolding = (): void => {}
+    const isHolding = new Promise<void>((resolve) => {
+      announceHolding = resolve
+    })
+
+    /* Armed only after boot: the overlay's own scaffolding writes a manifest,
+     * and a hook that blocked THAT would deadlock `startOverlayApiServer`. */
+    const blocker = await boot(root, {
+      async beforeRename(info) {
+        if (!armed || !info.targetPath.endsWith('manifest.json')) return
+        armed = false
+        announceHolding()
+        await held
+      },
+    })
+    const contender = await startOverlayApiServer({
+      root,
+      port: 0,
+      overlayId: OVERLAY_ID,
+      now: makeClock(),
+      watchIntervalMs: 0,
+      origins: [STUDIO_ORIGIN],
+      /* A real wait against the real `.locks/` critical section, bounded so the
+       * test is not itself a ten-second wait. */
+      storeOptions: {lockTimeoutMs: 1, staleLockMs: 60_000},
+    })
+    running.push(contender)
+
+    armed = true
+    const blocked = post(blocker, '/commit', {
+      idempotencyKey: 'holds-the-lock',
+      kind: 'actions',
+      payload: editAction('Holding the lock'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    await isHolding
+
+    const refused = await post(contender, '/commit', {
+      idempotencyKey: 'wants-the-lock',
+      kind: 'actions',
+      payload: editAction('Wants the lock', 'article-2'),
+      baseDocuments: [{...BASE_ARTICLE, _id: 'article-2'}],
+    })
+
+    release()
+    await blocked
+
+    expect(refused.json.error.code).toBe('OVERLAY_STORE_UNAVAILABLE')
+    expect(refused.status).toBe(503)
+  })
+
+  /**
+   * COMPLETENESS. Every row §22.9 states resolves to the status it states —
+   * including `BASE_UNAVAILABLE`, which nothing in this repository raises yet.
+   * It is here so that the day something does, it arrives as a 503 rather than
+   * as the 400 this whole suite exists to abolish.
+   */
+  it('maps every §22.9 code to its stated status, including the rows nothing raises yet', () => {
+    for (const row of [...SECTION_22_9, ...EXTENSIONS]) {
+      expect(
+        overlayApiStatusForErrorCode(row.code),
+        `§22.9 assigns ${row.status} to ${row.code}`,
+      ).toBe(row.status)
+    }
+  })
+
+  /** A code the table says nothing about must not acquire a status by accident. */
+  it('claims no status for a code §22.9 does not name', () => {
+    expect(overlayApiStatusForErrorCode('OVERLAY_DOCUMENT_ALREADY_EXISTS')).toBeUndefined()
+    expect(overlayApiStatusForErrorCode('INTERNAL')).toBeUndefined()
+  })
 })
 
 /* ================================================================== *

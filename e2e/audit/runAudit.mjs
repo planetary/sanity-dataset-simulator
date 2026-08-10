@@ -3,6 +3,7 @@
  *
  *     node e2e/audit/runAudit.mjs
  *     node e2e/audit/runAudit.mjs --proxy-log=<path> --overlay-log=<path> --since=<iso>
+ *     node e2e/audit/runAudit.mjs --expect-no-upstream=0     # a Mode 1 run
  *
  * Exit code 0 is the whole gate. Every FAIL line names the predicate.
  *
@@ -51,6 +52,20 @@ if (since === undefined) {
   process.exit(2)
 }
 
+/**
+ * A12, the structural egress control, applies only to a run that had NO
+ * upstream — Mode 2, which `playwright.config.ts` selects with
+ * `E2E_MODE=local` (its default). In `live` mode the proxy is pointed at a real
+ * project and forwarding reads is the whole point, so the control is off.
+ *
+ * DERIVED FROM THE SAME VARIABLE THE CONFIG BRANCHES ON, not from a second copy
+ * of the decision, and still overridable for a hand-run log from either mode.
+ */
+const expectNoUpstream = flag(
+  'expect-no-upstream',
+  process.env.E2E_MODE === 'live' ? '0' : '1',
+) !== '0'
+
 const results = auditAll({
   proxyLogPath: flag('proxy-log', PROXY_LOG),
   overlayLogPath: flag('overlay-log', OVERLAY_LOG),
@@ -59,6 +74,7 @@ const results = auditAll({
   expectedPinnedLines: PINNED_PROXY_LOG_LINES,
   repoRoot: REPO_ROOT,
   expectCommits: flag('expect-commits', '1') !== '0',
+  expectNoUpstream,
 })
 
 const {ok, text} = formatResults(results)

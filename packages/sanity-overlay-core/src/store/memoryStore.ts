@@ -71,6 +71,7 @@ import {
   OverlayStoreCorruptError,
   OverlayWriteConflictError,
 } from './errors'
+import {assertGenuineStoreReplay} from './replay'
 import {baseSnapshotFrom, intentChecksum, intentFromRecord} from './intent'
 import type {CheckpointDocumentIntent, OverlayBaseSnapshot} from './intent'
 import type {
@@ -511,6 +512,8 @@ export class MemoryOverlayStore implements OverlayStore {
       idempotencyKey: request.idempotencyKey,
     })
     if (replayed !== null) {
+      /* …but a replay must be a replay OF THIS REQUEST. See `store/replay.ts`. */
+      assertGenuineStoreReplay(request, replayed)
       const current = this.#loadManifest()
       return {
         transaction: replayed,

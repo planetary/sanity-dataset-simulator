@@ -117,7 +117,21 @@ describe('commit — the three outcomes', () => {
     expect(result.documents?.[0]?.logicalId).toBe('article-1')
   })
 
-  it.each([500, 502, 503, 409, 400])('treats HTTP %s as degraded, not fatal', async (status) => {
+  /**
+   * 409 LEFT THIS LIST ON 2026-08-09, and it is the whole point of the change.
+   *
+   * `degraded` means "saved, loudly" — the echo has already updated the pane and
+   * the outage is assumed transient. A 409 is neither: the write did not land,
+   * and it will not land until the tab reloads, because the branch moved
+   * underneath this session. Reporting it here as `degraded` is what let a live
+   * session stop saving with no error and no toast. It is now `stale`, and the
+   * full table lives in `studio-transport-outcomes.test.ts`.
+   *
+   * 413/415/422 left for the same reason in the other direction: they are
+   * refusals about the REQUEST, and a client that treats them as transient
+   * retries the identical bytes forever.
+   */
+  it.each([500, 502, 400, 404, 429])('treats HTTP %s as degraded, not fatal', async (status) => {
     const errors: string[] = []
     const {fetch} = stubFetch(() => ({status, body: {ok: false, error: {message: 'boom'}}}))
     const transport = createOverlayTransport({
@@ -127,7 +141,25 @@ describe('commit — the three outcomes', () => {
     })
     const result = await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
     expect(result.outcome).toBe('degraded')
+    expect(result.retryable).toBe(true)
     expect(errors.join(' ')).toMatch(/boom/)
+  })
+
+  it('treats HTTP 409 as stale — not saved, and not worth retrying', async () => {
+    const errors: string[] = []
+    const {fetch} = stubFetch(() => ({
+      status: 409,
+      body: {ok: false, error: {code: 'OVERLAY_WRITE_CONFLICT', message: 'boom'}},
+    }))
+    const transport = createOverlayTransport({
+      apiUrl: 'http://localhost:3998',
+      fetch,
+      onError: (message) => errors.push(message),
+    })
+    const result = await transport.commit({kind: 'mutations', payload: []}, {idempotencyKey: 'a'})
+    expect(result.outcome).toBe('stale')
+    expect(result.retryable).toBe(false)
+    expect(errors.join(' ')).toMatch(/reload/i)
   })
 
   it('treats a thrown fetch (offline) as degraded', async () => {

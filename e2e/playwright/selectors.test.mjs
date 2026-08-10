@@ -92,6 +92,7 @@ const STUDIO_IDS = [
   'pane-footer-document-status',
   'document-pane',
   'document-panel-document-title',
+  'global-perspective-menu-button',
   'form-view',
   'string-input',
   'pt-editor',

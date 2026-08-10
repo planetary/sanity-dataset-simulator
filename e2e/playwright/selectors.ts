@@ -83,10 +83,35 @@ export const STUDIO = {
   pane: 'pane',
   paneContent: 'pane-content',
   paneHeader: 'pane-header',
+  /**
+   * The pane footer has TWO status surfaces and which one renders depends on the
+   * document, not on the settings — confirmed on the first real run.
+   *
+   * `pane-footer-document-status` is a `MotionButton` that reports *last edited
+   * / last published* and only renders once there is such a timestamp. A
+   * document the branch created has none, so on every spec in this suite it does
+   * not exist and waiting for it timed out at 20 s while the pane sat happily on
+   * `Saving...`.
+   *
+   * `pane-footer-document-status-pulse` is the one that carries the sync state
+   * (`Saving...` / `Saved`, `structureTool` dist ~7216) and is the surface these
+   * specs actually mean.
+   */
   paneFooterStatus: 'pane-footer-document-status',
+  paneFooterStatusPulse: 'pane-footer-document-status-pulse',
 
   documentPane: 'document-pane',
   documentTitle: 'document-panel-document-title',
+  /**
+   * The navbar perspective switcher (`ReleasesNav` dist).
+   *
+   * Needed because THREE of the six §21.2 actions are rendered per perspective,
+   * not per document: `useUnpublishAction` opens with
+   * `release || isDraft || … ? null : …`, so in the Drafts perspective a
+   * published document offers no Unpublish at all. Reaching it is navigation,
+   * not a workaround — see `04-document-actions.spec.ts`.
+   */
+  globalPerspectiveMenuButton: 'global-perspective-menu-button',
   formView: 'form-view',
   stringInput: 'string-input',
   ptEditor: 'pt-editor',

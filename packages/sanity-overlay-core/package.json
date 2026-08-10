@@ -3,8 +3,53 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "exports": {".": "./src/index.ts"},
+  "exports": {
+    ".": "./src/index.ts",
+    "./checksum": "./src/checksum.ts",
+    "./references": "./src/references/index.ts",
+    "./validation": "./src/validation/index.ts",
+    "./store/contract": "./src/store/contract.ts",
+    "./store/errors": "./src/store/errors.ts",
+    "./store/intent": "./src/store/intent.ts"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "prepack": "node ../../scripts/build-package.mjs",
     "test": "echo 'tested via sanity-overlay-testkit'"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/src/index.d.ts",
+        "import": "./dist/src/index.js"
+      },
+      "./checksum": {
+        "types": "./dist/src/checksum.d.ts",
+        "import": "./dist/src/checksum.js"
+      },
+      "./references": {
+        "types": "./dist/src/references/index.d.ts",
+        "import": "./dist/src/references/index.js"
+      },
+      "./validation": {
+        "types": "./dist/src/validation/index.d.ts",
+        "import": "./dist/src/validation/index.js"
+      },
+      "./store/contract": {
+        "types": "./dist/src/store/contract.d.ts",
+        "import": "./dist/src/store/contract.js"
+      },
+      "./store/errors": {
+        "types": "./dist/src/store/errors.d.ts",
+        "import": "./dist/src/store/errors.js"
+      },
+      "./store/intent": {
+        "types": "./dist/src/store/intent.d.ts",
+        "import": "./dist/src/store/intent.js"
+      }
+    }
   }
 }

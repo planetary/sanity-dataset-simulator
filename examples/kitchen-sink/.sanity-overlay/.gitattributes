@@ -1,2 +1,3 @@
-.sanity-overlay/snapshots/** linguist-generated=true
-.sanity-overlay/.runtime/** export-ignore
+snapshots/** linguist-generated=true
+.runtime/** export-ignore
+assets/blobs/** binary

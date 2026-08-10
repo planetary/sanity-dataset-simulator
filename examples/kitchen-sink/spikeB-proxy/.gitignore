@@ -1,0 +1,11 @@
+# Locally minted TLS material for the HTTP/2 listener.
+#
+# `proxy.mjs` mints a `*.localhost` certificate here on first run because
+# browsers negotiate HTTP/2 over TLS only, and without HTTP/2 Studio exhausts
+# Chromium's six-connection budget and no document pane ever loads
+# (`tlsMaterial.mjs` has the measurement and the ladder).
+#
+# NEVER COMMITTED. It is a private key, it is machine-local, and a committed one
+# would be a key every clone of this repository shares. Deleting this directory
+# is always safe: the next start mints another.
+.tls/

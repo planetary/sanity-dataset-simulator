@@ -20,6 +20,9 @@ export * from './errors'
 /* The adapter-neutral store contract — PRD §35.7, plan §8.1. */
 export * from './contract'
 
+/* The §34.6 replay guard every adapter shares — PRD §13.10. */
+export * from './replay'
+
 /* Review-facing document intent and content-addressed base snapshots — PRD §14.2. */
 export * from './intent'
 

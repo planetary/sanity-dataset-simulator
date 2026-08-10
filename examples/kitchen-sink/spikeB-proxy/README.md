@@ -45,6 +45,11 @@ PROXY_BLOCK_WRITES=1 node examples/kitchen-sink/spikeB-proxy/proxy.mjs
 | `PROXY_REWRITE_COOKIES` | on | Strips `Domain=` and `Secure` from upstream `Set-Cookie`. Best-effort only — see "Cookies". |
 | `PROXY_LOG` | `./proxy-log.jsonl` | JSONL request log. |
 | `PROXY_VERBOSE` | off | Mirror each log line to stderr. |
+| `PROXY_TLS` | **on** | The HTTP/2 listener, on the same port. `0` disables it — see "HTTP/2" for what that costs in a browser. |
+| `PROXY_TLS_DIR` | `./.tls` (gitignored) | Where a minted certificate is cached. |
+| `PROXY_TLS_CERT` / `PROXY_TLS_KEY` | unset | Use a certificate you already have instead of minting one. |
+| `PROXY_TLS_SOURCE` | `auto` | Pin a rung of the certificate ladder: `mkcert`, `self-signed`, `explicit`. |
+| `PROXY_TLS_NAMES` | unset | Extra certificate subject names, comma-separated. |
 
 ### Request log
 
@@ -55,6 +60,12 @@ One JSONL line per request, written synchronously so a `SIGTERM` mid-run cannot 
 ```
 
 `path` excludes the query string (GROQ queries and tokens are not logged).
+
+A request served over HTTP/2 carries one extra field, `"h2": true`, and is **otherwise
+identical** — same `disposition`, same `gate`/`refusal`/`upstream`, same `blocked`. The field is
+omitted on HTTP/1.1, so every record the network audit already knows how to read is byte-for-byte
+unchanged; it exists so a reader can tell which listener served a request without having to take
+"the browser really used h2" on trust.
 
 ## Write guard (`PROXY_BLOCK_WRITES=1`) — **default-deny**
 
@@ -96,6 +107,126 @@ Consequences worth knowing before you debug a 403:
 The guard is transport-independent: it runs on the `upgrade` path too (see below), because
 otherwise two extra request headers turn any write into an unguarded tunnel.
 
+## HTTP/2 — the difference between "runs" and "usable in a browser"
+
+### The defect
+
+Chromium allows **six concurrent HTTP/1.1 connections per origin.** That is not a tunable:
+`--max-connections-per-host` was tried, both ways, and has no effect. `sanity@6.8.0` opens, against
+the data host, six long-lived listeners and holds every one of them open:
+
+```
+sanity.studio.releases.listen
+sanity.studio.preview.global
+sanity.studio.document.pair.listen
+sanity.studio.preview.observe-document-set.listen   (versionOf)
+sanity.studio.preview.observe-document-set.listen   (canvas.link)
+sanity.studio.listen-search-query
+```
+
+Six. The pool is then empty, and the **seventh** request — the document pair's initial snapshot,
+`GET /data/doc/<ds>/<id>,drafts.<id>` — is queued and never issued. `editState` never becomes
+ready, the pane sits on *Loading document…* and then flips to a read-only *reconnecting* form, no
+keystroke can be typed, and no `/commit` is ever sent.
+
+Measured, in a real browser, against this proxy:
+`examples/kitchen-sink/spikeB-proxy/proxy-h2.browser.test.mjs`. One page, twelve `EventSource`s.
+Over HTTP/1.1 six reach `welcome`, the server accepts exactly six TCP connections, the upstream
+holds exactly six streams, and a follow-up `fetch` does not resolve inside five seconds. Over the
+HTTP/2 listener all twelve open **as streams on one session**, and the follow-up answers.
+
+```bash
+node --test examples/kitchen-sink/spikeB-proxy/proxy-h2.browser.test.mjs
+```
+
+Real Content Lake is HTTP/2, where those six listeners are six streams on one connection, so the
+limit never bites there. **A proxy standing in for it over HTTP/1.1 is not a faithful stand-in: it
+imposes a ceiling the real service does not have.**
+
+### Additive, and on the same port
+
+`https://` and `http://` are both served on `PROXY_PORT`. The first byte of a TLS ClientHello is
+`0x16` and no HTTP method starts that way, so the listener peeks one byte, pushes it back, and
+hands the socket to whichever of the two servers owns that framing. The peek does nothing else — it
+never parses, classifies, logs or answers — so a request reaches the guard and the log exactly as
+it was sent.
+
+Both servers share **one** set of handlers (`createProxyCore`), so there is no second code path to
+forget the write guard in. Everything transport-dependent is decided per request, from the
+request, which is also why the TLS listener's own HTTP/1.1 fallback behaves like HTTP/1.1.
+
+- **Nothing that works today stops working.** `curl http://localhost:3999/vX/ping`, the CLI, every
+  probe in the checklist below and `test/proxy-*.test.ts` all keep the address they already use.
+
+  The E2E harness used to reach this proxy through its own TLS+h2 terminator,
+  `e2e/harness/dataPlaneFront.mjs`, because the proxy spoke only HTTP/1.1 and Chromium's
+  six-connections-per-origin ceiling then starved the document pane's first snapshot. That front
+  was **deleted** once this listener landed: it was redundant, and it sat between the browser and
+  the thing under test, which is a poor place for anything in a suite whose purpose is evidence.
+  The harness now points `apiHost` straight at `https://localhost:3999`.
+- **The browser origin differs from today's by the scheme only** — `https://` instead of `http://`,
+  same host, same port. A second port would have been a second thing to configure, document and
+  collide with, for no gain.
+
+### The certificate, and the one step nobody can take away for you
+
+Browsers negotiate HTTP/2 over TLS and ALPN only — there is no h2c in any browser. So the listener
+needs a certificate for the name `@sanity/client` actually asks for, which is
+`<projectId>.localhost`. The proxy walks a ladder (`tlsMaterial.mjs`) and **prints which rung it
+landed on, and what you still owe, at startup**:
+
+| Rung | When | Browser trust |
+|---|---|---|
+| `explicit` | `PROXY_TLS_CERT` + `PROXY_TLS_KEY` are set | yours to know |
+| `mkcert` | `mkcert` is on PATH | **trusted, no interstitial** — provided `mkcert -install` has been run once |
+| `self-signed` | only `openssl` is available | **not trusted** |
+| `none` | neither tool | the proxy refuses to start |
+
+**Say it plainly: with a self-signed certificate there is a manual step, and it is not the
+interstitial you are thinking of.** Studio's requests to the data host are *cross-origin
+subresource* requests from `http://localhost:3333`, and a cross-origin request to an
+untrusted-certificate origin **fails silently — there is no interstitial to click**. You must first
+visit `https://<projectId>.localhost:3999` in a tab and accept the certificate there, and repeat
+that whenever the certificate is regenerated.
+
+The way to not have that step is:
+
+```bash
+brew install mkcert   # or your platform's equivalent
+mkcert -install       # ONCE. Asks for your password; adds mkcert's root to the
+                      # system and Firefox trust stores.
+```
+
+The proxy will **never run `mkcert -install` for you.** It writes to your system trust store and
+prompts for a password; a proxy that did that unasked would be doing something nobody typed. It
+detects the situation and prints the command instead. (On macOS it verifies the root against the
+keychain; on other platforms it cannot cheaply prove trust and says `UNVERIFIED` rather than
+guessing in the comfortable direction.)
+
+The certificate covers `localhost`, `*.localhost`, **`<projectId>.localhost` explicitly**,
+`127.0.0.1` and `::1`. The explicit name is the load-bearing one: `*.localhost` is a wildcard whose
+parent is a single label, which verifiers decline — OpenSSL's `X509_check_host` refuses it even
+with `X509_CHECK_FLAG_SINGLE_LABEL_SUBDOMAINS` (measured; `test/proxy-h2.test.ts` asserts the exact
+name and would have passed vacuously on the wildcard alone).
+
+A certificate that cannot be produced is a **hard startup failure**, not a warning. A proxy that
+quietly served HTTP/1.1 only would start, look healthy, and be unusable at the seventh concurrent
+request — which is the whole defect. `PROXY_TLS=0` is how you say you meant cleartext.
+
+### What the new transport changed, path by path
+
+| Path | Verdict on h2 |
+|---|---|
+| Plain request | Same handler. h2 **pseudo-headers are stripped** before the upstream request — forwarded verbatim, `:method`/`:path`/`:scheme`/`:authority` make `http.request` throw `ERR_INVALID_HTTP_TOKEN`. |
+| Project-host derivation | Now reads **`:authority`**, falling back to `Host`. HTTP/2 has no `Host` header (RFC 9113 §8.3.1); a proxy that only read `req.headers.host` would silently stop deriving `<projectId>.api.sanity.io` the moment a browser negotiated h2. |
+| Preflight | Unchanged. Same allowlist, same advertised method set, same `Vary`. |
+| SSE | `Connection: keep-alive` is **not** emitted — h2 has no such header and Node throws `ERR_HTTP2_INVALID_CONNECTION_HEADERS` rather than send one, which would have turned every listener into a 500. `res.socket.setNoDelay()` is **not** called either: on an h2 stream that Proxy throws `ERR_HTTP2_NO_SOCKET_MANIPULATION`, and the session has already disabled Nagle. `flushHeaders`, `no-transform` and the manual chunk pump are unchanged. A last-moment filter drops connection-specific headers from every h2 response, so no future edit can reintroduce one. |
+| WebSocket upgrade | RFC 9113 §8.1 **deleted** `Upgrade:`. h2's replacement is RFC 8441 Extended CONNECT, which a server must opt into by advertising `SETTINGS_ENABLE_CONNECT_PROTOCOL`. **This proxy deliberately does not**, so Chrome does what it does against any origin that has not: it opens `new WebSocket()` on a separate HTTP/1.1 TLS connection, which the same listener serves (`allowHTTP1: true`) and which arrives at the same `upgrade` handler. That is the better answer, not a workaround — `Upgrade:` is the shape the write guard, the frame guard and the 101 relay all understand, and WebSockets have their own far larger per-host budget, so this leg was never the ceiling. |
+| 101 relay | Unchanged, byte-for-byte, and the write guard still runs before the upstream socket is dialled. |
+| Upstream dial | Unchanged. Downstream framing has no bearing on the hop to Content Lake, which is still HTTP/1.1 — and `upstreamDialSpec` still pins `ALPNProtocols: ['http/1.1']` for the upgrade tunnel, because RFC 9113 removed the mechanism those bytes describe. |
+| `Set-Cookie` | The one genuinely transport-dependent rewrite. `Domain=` is stripped on both legs. **`Secure` is now stripped only on the cleartext leg.** Over TLS, keeping it is what makes the cookie storable at all: Sanity's session cookie is `SameSite=None`, and Chrome rejects `SameSite=None` without `Secure`. Each leg gets the cookie it can actually store, and whichever leg set it is the leg that can send it back. |
+| The log | Every h2 request is recorded exactly as an h1 one, plus `"h2": true`. `test/proxy-h2.test.ts` runs the **real** `e2e/audit/predicates.mjs` over a log written entirely by the h2 path and asserts A0–A4, A10 and A11 pass. |
+
 ## Streaming (the load-bearing requirement)
 
 Per `listener-event-shapes.md`, `@sanity/client` 7 consumes `/data/listen` SSE over `fetch`,
@@ -103,7 +234,9 @@ not `EventSource`. The proxy therefore:
 
 - pumps chunks manually (`upstreamRes.on('data') → res.write()`) rather than buffering, with
   explicit backpressure (`pause`/`drain`/`resume`);
-- calls `res.flushHeaders()` and `socket.setNoDelay(true)` on both sockets for `text/event-stream`;
+- calls `res.flushHeaders()` and `socket.setNoDelay(true)` on both sockets for `text/event-stream`
+  — except on an HTTP/2 stream, where `res.socket` is a Proxy that throws on `setNoDelay` and the
+  session has already disabled Nagle (see "HTTP/2");
 - strips `Accept-Encoding` on `/data/listen` requests so no gzip/br window can hold events back;
 - forces `Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`;
 - disables all timeouts (`server.requestTimeout = 0`, `req.setTimeout(0)`) — Studio holds
@@ -122,6 +255,13 @@ session). Without an `upgrade` handler Node clears `req.upgrade` and replays the
 ordinary `request` path, where the hop-by-hop `Upgrade`/`Connection` headers are stripped — so
 Sanity answers a plain 404, Studio logs *"No activity within 45000 milliseconds. Reconnecting."*
 and every pane sits on *"Loading document…"*.
+
+**HTTP/2 changed nothing here, and that is the answer.** RFC 9113 §8.1 deleted the `Upgrade:`
+mechanism outright; its replacement is RFC 8441 Extended CONNECT, which a server must opt into by
+advertising `SETTINGS_ENABLE_CONNECT_PROTOCOL`. This proxy deliberately does not advertise it, so
+Chrome opens `new WebSocket()` on a separate HTTP/1.1 TLS connection — served by the same listener
+(`allowHTTP1: true`) and delivered to the same handler below. Extended CONNECT would need a frame
+guard that speaks it; until then, not advertising it is what keeps this handler true.
 
 The handler dials upstream raw (`net`/`tls`, `ALPNProtocols: ['http/1.1']` so ALPN can never pick
 h2), replays the request line and headers verbatim, writes any bytes the client pipelined behind
@@ -224,7 +364,11 @@ log line, not a silent write.
 // examples/kitchen-sink/sanity.config.ts — NOT applied by this spike
 export default defineConfig({
   // ...
-  apiHost: 'http://localhost:3999',
+  // `https:`, not `http:`. Same host, same port — the proxy serves both framings
+  // on PROXY_PORT — but only the TLS one negotiates HTTP/2, and only HTTP/2
+  // survives past the sixth concurrent listener stream. See "HTTP/2" above,
+  // including the one-time certificate step if you are not using mkcert.
+  apiHost: 'https://localhost:3999',
 })
 ```
 
@@ -261,8 +405,9 @@ Bare `localhost:3999` also works (falls back to `SANITY_API_HOST`), which covers
   Studio traffic through the proxy with zero change to `apiHost` in `defineConfig`, and is the
   cleanest way to combine the two tracks.
 - **Transparent MITM.** `/etc/hosts` entry for `b1n03q3z.api.sanity.io` → `127.0.0.1` plus a
-  locally-trusted TLS cert on :443. Needs no Studio config at all, but requires TLS termination
-  (out of scope for a `node:`-builtins-only spike) and root to bind :443.
+  locally-trusted TLS cert on :443. Needs no Studio config at all, and TLS termination is no longer
+  the obstacle it was — the proxy terminates TLS itself now — but it still needs root to bind :443
+  and a certificate for a name you do not own.
 
 ## Known obstacles for Studio-through-proxy
 
@@ -280,8 +425,17 @@ localhost origin in a way that survives:
 **Consequence: `withCredentials` cookie auth does not work through an http:// localhost
 apiHost.** Token auth via `Authorization: Bearer` does — verified end to end below. Studio dev
 on localhost already uses a localStorage token for the data plane, so this is likely survivable,
-but it must be confirmed in a browser run. If cookie auth turns out to be required, Track B
-needs local TLS (a trusted cert on `https://b1n03q3z.localhost`), not a code change.
+but it must be confirmed in a browser run.
+
+> **This paragraph's own conclusion is now actionable, and has been acted on.** It ends "if cookie
+> auth turns out to be required, Track B needs local TLS (a trusted cert on
+> `https://b1n03q3z.localhost`), not a code change" — and local TLS is exactly what the HTTP/2
+> listener brought, for an unrelated reason. So `rewriteSetCookie` no longer strips `Secure` on the
+> TLS leg: over `https://<projectId>.localhost:3999` the `SameSite=None; Secure` combination is
+> reachable and the cookie is storable. It is still stripped on the cleartext leg, where a `Secure`
+> cookie would simply be discarded. This is **not** claimed as verified cookie auth — it removes
+> the blocker this section identified; whether the rest of the login flow works through the proxy
+> is still unexercised (see "Other things to watch in a browser run").
 
 Note also `@sanity/client`'s own config normalisation: when a token **and** `withCredentials`
 are both set it prints a warning and forces `withCredentials = false`; and a token on a
@@ -435,8 +589,14 @@ defined over one kind or the other. Read this first or the counts will not mean 
 
 | kind | discriminator | `method` | fields written (exhaustive) |
 |---|---|---|---|
-| **request** | `"frame"` absent | a real HTTP method | `at`, `method`, `path`, `status`, `ms`, `blocked`, and `upgrade` only on an upgrade |
+| **request** | `"frame"` absent | a real HTTP method | `at`, `method`, `path`, `status`, `ms`, `blocked`, `disposition` (+ `gate`/`refusal` or `upstream`), `upgrade` only on an upgrade, `h2` only on an HTTP/2 stream |
 | **frame** | `"frame":true` | always `"WS"` | the above plus `opcode`, `rpc`, `rpcId`, `wouldBlock`, `reason` |
+
+`h2` is **additive and omitted on HTTP/1.1**, so every record in the pinned corpora — which predate
+the HTTP/2 listener — is unchanged, and no predicate needs to know about it. It is present so a
+reader can tell the two listeners apart; nothing else about an h2 record differs, which
+`test/proxy-h2.test.ts` pins by running `e2e/audit/predicates.mjs` over a log written entirely by
+the h2 path.
 
 Three consequences that will bite a naive grep:
 

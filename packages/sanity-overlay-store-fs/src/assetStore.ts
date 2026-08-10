@@ -54,7 +54,7 @@ import {
   serialize,
   sha256Hex,
   synthesizeAssetDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import type {
   OverlayActor,
   OverlayAssetProvider,
@@ -62,7 +62,7 @@ import type {
   OverlayFormatVersion,
   OverlayState,
   SanityDocument,
-} from '../../sanity-overlay-core/src/index'
+} from 'sanity-overlay-core'
 import {GITATTRIBUTES_CONTENT, GITATTRIBUTES_FILE, OverlayLayout, TEMP_PREFIX} from './layout'
 
 /** Injected clock, exactly as {@link FsOverlayStore} takes one (PRD §14.3). */

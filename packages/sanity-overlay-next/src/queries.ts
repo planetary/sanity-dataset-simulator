@@ -35,7 +35,7 @@ import {
   evaluateOverlayQuery,
   planCandidateRequests,
   queryTextChecksum,
-} from '../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
 import type {
   OverlayQueryDefinition,
   OverlayQueryRegistry,
@@ -43,7 +43,7 @@ import type {
   QueryCaller,
   QueryDocument,
   QueryPerspective,
-} from '../../sanity-overlay-query/src/index'
+} from 'sanity-overlay-query'
 import {OverlayApiError} from './errors'
 
 type Rec = Record<string, unknown>
@@ -177,7 +177,14 @@ export async function evaluateRegisteredQuery(
    * passthrough licence belongs to the caller — it holds the credential and can
    * ask the base dataset itself — and is not this endpoint's to grant. */
   if (def === null) {
-    throw new OverlayApiError(400, 'UNSUPPORTED_QUERY', unregisteredReason(request))
+    /* 422, which is the status §22.9 gives `QUERY_NOT_REGISTERED` and §33 gives
+     * the "Query not registered" row. The CODE stays this endpoint's own — see
+     * the module header on why the §22.5 passthrough licence is the caller's —
+     * but the status is about what the caller may CONCLUDE, and "this overlay
+     * will not answer that query" is not "your request was malformed". As a 400
+     * it was indistinguishable from a bad payload, so a client could not tell a
+     * registration it must fix from a request it must fix. */
+    throw new OverlayApiError(422, 'UNSUPPORTED_QUERY', unregisteredReason(request))
   }
 
   const evaluated = await evaluateOverlayQuery({

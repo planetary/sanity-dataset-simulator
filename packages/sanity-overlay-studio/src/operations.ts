@@ -23,7 +23,7 @@
  *   - and how to read the overlay's answer without mistaking silence for success.
  */
 
-import {REBASE_MODES, toPublishedId, type RebaseMode} from '../../sanity-overlay-core/src/index'
+import {REBASE_MODES, toPublishedId, type RebaseMode} from 'sanity-overlay-core'
 
 import type {OverlayConflictReport} from './conflicts'
 import type {ConflictResolutionCommand} from './conflictPanel'

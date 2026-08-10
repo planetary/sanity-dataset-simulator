@@ -5,7 +5,7 @@
  * ancestors (PRD §13.3): collapsing them would attribute a draft-only edit to
  * the published document. The diff engine itself is `../diff.ts`.
  */
-import {toPublishedId} from '../../../sanity-overlay-core/src/index'
+import {toPublishedId} from 'sanity-overlay-core'
 import {EXIT} from '../exit'
 import {diffValues, type DiffEntry} from '../diff'
 import {loadRecords, openOverlay, requireHead, sortedHeads} from '../overlay'

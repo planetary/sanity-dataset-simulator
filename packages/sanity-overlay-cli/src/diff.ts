@@ -18,8 +18,8 @@
  * change on every write by construction (PRD §13.9), so including them would
  * bury the semantic change under noise. `--system` shows them.
  */
-import {isKeyedArray, keyMap, valueEquals} from '../../sanity-overlay-core/src/index'
-import type {OverlayPath, OverlayPathSegment} from '../../sanity-overlay-core/src/index'
+import {isKeyedArray, keyMap, valueEquals} from 'sanity-overlay-core'
+import type {OverlayPath, OverlayPathSegment} from 'sanity-overlay-core'
 import {formatPath} from './render'
 
 export type DiffKind = 'added' | 'removed' | 'changed'

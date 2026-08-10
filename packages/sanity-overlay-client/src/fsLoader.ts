@@ -16,9 +16,9 @@
  */
 import {watch as fsWatch, type FSWatcher} from 'node:fs'
 import {isAbsolute, join, resolve} from 'node:path'
-import {isOverlayStoreError} from '../../sanity-overlay-core/src/index'
-import {FsOverlayStore, OVERLAY_DIR} from '../../sanity-overlay-store-fs/src/index'
-import type {OverlayRecordMap} from '../../sanity-overlay-core/src/index'
+import {isOverlayStoreError} from 'sanity-overlay-core'
+import {FsOverlayStore, OVERLAY_DIR} from 'sanity-overlay-store-fs'
+import type {OverlayRecordMap} from 'sanity-overlay-core'
 import type {OverlayStateLoader, OverlayStateSnapshot} from './types'
 
 export interface FsOverlayStateLoaderOptions {

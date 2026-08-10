@@ -164,6 +164,7 @@ function transportDouble(): OverlayTransport {
 interface Harness {
   real: SanityClient
   wrapped: SanityClient
+  echo: ReturnType<typeof createOverlayEcho>
   errors: string[]
 }
 
@@ -175,12 +176,13 @@ function localConfig(): ClientConfig {
 function harness(): Harness {
   const errors: string[] = []
   const real = createClient(localConfig())
+  const echo = createOverlayEcho({onError: (message) => errors.push(message)})
   const wrapped = wrapWithOverlay(real, {
-    echo: createOverlayEcho({onError: (message) => errors.push(message)}),
+    echo,
     transport: transportDouble(),
     onError: (message) => errors.push(message),
   })
-  return {real, wrapped, errors}
+  return {real, wrapped, echo, errors}
 }
 
 function observableClientOf(client: SanityClient): Rec {
@@ -459,7 +461,17 @@ describe('a piped chain delivers through the facade', () => {
    * listener is not a real Observable, the pane sits at "Saving…" forever.
    */
   it('the local echo channel reaches a piped pair listener', async () => {
-    const {wrapped} = harness()
+    const {wrapped, echo} = harness()
+    /*
+     * The document has to be one the echo can spell a frame for, and that is a
+     * precondition rather than scaffolding. `[{patch: …}]` fails
+     * `@sanity/mutator`'s `appliesToMissingDocument()`, so a patch frame at an
+     * address the pane holds no revision for would be buffered for ever instead
+     * of applied — the echo now refuses to emit one and asks the pane to re-read
+     * instead (`studio-echo-refusals.test.ts`). This test is about the OBSERVABLE
+     * plumbing, so it uses a document where the frame exists.
+     */
+    echo.seedFromResult({_id: 'drafts.article-01', _type: 'article', _rev: 'lake-1'}, true)
     const listen = observableClientOf(wrapped).listen as (
       query: string,
       params: Rec,
