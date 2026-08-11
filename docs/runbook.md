@@ -558,11 +558,5 @@ node packages/sanity-overlay-cli/bin/sanity-overlay.mjs import --root <dir> --bu
 - **Vercel preview / Blob mode.** `OVERLAY_MODE=blob` throws at startup. Gates C and F are not started.
 - **A deployed enforcement layer.** The proxy is a local process. No preview auth, no CSRF, no session, no HMAC.
 - **Alerting and observability.** PRD §38.3 lists *"Observability and alerts exist"*; nothing does. The signals available are the CLI's exit codes, the proxy JSONL log, and the overlay server's stdout.
-- **Branch assets.** `client.assets.upload` is refused; local-only upload is unbuilt. The asset store and delivery code exist and have never been exercised in a browser.
-- **The browser E2E suite.** `@playwright/test` is not installed and `playwright.config.ts` cannot be imported. What runs today:
-  ```bash
-  node --test e2e/audit/predicates.test.mjs
-  node --test e2e/playwright/selectors.test.mjs
-  node e2e/audit/runAudit.mjs
-  ```
+- **Branch assets in a browser.** The local upload path exists (bytes land under `.sanity-overlay/`, synthetic asset documents resolve) but no browser pass has exercised it.
 - **Overlay revision history.** `sanity-overlay history` reads the local transaction log and prints `history NOT RETAINED` when it is absent. It is not Sanity's History and it is **not durable** — checkpoints drop it, `cleanup` prunes it.

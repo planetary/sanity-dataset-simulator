@@ -1,11 +1,11 @@
 # `e2e/` — the browser suite roadmap Phase 5 exits on
 
-> **Status: written, not yet run.** Playwright is not installed in this
-> workspace and installs are permission-blocked. Everything that does **not**
-> need Playwright runs today and is green — see [What runs
-> today](#what-runs-today). Everything that drives a browser is written against
-> selectors verified in the pinned `sanity@6.8.0` build, and is **unrun**. This
-> file says which is which, per scenario, without rounding up.
+> **Status: runs locally, green.** `@playwright/test` is installed at the
+> workspace root and the local suite passed on 2026-08-10 (recorded in
+> `e2e/.artifacts/run/`). It is **not in CI** — every browser assertion is a
+> manual run. The live suite (`E2E_MODE=live`) needs the repo `.env`
+> credentials and skips without them. Scenario-by-scenario coverage and the
+> deliberate gaps are listed below, without rounding up.
 
 ## Install
 
