@@ -38,12 +38,16 @@ name: base drift scan
 # and REMOVING `--allow-skip base-drift`. Nothing else changes.
 
 on:
-  schedule:
-    # PRD §16.6 default cadence: every 6 hours. Asserted by
-    # test/ci-repo-gates.test.ts, so this expression cannot drift from the spec
-    # without something going red.
-    - cron: '0 */6 * * *'
-  # So the scan can be run on demand while the schedule is the routine path.
+  # SCHEDULE DEFERRED — owner decision, 2026-08-11: no cron runs on GitHub
+  # until CI is triaged and re-enabled. The PRD §16.6 cadence is preserved
+  # below, commented, so re-enabling is an uncomment — and the gate in
+  # test/ci-repo-gates.test.ts pins THIS deferred shape (dispatch-only, cadence
+  # recorded) so neither silent re-activation nor silent loss of the cadence
+  # can happen without something going red.
+  #
+  #   schedule:
+  #     - cron: '0 */6 * * *'   # PRD §16.6 default cadence: every 6 hours
+  #
   # Deliberately NOT `pull_request`: this workflow is allowed to hold a secret
   # (see the `workflow-secrets` gate in ci.yml), and a fork-reachable trigger
   # would put that secret one pull request away from fork-authored code.

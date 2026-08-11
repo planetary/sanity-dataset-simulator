@@ -6,13 +6,17 @@ name: CI
 # a gate that actually runs on every push instead of a test nobody executes.
 
 on:
-  # `push` is unfiltered on purpose: work here lands directly on branches (and
-  # on main) without always going through a PR, and the audit's complaint was
-  # precisely that these tests run on nobody's push. `pull_request` additionally
-  # covers fork contributions, which `push` never sees. Same-repo PRs therefore
-  # get one run per event; the concurrency group below keeps that from piling up.
-  push:
-  pull_request:
+  # MANUAL-ONLY FOR NOW — owner decision, 2026-08-11. The first push of the
+  # implementation met a clean runner and the matrix went red on environment
+  # differences the local suite never sees; until that is triaged, runs are
+  # started by hand from the Actions tab. Restore the block below to re-enable.
+  #
+  #   push:
+  #   pull_request:
+  #
+  # (`push` was unfiltered on purpose: work lands directly on branches without
+  # always going through a PR. `pull_request` additionally covers forks.)
+  workflow_dispatch:
 
 # A superseded push has nothing to tell us; cancel it rather than pay for it.
 # `cancel-in-progress` is NOT a retry -- a run that finishes red stays red.

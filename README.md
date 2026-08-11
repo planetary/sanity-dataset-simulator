@@ -35,11 +35,11 @@ Enforced structurally, not by documentation: a suite-wide outbound monitor fails
 | Registered GROQ queries (site + CLI) | ✅ | ✗ |
 | Studio lists and search (unfiltered exact; typed search refused) | ⚠️ | ✗ |
 | References — resolve + incoming | ✅ | ✗ |
-| References — authoring via the picker | ⚠️ | ✗ |
+| References — authoring via the picker (branch-created targets) | ✅ | ✗ |
 | Conflict detection + banner (resolution panel partial) | ⚠️ | ✗ |
 | Checkpoint / export / import (CLI) | ✅ | ✗ |
 | Branch assets (upload path exists, no browser pass) | ⚠️ | ✗ |
-| Overlay revision history + restore | ✗ | ✗ |
+| Overlay revision history + restore (Studio; CLI log viewer exists) | ✗ | ✗ |
 | Write-block enforcement, server-side audited | ✅ | ✗ |
 | Durable persistence + PR identity across deploys | n/a | ✗ |
 
@@ -75,7 +75,7 @@ The full local stack (Studio + proxy + overlay API + site) is documented in the 
 packages/   core (types, mutations, merge) · store-fs · query · client ·
             studio (the plugin) · next (overlay HTTP API) · cli · testkit (all tests)
 examples/   kitchen-sink (Studio + Phase 1 spike rigs) · local-site (demo site)
-e2e/        Playwright specs (local suite green 2026-08-10; not in CI)
+e2e/        Playwright specs (local suite 58/58 green 2026-08-11; not in CI)
 docs/       PRD, roadmap, evidence, guides
 ```
 

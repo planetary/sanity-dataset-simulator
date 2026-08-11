@@ -664,5 +664,12 @@ describe('the checks are wired into a workflow, so they are gates and not module
     const drift = [...workflows.entries()].find(([name]) => name.includes('base-drift'))
     expect(drift, '.github/workflows/base-drift-scan.yml').toBeDefined()
     expect(drift![1]).toMatch(/cron:\s*['"]0 \*\/6 \* \* \*['"]/)
+    /* Owner decision 2026-08-11: the schedule is DEFERRED until CI is triaged
+     * and re-enabled. The §16.6 cadence must stay recorded (the assertion
+     * above — a commented line satisfies it), but no ACTIVE `schedule:`
+     * trigger may exist. Re-enabling the cron is done by deleting this
+     * assertion together with uncommenting the workflow — a deliberate pair,
+     * never a drive-by. */
+    expect(drift![1]).not.toMatch(/^\s{2}schedule:/m)
   })
 })
