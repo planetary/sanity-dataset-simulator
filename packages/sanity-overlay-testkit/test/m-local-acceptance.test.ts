@@ -342,13 +342,9 @@ describe('§2 the evidence named by each verdict is really there', () => {
     )
     expect(tracked.size).toBeGreaterThan(100)
 
-    /** Added 2026-08-10, not yet committed. Empty this when the batch lands. */
-    const NEW_IN_THIS_TREE: readonly string[] = [
-      'e2e/specs/local/09-branch-visibility.spec.ts',
-      'packages/sanity-overlay-testkit/test/site-branch-tombstone-over-base.test.ts',
-      'packages/sanity-overlay-testkit/test/studio-reference-validation.test.ts',
-      'packages/sanity-overlay-testkit/test/studio-doc-existence.test.ts',
-    ]
+    /** Added 2026-08-10, not yet committed. Empty this when the batch lands.
+     * Emptied 2026-08-11: the batch landed in f797062. */
+    const NEW_IN_THIS_TREE: readonly string[] = []
 
     const untracked = M_LOCAL_ACCEPTANCE.flatMap((entry) =>
       entry.measuredBy.filter((relative) => !tracked.has(relative)),

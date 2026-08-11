@@ -195,17 +195,38 @@ function mergeVersion(
   const record = request.record!
   const local = localVersionOf(record, version)!
   const baseBlock = record.base
-  const ancestor =
-    version === 'draft'
-      ? (baseBlock?.draft?.snapshot ?? baseBlock?.published?.snapshot ?? null)
-      : (baseBlock?.published?.snapshot ?? null)
-  const currentBase =
-    version === 'draft' ? (request.base.draft ?? request.base.published) : request.base.published
+
+  /* §18.2: a draft anchored on the branch's own published layer stacks on THAT
+   * resolution. Using the base draft as its current base would let untouched
+   * fields inherit content the branch already published over (observed live
+   * 2026-08-11: an edit after publish resolved to the stale upstream draft). */
+  const draftOverLocalPublished =
+    version === 'draft' &&
+    local.ancestorKind === 'local-published' &&
+    record.local.published !== null &&
+    !record.local.publishedTombstone
+
+  let ancestor: SanityDocument | null
+  let currentBase: SanityDocument | null
+  if (draftOverLocalPublished) {
+    ancestor = record.local.published!.materialized
+    currentBase = mergeVersion(request, perspective, 'published', 'local-published').document
+  } else {
+    ancestor =
+      version === 'draft'
+        ? (baseBlock?.draft?.snapshot ?? baseBlock?.published?.snapshot ?? null)
+        : (baseBlock?.published?.snapshot ?? null)
+    currentBase =
+      version === 'draft' ? (request.base.draft ?? request.base.published) : request.base.published
+  }
 
   const extra: OverlayConflict[] = []
   // §17.4 `BASE_DRAFT_DELETED`: the base draft this local draft was anchored to is
-  // gone, the local draft wins, and §18.2's fallback chain still applies.
+  // gone, the local draft wins, and §18.2's fallback chain still applies. A draft
+  // stacked on the branch's own published layer superseded the base draft, so its
+  // later deletion upstream is not a conflict for it.
   if (
+    !draftOverLocalPublished &&
     version === 'draft' &&
     baseBlock?.draft != null &&
     request.base.draft === null &&

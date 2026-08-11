@@ -180,6 +180,12 @@ const READ_ROOT_PREFIXES = [
   '/socket', //                   x38 — the presence WebSocket upgrade (a GET)
   '/schedules', //                x3  — scheduled-publishing list; POST/PUT/DELETE
   //                                    on the same path are writes and are blocked
+  '/auth', //                     login-screen reads: GET /auth/providers (the first
+  //                                    request an unauthenticated Studio makes) and
+  //                                    GET /auth/fetch?sid=… (login completion).
+  //                                    Absent from every recorded session because they
+  //                                    all carried a session already; observed live
+  //                                    2026-08-11. POST /auth/logout stays a write.
   '/users', //                    x12 — /users/me and /users/me/keyvalue/<k> reads
   '/projects', //                 x21 — project metadata, grants, dataset list,
   //                                    user-applications

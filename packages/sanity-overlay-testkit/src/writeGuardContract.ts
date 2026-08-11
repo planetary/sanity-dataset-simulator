@@ -613,6 +613,19 @@ const READ_PASSTHROUGH: WriteGuardCase[] = (
       '/v2025-02-19/agent/oTu7RImef/bundles/mine/listen',
       'the real agent bundle listener shape (x3): /agent/<id>/bundles/mine/listen',
     ],
+    [
+      'GET',
+      '/v2025-02-19/auth/providers',
+      'login-screen provider list — the first request an UNAUTHENTICATED Studio makes. ' +
+        'Absent from every recorded session because they all carried a session already; ' +
+        'observed live 2026-08-11 when the login screen could not render through the proxy.',
+    ],
+    [
+      'GET',
+      '/v2025-02-19/auth/fetch',
+      'login completion — exchanges the sid returned by the accounts flow for a session. ' +
+        'GET-only; the logout POST on this namespace stays a write and stays blocked.',
+    ],
   ] as [string, string, string][]
 ).map(([method, url, why]) => ({
   group: 'read-passthrough' as const,

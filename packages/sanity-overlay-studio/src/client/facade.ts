@@ -434,9 +434,14 @@ const PAIR_QUERY_RE = /^\*\[\s*_id\s+in\s+\$ids\s*\]$/
  * shown. `runtime.ts` now feeds this from `/state` as well.
  *
  * A TOMBSTONE IS NOT AN ABSENT BODY. `draft: null` with `draftTombstone: true`
- * means the branch removed that address; `draft: null` without it means the
- * branch simply holds no local draft and base is the honest answer. Storing both
- * as "forget this id" put deleted documents back in front of the editor.
+ * means the branch removed that address. `draft: null` WITHOUT it is two states
+ * the wire spells identically (PRD §18.2): if the row carries no published body
+ * either, the branch holds no opinion and base is the honest answer — but if it
+ * DOES carry a published body, the branch published over this document and the
+ * draft address is SUPERSEDED. §18.2 orders the fallthrough local draft → local
+ * published → base draft, so a base draft must never answer for it. Reading
+ * that state as "no opinion" is the 2026-08-11 live defect: the form re-read
+ * `drafts.<id>` after a publish and displayed the stale upstream draft.
  */
 export function seedOverlayDocuments(
   echo: Pick<OverlayEcho, 'setOverlayDocument' | 'setOverlaySuppressed'>,
@@ -461,6 +466,20 @@ export function seedOverlayDocuments(
     }
     if (document.publishedTombstone !== undefined) {
       echo.setOverlaySuppressed(document.logicalId, document.publishedTombstone === true)
+    }
+    /* §18.2 R5: a published body with an EXPLICIT `draft: null` and no draft
+     * tombstone is a branch publish — the draft address is superseded, not
+     * unknown. Sequenced after the tombstone block so the derived suppression
+     * survives the explicit `draftTombstone: false` clear above; the same
+     * predicate `overlaySourceFromBranch` uses for the list panes, so the form
+     * and the list cannot disagree again. */
+    if (
+      isRec(document.published) &&
+      document.draft === null &&
+      document.draftTombstone !== true &&
+      document.publishedTombstone !== true
+    ) {
+      echo.setOverlaySuppressed(draftId, true)
     }
   }
 }

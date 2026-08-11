@@ -793,3 +793,117 @@ describe('the history gap is stated, not left to be deduced from an empty list',
     expect(h.messages).toEqual([])
   })
 })
+
+/* ================================================================== *
+ * 7. §18.2 — a branch-published document SUPPRESSES the base draft
+ *
+ * Found live, 2026-08-11, human validation over the real parity dataset:
+ * the base holds `drafts.article-02` ("Article 2 (DRAFT: retitled)"). The
+ * editor changed the title and clicked Publish. The branch then held a
+ * published body and no draft — and the pane re-read `drafts.article-02`,
+ * got NO branch opinion, fell through to base, and displayed the stale
+ * upstream draft over the value the branch had just published.
+ *
+ * PRD §18.2 orders the fallthrough: local draft → local published → base
+ * draft. Base draft answers ONLY when the branch holds neither. So when the
+ * branch holds a published body and no draft, the draft ADDRESS must be
+ * suppressed, not unknown.
+ * ================================================================== */
+
+/** Base document the branch has published over; base ALSO holds a draft. */
+const OVERRIDDEN = 'article-published-over-base-draft'
+const OVERRIDDEN_DRAFT = `drafts.${OVERRIDDEN}`
+
+/** The branch as `GET /state` reports it after §18.5 publish: published body, no draft. */
+const BRANCH_PUBLISHED_NO_DRAFT: OverlayHydrationDocument[] = [
+  {
+    logicalId: OVERRIDDEN,
+    schemaType: 'article',
+    published: {_id: OVERRIDDEN, _type: 'article', title: 'Branch value', _rev: 'ov-9'},
+  },
+]
+
+/** Boundary control: the branch holds BOTH — the draft must keep answering. */
+const BRANCH_PUBLISHED_AND_DRAFT: OverlayHydrationDocument[] = [
+  {
+    logicalId: OVERRIDDEN,
+    schemaType: 'article',
+    published: {_id: OVERRIDDEN, _type: 'article', title: 'Branch value', _rev: 'ov-9'},
+    draft: {_id: OVERRIDDEN_DRAFT, _type: 'article', title: 'Branch draft value', _rev: 'ov-10'},
+  },
+]
+
+/** The stale upstream draft a base read would serve for the draft address. */
+const BASE_DRAFT_ANSWER = {
+  documents: [
+    {_id: OVERRIDDEN_DRAFT, _type: 'article', title: 'STALE base draft', _rev: 'base-2'},
+  ],
+  omitted: [],
+}
+
+describe('§18.2 — branch-published suppresses the base draft', () => {
+  it('the view itself: published held, draft address SUPPRESSED, not unknown', () => {
+    const view = overlaySourceFromBranch(BRANCH_PUBLISHED_NO_DRAFT)
+    expect(view.documents.get(OVERRIDDEN)?.title).toBe('Branch value')
+    expect(view.documents.has(OVERRIDDEN_DRAFT)).toBe(false)
+    /* THE RED LINE: no opinion means base answers with the stale draft. */
+    expect(view.tombstones.has(OVERRIDDEN_DRAFT)).toBe(true)
+  })
+
+  it('boundary: a branch that holds a draft keeps serving it — no suppression', () => {
+    const view = overlaySourceFromBranch(BRANCH_PUBLISHED_AND_DRAFT)
+    expect(view.documents.get(OVERRIDDEN_DRAFT)?.title).toBe('Branch draft value')
+    expect(view.tombstones.has(OVERRIDDEN_DRAFT)).toBe(false)
+  })
+
+  it('boundary: a draft-only edit leaves the published address to base — no suppression', () => {
+    const view = overlaySourceFromBranch([
+      {
+        logicalId: OVERRIDDEN,
+        schemaType: 'article',
+        draft: {_id: OVERRIDDEN_DRAFT, _type: 'article', title: 'Branch draft value', _rev: 'ov-3'},
+      },
+    ])
+    expect(view.documents.has(OVERRIDDEN)).toBe(false)
+    expect(view.tombstones.has(OVERRIDDEN)).toBe(false)
+  })
+
+  it('the pair read the pane makes after publish: base draft must NOT come back', async () => {
+    const h = harness(BRANCH_PUBLISHED_NO_DRAFT)
+    h.setBaseAnswer(BASE_DRAFT_ANSWER)
+
+    const answer = await ask(h, [OVERRIDDEN_DRAFT, OVERRIDDEN], {excludeContent: 'true'})
+    const bodies = documentBodies(answer)
+
+    /* The published body, and ONLY the published body. */
+    expect(bodies.map((b) => b._id)).toEqual([OVERRIDDEN])
+    expect(bodies[0]?.title).toBe('Branch value')
+    /* The stale upstream draft is what the user saw. It must never appear. */
+    expect(JSON.stringify(answer)).not.toContain('STALE base draft')
+    /* And the draft address reads as NOT EXISTING, not as unanswered. */
+    expect(readAvailability(answer, [OVERRIDDEN_DRAFT, OVERRIDDEN])).toEqual({
+      [OVERRIDDEN_DRAFT]: false,
+      [OVERRIDDEN]: true,
+    })
+  })
+
+  it('…and base is not even asked: the branch has an opinion about both ids', async () => {
+    const h = harness(BRANCH_PUBLISHED_NO_DRAFT)
+    h.setBaseAnswer(BASE_DRAFT_ANSWER)
+    await ask(h, [OVERRIDDEN_DRAFT, OVERRIDDEN], {query: {excludeContent: 'true'}})
+    expect(h.delegated).toEqual([])
+  })
+
+  it('§18.6 sibling: after unpublish the draft answers and published is suppressed', () => {
+    const view = overlaySourceFromBranch([
+      {
+        logicalId: OVERRIDDEN,
+        schemaType: 'article',
+        publishedTombstone: true,
+        draft: {_id: OVERRIDDEN_DRAFT, _type: 'article', title: 'Preserved as draft', _rev: 'ov-4'},
+      },
+    ])
+    expect(view.documents.get(OVERRIDDEN_DRAFT)?.title).toBe('Preserved as draft')
+    expect(view.tombstones.has(OVERRIDDEN)).toBe(true)
+  })
+})

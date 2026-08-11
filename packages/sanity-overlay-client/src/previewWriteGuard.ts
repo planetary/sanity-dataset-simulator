@@ -112,6 +112,12 @@ const READ_ROOT_PREFIXES = [
   '/intake/telemetry-status' /* the POST sibling /intake/batch is deliberately absent */,
   '/socket',
   '/schedules',
+  /* Login-screen reads: GET /auth/providers (the first request an
+   * unauthenticated Studio makes) and GET /auth/fetch?sid=… (login
+   * completion). Observed live 2026-08-11 — every earlier recorded session
+   * already carried a session, so the login flow had never been exercised.
+   * POST /auth/logout stays a write and stays blocked. */
+  '/auth',
   '/users',
   '/projects',
   '/datasets',

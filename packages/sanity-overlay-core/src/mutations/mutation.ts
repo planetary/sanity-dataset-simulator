@@ -257,19 +257,24 @@ function baselineFor(
     }
   }
 
+  /* §18.2 ordering: local published BEFORE base draft. A branch publish leaves
+   * {published, draft: null} — anchoring the next edit on a base draft that
+   * still exists upstream re-materializes content the branch just superseded.
+   * Observed live 2026-08-11: publish "Well?", type again, and the save
+   * restored the stale upstream draft title. */
+  if (record.local.published !== null && !record.local.publishedTombstone) {
+    return {
+      document: deepClone(record.local.published.materialized),
+      ancestorKind: 'local-published',
+      ancestorRevision: record.local.published.overlayRevision,
+    }
+  }
   const baseDraft = record.base?.draft ?? null
   if (baseDraft !== null) {
     return {
       document: deepClone(baseDraft.snapshot),
       ancestorKind: 'base-draft',
       ancestorRevision: baseDraft.revision,
-    }
-  }
-  if (record.local.published !== null && !record.local.publishedTombstone) {
-    return {
-      document: deepClone(record.local.published.materialized),
-      ancestorKind: 'local-published',
-      ancestorRevision: record.local.published.overlayRevision,
     }
   }
   const basePublished = record.base?.published ?? null

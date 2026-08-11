@@ -711,6 +711,13 @@ function absorbOverlayDocuments(documents: HydrationDocument[] | undefined): voi
       overlayTombstones.delete(draftId)
       overlayDocs.set(draftId, entry.draft)
       protocol.setOverlayDocument(draftId, entry.draft)
+    } else if (entry.draft === null && isRec(entry.published) && !entry.publishedTombstone) {
+      /* §18.2 R5 (2026-08-11): published-with-no-draft means the branch
+       * publish SUPERSEDED the draft address — suppress it, and clear any
+       * stale body, so a base draft can never answer for it. */
+      overlayTombstones.add(draftId)
+      overlayDocs.delete(draftId)
+      protocol.setOverlayDocument(draftId, null)
     }
 
     if (entry.publishedTombstone) {

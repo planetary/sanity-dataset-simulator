@@ -1001,6 +1001,10 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
   function bodyFor(id: string): Rec | undefined {
     const stored = overlayDocs.get(id)
     if (stored !== undefined) return stored
+    /* A suppressed address has NO body — the branch says it does not exist
+     * (§18.2, §18.6-§18.8). Falling through to the read snapshot here would
+     * echo base content the branch removed or superseded. */
+    if (overlaySuppressed.has(id)) return undefined
     const state = docs.get(id)
     if (state?.doc !== undefined && state.synthetic === true) {
       noteError(
@@ -1064,7 +1068,12 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
     let transition = plan.transition
 
     if (plan.copyFrom !== undefined) {
-      const source = bodyFor(plan.copyFrom)
+      /* Prefer the DESTINATION's overlay body: when the commit's hydration has
+       * already landed (persistAndEcho seeds before emitting), it holds exactly
+       * what core materialized for this plan — and the copy SOURCE may already
+       * be suppressed by that same hydration (§18.5 removes the draft). The
+       * source is the fallback for the optimistic pre-commit echo. */
+      const source = overlayDocs.get(plan.documentId) ?? bodyFor(plan.copyFrom)
       if (source === undefined) {
         noteError(
           `cannot echo ${plan.documentId}: no known body for ${plan.copyFrom} to copy from ` +

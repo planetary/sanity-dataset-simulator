@@ -114,6 +114,7 @@ const PURE_LOGIC: readonly string[] = [
   'core-overlay-heads.test.ts',
   'core-properties.test.ts',
   'core-prototype-writes.test.ts',
+  'core-r5-supersession.test.ts',
   'core-read-batch.test.ts',
   'core-serializer-golden.test.ts',
   'core-w1.test.ts',
@@ -131,6 +132,7 @@ const PURE_LOGIC: readonly string[] = [
   'core-w5-memory.test.ts',
   'mutation-gaps.test.ts',
   'offline-parity.test.ts',
+  'query-address-space.test.ts',
   'query-boundedness.test.ts',
   'query-parity.test.ts',
   'query-pushdown.test.ts',
@@ -242,6 +244,16 @@ const WIRING: Readonly<Record<string, WiringEntry>> = {
     note:
       'the same transcribed resolver, but over a config this file writes and a stub fetch. The ' +
       'smoke boot runs it over the real `examples/kitchen-sink/sanity.config.ts` and a real API.',
+  },
+  'studio-echo-supersession.test.ts': {
+    seam: 'partial',
+    where: 'action-echo.test.ts',
+    note:
+      '§18.2 R5 through the echo: hydration seeding, the pair-snapshot tap and the publish ' +
+      'frame all refuse the superseded base draft. Found live 2026-08-11 in a real browser ' +
+      'over the real parity dataset; the companion file drives the same echo through a real ' +
+      'overlay server on disk, and e2e/specs/local/04-document-actions.spec.ts drives publish ' +
+      'in a real pane.',
   },
   'studio-echo.test.ts': {
     seam: 'partial',

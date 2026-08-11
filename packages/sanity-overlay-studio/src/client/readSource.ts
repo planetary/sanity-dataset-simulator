@@ -103,6 +103,22 @@ export function overlaySourceFromBranch(
       documents.set(version.address, document)
       if (conflicted) conflicts.add(version.address)
     }
+
+    /* §18.2: local draft → local published → base draft, in that order. A
+     * branch that holds a published body and no draft has an OPINION about the
+     * draft address — the draft does not exist — and leaving it unknown lets a
+     * base draft resurface content the branch just published over. Found live
+     * 2026-08-11: after §18.5 publish, the pane re-read `drafts.<id>` and
+     * displayed the stale upstream draft. */
+    const draftAddr = draftAddress(logicalId)
+    if (
+      documents.has(logicalId) &&
+      !documents.has(draftAddr) &&
+      !tombstones.has(draftAddr)
+    ) {
+      tombstones.add(draftAddr)
+      if (conflicted) conflicts.add(draftAddr)
+    }
   }
 
   return {documents, tombstones, conflicts}

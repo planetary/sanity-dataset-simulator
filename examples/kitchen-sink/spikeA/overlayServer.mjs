@@ -904,6 +904,12 @@ export async function startOverlayServer(options = {}) {
       const record = state.documents[logicalId]
       if (record.local.draftTombstone) tombstones.add(`drafts.${logicalId}`)
       else if (record.local.draft) addresses.push(`drafts.${logicalId}`)
+      else if (record.local.published && !record.local.publishedTombstone) {
+        /* §18.2 R5 (2026-08-11): a branch publish leaves {published, draft:
+         * null} — the draft address is SUPERSEDED, not unowned. Leaving it out
+         * entirely lets a caller's raw-addressed base draft answer for it. */
+        tombstones.add(`drafts.${logicalId}`)
+      }
       if (record.local.publishedTombstone) tombstones.add(logicalId)
       else if (record.local.published) addresses.push(logicalId)
     }

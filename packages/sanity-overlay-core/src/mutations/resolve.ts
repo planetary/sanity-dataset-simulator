@@ -49,17 +49,20 @@ function mergeLocal(
   version: VersionKind,
   currentBase: SanityDocument | null,
   context: ResolveContext,
+  ancestorOverride?: SanityDocument | null,
 ): SanityDocument {
   const local = version === 'draft' ? record.local.draft : record.local.published
   /* istanbul ignore next -- callers check presence first */
   if (local === null) throw new Error('mergeLocal called without a local version')
   const ancestorBlock = record.base
   const ancestor =
-    ancestorBlock === null
-      ? null
-      : ((version === 'draft' ? ancestorBlock.draft : ancestorBlock.published)?.snapshot ??
-        ancestorBlock.published?.snapshot ??
-        null)
+    ancestorOverride !== undefined
+      ? ancestorOverride
+      : ancestorBlock === null
+        ? null
+        : ((version === 'draft' ? ancestorBlock.draft : ancestorBlock.published)?.snapshot ??
+          ancestorBlock.published?.snapshot ??
+          null)
   return mergeOf(context)({
     ancestor,
     currentBase,
@@ -119,6 +122,25 @@ export function resolveDraft(
     return record.local.publishedTombstone ? null : currentBasePublished
   }
   if (record.local.draft !== null) {
+    /* §18.2: a draft anchored on the branch's own published layer stacks on
+     * THAT resolution — the base draft it superseded must not be its current
+     * base, or untouched fields inherit content the branch already published
+     * over (observed live 2026-08-11: an edit after publish restored the stale
+     * upstream draft title into the form). */
+    if (
+      record.local.draft.ancestorKind === 'local-published' &&
+      record.local.published !== null &&
+      !record.local.publishedTombstone
+    ) {
+      const publishedResolved = mergeLocal(record, 'published', currentBasePublished, context)
+      return mergeLocal(
+        record,
+        'draft',
+        publishedResolved,
+        context,
+        record.local.published.materialized,
+      )
+    }
     return mergeLocal(record, 'draft', currentBaseDraft ?? currentBasePublished, context)
   }
   if (record.local.published !== null && !record.local.publishedTombstone) {
@@ -161,6 +183,10 @@ export function documentExists(
     if (record !== null) {
       if (record.local.draftTombstone) return false
       if (record.local.draft !== null) return true
+      /* §18.2: a branch-published record supersedes the base draft. The virtual
+       * draft address does not exist — `resolveVersionBatch` already answers
+       * `null` for it, and this predicate must agree (2026-08-11). */
+      if (record.local.published !== null && !record.local.publishedTombstone) return false
     }
     return source.getDraft(logicalId) !== null
   }

@@ -187,13 +187,15 @@ export function perspectiveOverlaySource(
     /*
      * THE BRANCH MAY ONLY CLAIM THE ADDRESS THE PERSPECTIVE ACTUALLY SELECTS.
      *
-     * Under `drafts` the DRAFT ADDRESS wins over the published one whoever
-     * supplies each, and this view cannot see base. So the branch's published
-     * body is promoted only once the branch has PROVED no draft exists — by
-     * tombstoning it. Otherwise the decision is deferred to the candidate pool,
-     * which sees both sides; the branch's own row is in that pool either way
-     * (`createBranchCandidateSource` unions it in), so nothing is lost by
-     * deferring and a base draft is no longer overruled by a branch publish.
+     * Under `drafts` the branch's own draft wins outright. Its published body
+     * is promoted once the draft address is settled as NOT EXISTING — which
+     * `overlaySourceFromBranch` records as a draft tombstone both for an
+     * explicit §18.6-§18.8 removal AND for the §18.2 R5 supersession a branch
+     * publish leaves behind ({published, draft: null}). The pre-2026-08-11
+     * version of this comment claimed a base draft "is no longer overruled by
+     * a branch publish"; §18.2 orders the fallthrough local draft → local
+     * published → base draft, and the live session proved what the inverted
+     * rule does: a publish appeared to revert to the stale upstream draft.
      */
     const winner =
       perspective === 'drafts'

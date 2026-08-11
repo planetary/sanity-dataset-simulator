@@ -289,10 +289,18 @@ describe('§2 the collapse rule, case by case', () => {
     ).toEqual([{_id: 'article-01', title: 'branch published'}])
   })
 
-  it('base’s draft beats the BRANCH’s published body — address precedence, not origin', async () => {
+  it('the BRANCH’s published body beats base’s draft — §18.2 fallthrough, not address precedence', async () => {
     /* `article-02` has a base draft ("Article 2 (DRAFT: retitled)") and a base
-     * published. A branch that only republished it must not promote its
-     * published body over a draft that still exists. */
+     * published. PRD §18.2 orders the drafts-perspective fallthrough: local
+     * draft → local published → base draft. A branch that published this
+     * document HAS an opinion — the base draft is superseded content.
+     *
+     * The inverse of this assertion was previously pinned here as "address
+     * precedence, not origin". The 2026-08-11 human validation over the live
+     * parity dataset showed what that rule does to an editor: they changed
+     * this very document's title, clicked Publish, and watched the pane revert
+     * to the stale upstream draft — published work reading as lost. §18.2 and
+     * §18.5 together rule the other way, so this test now pins the PRD. */
     const rigged = rig([
       {
         logicalId: 'article-02',
@@ -303,8 +311,8 @@ describe('§2 the collapse rule, case by case', () => {
     expect(await draftsRead(rigged, ['article-02'])).toEqual([
       {
         _id: 'article-02',
-        _originalId: 'drafts.article-02',
-        title: 'Article 2 (DRAFT: retitled)',
+        _originalId: 'article-02',
+        title: 'branch published two',
       },
     ])
   })

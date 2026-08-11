@@ -212,6 +212,17 @@ export async function evaluateOverlayQuery<T = unknown>(
   const candidates = new Map<string, QueryDocument>()
   const admit = (id: string): QueryDocument | undefined => {
     if (candidates.has(id)) return undefined
+    /* §18.2/§18.8 address-space rule (2026-08-11): a DRAFT-addressed row the
+     * overlay itself does not hold is admissible only while the overlay has no
+     * opinion about its logical twin. A logical-keyed overlay (every
+     * published/drafts reader) that holds a body or tombstone for `X` has
+     * superseded the base's `drafts.X` — admitting it would resurface a stale
+     * base draft alongside the branch answer. A versioned overlay view keys
+     * its own draft addresses and is untouched by this check. */
+    if (id.startsWith('drafts.') && !overlay.documents.has(id) && !overlay.tombstones.has(id)) {
+      const logicalId = id.slice('drafts.'.length)
+      if (overlay.documents.has(logicalId) || overlay.tombstones.has(logicalId)) return undefined
+    }
     /* 7 + 13. Tombstones suppress; branch records win over base. */
     const doc = resolveVirtualDocument(id, baseById, overlay)
     if (!doc) return undefined
