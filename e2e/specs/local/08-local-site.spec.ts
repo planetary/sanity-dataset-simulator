@@ -35,13 +35,25 @@
  */
 import {test, expect} from '../../playwright/fixtures'
 import {overrideAt} from '../../playwright/disk'
-import {setField, waitForSettled} from '../../playwright/interactions'
+import {
+  confirmIfAsked,
+  runDocumentAction,
+  setField,
+  waitForSettled,
+} from '../../playwright/interactions'
+import {seedArticleReferencing, seedPublishedAuthor} from '../../playwright/seed'
 import {URLS} from '../../harness/paths.mjs'
 
 async function fetchText(url: string): Promise<string> {
   const response = await fetch(url, {headers: {accept: 'text/html'}})
   expect(response.ok, `${url} answered ${response.status}`).toBe(true)
   return response.text()
+}
+
+/** The same fetch, for a route whose ABSENCE is the assertion. */
+async function fetchPage(url: string): Promise<{status: number; body: string}> {
+  const response = await fetch(url, {headers: {accept: 'text/html'}})
+  return {status: response.status, body: await response.text()}
 }
 
 /** Ask the site to re-read the overlay rather than waiting out its probe. */
@@ -117,20 +129,102 @@ test.describe('the consumer site reads the branch, and mode: off reads the base'
     expect(staging).not.toContain('overlay revision:')
   })
 
+  /**
+   * PRD §38.1's strongest local form: *"Delete an article in Studio. Reload: it
+   * is gone from the list, and its own URL returns 404, not the stale staging
+   * row."*
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * THIS WAS SKIPPED, AND THE SKIP WAS WRONG ON BOTH OF ITS CLAIMS.
+   *
+   * It read `test.skip(true, 'needs a shared base document — see specs/live/')`,
+   * on the reasoning that *"in local mode the Studio's world is the empty run
+   * overlay, so there is no shared id to delete"*.
+   *
+   *   - `specs/live/01-staging-untouched.spec.ts` does not carry this test. It
+   *     has the branch-title cases and no tombstone case at all, so the pointer
+   *     named a home that does not exist.
+   *   - "the Studio has no base" is not "no id can be shared". The id is shared
+   *     by the SITE, which is the process holding both halves: the Studio can
+   *     address `article-02`, and `examples/local-site/base-dataset.ndjson`
+   *     contains `article-02`. Nothing had to exist upstream for that to be true.
+   *
+   * The real difference the skip was circling — that a Mode 2 Studio can only
+   * produce a BRANCH-CREATED tombstone, while `local-site-routes.test.ts` seeds
+   * a base-derived one — is measured in
+   * `packages/sanity-overlay-testkit/test/site-branch-tombstone-over-base.test.ts`,
+   * which drives exactly the Mode 2 record shape and shows the suppression holds.
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * THE DIFFERENTIAL IS STILL THE ASSERTION. `:4001` is asserted to be serving
+   * the row BEFORE and AFTER, so "the branch 404s" cannot pass by the site being
+   * broken, the slug being wrong, or the base dataset having changed.
+   */
   test('a tombstoned document 404s on the branch view while the base still has it', async ({
+    page,
+    studio,
     overlay,
   }) => {
-    /**
-     * SCAFFOLDED, not asserted.
-     *
-     * The strong form — *"Delete an article in Studio. Reload: it is gone from
-     * the list, and its own URL returns 404, not the stale staging row"* — needs
-     * a document that exists in `base-dataset.ndjson` AND in the Studio's world.
-     * In `local` mode the Studio's world is the empty run overlay, so there is
-     * no shared id to delete. `specs/live/` is where the base and the Studio
-     * agree on ids.
-     */
-    test.skip(true, 'needs a shared base document — see specs/live/')
-    expect(overlay.ids()).toBeDefined()
+    /* An id that `base-dataset.ndjson` really holds, and the slug it routes by. */
+    const id = 'article-02'
+    const slug = 'article-2'
+    const branchTitle = 'About to be deleted on the branch'
+
+    /* BEFORE: the staging view serves it, so the row demonstrably exists. */
+    const stagingBefore = await fetchPage(`${URLS.siteStaging}/articles/${slug}`)
+    expect(stagingBefore.status, 'the base dataset no longer routes this slug').toBe(200)
+
+    /* `article` declares a required STRONG reference to a PUBLISHED author, and
+     * no amount of typing in the form can satisfy it — see `playwright/seed.ts`.
+     * Publish stays disabled without this, and a document that cannot be
+     * published cannot be tombstoned. */
+    await seedPublishedAuthor(`${id}-author`, 'Tombstone target author')
+    await seedArticleReferencing(id, `${id}-author`)
+
+    await studio.openDocument('article', id)
+    await setField(page, 'Title', branchTitle)
+    await setField(page, 'Slug', slug)
+    await setField(page, 'Published At', '2026-08-10 12:00')
+    await waitForSettled(page)
+    await overlay.waitForIntent(id, (value) => overrideAt(value, ['title']) === branchTitle)
+
+    /* Only a PUBLISHED version can be tombstoned (§18.8). */
+    await expect(page.getByTestId('action-publish').last()).toBeEnabled({timeout: 40_000})
+    await runDocumentAction(page, 'Publish')
+    await confirmIfAsked(page)
+    await overlay.waitForIntent(
+      id,
+      (value) => overrideAt(value, ['title'], 'published') === branchTitle,
+      {what: 'the published layer, which is the only thing a delete can tombstone'},
+    )
+
+    await runDocumentAction(page, 'Delete')
+    await confirmIfAsked(page)
+    await overlay.waitForIntent(
+      id,
+      (value) => value.tombstones.draft === true || value.tombstones.published === true,
+      {what: 'the tombstone to land on disk before asking the site'},
+    )
+
+    await revalidate()
+
+    /* THE ASSERTION: the branch view refuses to serve it… */
+    await expect
+      .poll(async () => (await fetchPage(`${URLS.siteBranch}/articles/${slug}`)).status, {
+        timeout: 30_000,
+        message: 'the branch view still serves a tombstoned document',
+      })
+      .toBe(404)
+
+    const branchList = await fetchText(`${URLS.siteBranch}/`)
+    expect(branchList, 'the tombstoned article is still linked from the branch list').not.toContain(
+      `/articles/${slug}`,
+    )
+
+    /* …while the base is untouched and the staging view still serves it. A
+     * 404 on both would mean the site broke, not that the overlay suppressed. */
+    const stagingAfter = await fetchPage(`${URLS.siteStaging}/articles/${slug}`)
+    expect(stagingAfter.status, 'the branch delete reached the STAGING view').toBe(200)
+    expect(await fetchText(`${URLS.siteStaging}/`)).toContain(`/articles/${slug}`)
   })
 })

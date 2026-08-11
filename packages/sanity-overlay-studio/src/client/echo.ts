@@ -17,6 +17,63 @@ type Rec = Record<string, unknown>
 
 /* ------------------------------------------------------------------ types */
 
+/**
+ * The mendoza patch pair every real pair-listener frame carries.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * NOT OPTIONAL, AND NOT ONLY THE PREVIEW LISTENER'S BUSINESS.
+ *
+ * `getPairListener` subscribes with `effectFormat: "mendoza"`
+ * (`sanity@6.8.0 lib/datastores-DqFH7RLd.js:1676`), so EVERY frame the Content
+ * Lake puts on the document pair channel has `effects`. Three consumers read it
+ * off that channel, all of them unguarded:
+ *
+ *   1. `getRemoteTransactionsSubscription.onMutationReceived`
+ *      (`lib/index.js:5688`) reads `remoteMutation.effects.apply` and
+ *      `.revert`. `apply` there is a MENDOZA PATCH PROPERTY, not
+ *      `Function.prototype.apply` — which is why omitting `effects` produced
+ *      `TypeError: Cannot read properties of undefined (reading 'apply')` on
+ *      every draft edit. It arrives via `BufferedDocument.onRemoteMutation`
+ *      (`datastores:1462`), which copies `mutation.effects` off the
+ *      `@sanity/mutator` `Mutation` built from the raw frame (`datastores:1486`,
+ *      `new Mutation(mutationEvent)`).
+ *   2. the history/timeline `Aligner` (`datastores:6821` → `:6859`) does
+ *      `applyPatch(state.attrs, evt.effects.apply)` — it both throws on a
+ *      missing `effects` AND RECONSTRUCTS REVISION CONTENT from `apply`.
+ *   3. `remoteMutationToTransaction` (`useBundleDocuments-BYW8M9LS.js:4905`)
+ *      re-keys the pair into the translog shape `getEditEvents` consumes.
+ *
+ * The `version !== documentVariantType` guard at `lib/index.js:5682` does not
+ * make the omission harmless: `version` is stamped downstream by
+ * `setVersion("draft")` (`datastores:1740`, applied in `checkoutPair` at
+ * `:1888`), so a draft frame always matches a draft pane.
+ *
+ * WHY BOTH HALVES ARE COMPLETE LITERAL PATCHES RATHER THAN MINIMAL DELTAS.
+ * Opcode `0` is mendoza's `Value` op: `[0, x]` means "the result is exactly
+ * `x`" (`mendoza@3.0.8 src/internal-patcher.ts` `OPS[0]` / `processValue`), and
+ * `[0, null]` is the delete patch `isDeletePatch` looks for
+ * (`useBundleDocuments-BYW8M9LS.js:4956`). The Content Lake itself emits that
+ * form for creates — `isVersionCreateTransaction` recognises a create by
+ * `revert === [0, null]` and rebuilds the document with
+ * `applyPatch({}, effects.apply)` (`:11202`, `:11217`). A complete literal is
+ * therefore a first-class mendoza patch, not an approximation of one; it is
+ * merely not the *smallest* patch that would do, and no consumer inspects a
+ * patch's shape — all three above only apply it or test it for `[0, null]`.
+ *
+ * AN EMPTY `{apply: [], revert: []}` WOULD BE A SILENT APPROXIMATION (§5.5).
+ * `applyPatch(doc, [])` is a verified no-op, so consumer 2 would rebuild the
+ * PRE-edit body for every revision, and `getEffectState` would answer
+ * `"modified"` for creates and deletes alike — so consumer 1's `onRefetch()`
+ * would never fire and the events panel would never learn a version appeared or
+ * went away.
+ */
+export interface OverlayMendozaEffects {
+  /** Mendoza patch taking the previous revision to this one. */
+  apply: unknown[]
+  /** Mendoza patch taking this revision back to the previous one. */
+  revert: unknown[]
+}
+
 /** A listener mutation event, in the shape sanity 6.8.0's pair listener emits. */
 export interface OverlayMutationEvent {
   type: 'mutation'
@@ -26,6 +83,7 @@ export interface OverlayMutationEvent {
   transition: 'update' | 'appear' | 'disappear'
   identity: string
   mutations: Rec[]
+  effects: OverlayMendozaEffects
   previousRev?: string
   resultRev: string
   timestamp: string
@@ -341,6 +399,227 @@ function isRec(value: unknown): value is Rec {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/* -------------------------------------------------------------- mendoza */
+
+/**
+ * `OPS[0]` in `mendoza@3.0.8` (`src/internal-patcher.ts`): read the next patch
+ * entry as a literal and make it the result. `[VALUE_OP, x]` is thus the
+ * complete patch "the result is exactly `x`", and `[VALUE_OP, null]` is the
+ * delete patch `isDeletePatch` tests for.
+ */
+const MENDOZA_VALUE_OP = 0
+
+/** "The result is exactly this." */
+function statedValue(value: Rec | null): unknown[] {
+  return [MENDOZA_VALUE_OP, value]
+}
+
+/**
+ * "I am not describing this transition."
+ *
+ * The empty patch is structurally valid and every consumer accepts it, but it
+ * MEANS "nothing changed" to anything that applies it. It is therefore only
+ * ever used where nothing applies it, or where the alternative is a fabricated
+ * body — and in the latter case {@link buildFrame} says so on `onError` first,
+ * because §5.5 forbids a *silent* approximation, not an announced one.
+ */
+const UNDESCRIBED: unknown[] = []
+
+/**
+ * `_rev` is never part of a mendoza patch's subject: every `applyPatch` call
+ * site in `sanity@6.8.0` strips it first (`omitRev`, `datastores:354`) and
+ * re-stamps the revision from the event (`applyMutationEventEffects` at `:368`,
+ * `Aligner._apply` at `:6859`).
+ */
+function withoutRev(document: Rec): Rec {
+  const copy = {...document}
+  delete copy._rev
+  return copy
+}
+
+/* ---------------------------------------------- the resulting-body applier */
+
+/** What a patch body may carry that is addressing, not an operation. */
+const PATCH_METADATA_KEYS = new Set(['id', 'ifRevisionID', 'unsetIsEmpty'])
+
+/**
+ * The patch operations this module will state a result for.
+ *
+ * DELIBERATELY SHORT, AND THE REFUSAL IS THE POINT. `insert`, `diffMatchPatch`
+ * and every array-selector path (`body[_key=="x"].text`) have semantics that
+ * live in `@sanity/mutator`'s `Patcher`; a second, approximate implementation
+ * of them here would put a WRONG body in the history timeline, which is worse
+ * than putting none there. Anything not on this list is refused by name.
+ */
+const APPLIABLE_PATCH_OPS = new Set(['set', 'setIfMissing', 'unset', 'inc', 'dec'])
+
+type BodyOutcome = {ok: true; body: Rec | null} | {ok: false; reason: string}
+
+/**
+ * A dotted path this module is willing to walk, or `undefined`.
+ *
+ * THE SEGMENT RULE IS `@sanity/mutator`'S OWN, NOT A LOOSER ONE. Its jsonpath
+ * tokenizer accepts an attribute matching `/^[a-zA-Z_][a-zA-Z0-9_]*$/`
+ * (`@sanity/mutator@6.8.0 lib/index.js:79`, `attributeFirstCharMatcher` /
+ * `attributeCharMatcher`) and throws `Invalid tokens in jsonpath` on anything
+ * else. Being MORE permissive than the oracle would mean confidently stating a
+ * body for a path the pane's own patcher refuses to parse — so array and key
+ * selectors (`body[0]`, `body[_key=="a"]`) and any other punctuation fall
+ * through to the announced fallback instead.
+ */
+const PATH_SEGMENT = /^[a-zA-Z_][a-zA-Z0-9_]*$/
+
+function plainSegments(path: string): string[] | undefined {
+  if (path === '') return undefined
+  const segments = path.split('.')
+  return segments.every((segment) => PATH_SEGMENT.test(segment)) ? segments : undefined
+}
+
+function setAtPath(target: Rec, path: string, value: unknown, onlyIfMissing: boolean): boolean {
+  const segments = plainSegments(path)
+  if (segments === undefined) return false
+  let cursor: Rec = target
+  for (const segment of segments.slice(0, -1)) {
+    const next = cursor[segment]
+    if (next === undefined) {
+      const created: Rec = {}
+      cursor[segment] = created
+      cursor = created
+      continue
+    }
+    if (!isRec(next)) return false
+    const copy = {...next}
+    cursor[segment] = copy
+    cursor = copy
+  }
+  const leaf = segments[segments.length - 1]!
+  if (onlyIfMissing && cursor[leaf] !== undefined) return true
+  cursor[leaf] = value
+  return true
+}
+
+function adjustAtPath(target: Rec, path: string, delta: number): boolean {
+  const segments = plainSegments(path)
+  if (segments === undefined) return false
+  let cursor: Rec = target
+  for (const segment of segments.slice(0, -1)) {
+    const next = cursor[segment]
+    if (!isRec(next)) return false
+    const copy = {...next}
+    cursor[segment] = copy
+    cursor = copy
+  }
+  const leaf = segments[segments.length - 1]!
+  const current = cursor[leaf]
+  if (typeof current !== 'number') return false
+  cursor[leaf] = current + delta
+  return true
+}
+
+function unsetAtPath(target: Rec, path: string): boolean {
+  const segments = plainSegments(path)
+  if (segments === undefined) return false
+  let cursor: Rec = target
+  for (const segment of segments.slice(0, -1)) {
+    const next = cursor[segment]
+    if (next === undefined) return true
+    if (!isRec(next)) return false
+    const copy = {...next}
+    cursor[segment] = copy
+    cursor = copy
+  }
+  delete cursor[segments[segments.length - 1]!]
+  return true
+}
+
+function applyPatchBody(document: Rec, patch: Rec): BodyOutcome {
+  const next: Rec = {...document}
+  for (const [op, argument] of Object.entries(patch)) {
+    if (PATCH_METADATA_KEYS.has(op)) continue
+    if (!APPLIABLE_PATCH_OPS.has(op)) {
+      return {ok: false, reason: `the patch operation \`${op}\``}
+    }
+    if (op === 'unset') {
+      const paths = Array.isArray(argument) ? argument : []
+      if (!Array.isArray(argument)) return {ok: false, reason: '`unset` without a path list'}
+      for (const path of paths) {
+        if (typeof path !== 'string' || !unsetAtPath(next, path)) {
+          return {ok: false, reason: `the \`unset\` path \`${String(path)}\``}
+        }
+      }
+      continue
+    }
+    if (!isRec(argument)) return {ok: false, reason: `a non-object \`${op}\``}
+    for (const [path, value] of Object.entries(argument)) {
+      const applied =
+        op === 'inc' || op === 'dec'
+          ? typeof value === 'number' &&
+            adjustAtPath(next, path, op === 'inc' ? value : -(value as number))
+          : setAtPath(next, path, value, op === 'setIfMissing')
+      if (!applied) return {ok: false, reason: `the \`${op}\` path \`${path}\``}
+    }
+  }
+  return {ok: true, body: next}
+}
+
+/**
+ * The body a frame's OWN mutations leave at this address — i.e. exactly what
+ * `@sanity/mutator` will compute when the pane applies the same frame
+ * (`Mutation.compile`, `@sanity/mutator@6.8.0 lib/index.js:1226-1261`).
+ *
+ * DERIVED FROM THE FRAME, NOT FROM A SECOND LOOKUP, so `effects` and
+ * `mutations` are two spellings of one claim and cannot contradict each other.
+ * The `_createdAt` and `_updatedAt` stamping mirrors `Mutation.compile` exactly:
+ * a create takes the payload's `_createdAt` or the frame timestamp (`:1226`),
+ * and a surviving document always ends with `_updatedAt = timestamp` (`:1254`).
+ *
+ * `head` is the body the pane's HEAD carries; `undefined` means the echo does
+ * not know it, which only an op that reads the previous value can be refused
+ * for.
+ */
+function resultingBody(
+  head: Rec | null | undefined,
+  mutations: readonly Rec[],
+  timestamp: string,
+): BodyOutcome {
+  let document: Rec | null | undefined = head
+  for (const mutation of mutations) {
+    const [kind] = Object.keys(mutation).filter((key) => mutation[key] !== undefined)
+    const payload = kind === undefined ? undefined : mutation[kind]
+
+    if (kind === 'delete') {
+      document = null
+      continue
+    }
+    if (kind === 'createOrReplace') {
+      if (!isRec(payload)) return {ok: false, reason: 'a `createOrReplace` without a body'}
+      document = {...payload, _createdAt: payload._createdAt ?? timestamp}
+      continue
+    }
+    if (kind === 'create' || kind === 'createIfNotExists') {
+      if (!isRec(payload)) return {ok: false, reason: `a \`${kind}\` without a body`}
+      if (document === undefined) return {ok: false, reason: `\`${kind}\` against an unknown HEAD`}
+      if (document === null) document = {...payload, _createdAt: payload._createdAt ?? timestamp}
+      continue
+    }
+    if (kind === 'patch') {
+      if (!isRec(payload)) return {ok: false, reason: 'a `patch` without a body'}
+      if (document === undefined) return {ok: false, reason: 'a `patch` against an unknown HEAD'}
+      if (document === null) return {ok: false, reason: 'a `patch` against a missing document'}
+      const outcome = applyPatchBody(document, payload)
+      if (!outcome.ok) return outcome
+      document = outcome.body
+      continue
+    }
+    return {ok: false, reason: `the mutation \`${String(kind)}\``}
+  }
+
+  if (document === undefined) return {ok: false, reason: 'an unknown HEAD'}
+  /* `Mutation.compile:1254` — a surviving document always carries the
+   * transaction's timestamp when the frame states one. */
+  return {ok: true, body: document === null ? null : {...document, _updatedAt: timestamp}}
+}
+
 /* ------------------------------------------------------------ auth status */
 
 /** The two statuses that end a session. Everything else is transient. */
@@ -481,6 +760,21 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
   const noteError = options.onError ?? ((): void => {})
 
   const docs = new Map<string, OverlayDocState>()
+  /**
+   * The body the PANE's HEAD carries for an address, as far as the echo can
+   * tell — the subject a mendoza patch is computed against.
+   *
+   * A SEPARATE MAP RATHER THAN A FIELD ON {@link OverlayDocState}, because
+   * "unknown" and "absent" must stay distinguishable and only a map can say
+   * both: `heads.has(id) === false` is *I do not know what the pane holds*,
+   * while `heads.get(id) === null` is *the pane holds nothing here*. Collapsing
+   * them onto `undefined` would let the echo state a `revert` for a body it
+   * never saw.
+   *
+   * It moves in lockstep with {@link OverlayDocState.rev}: every write that
+   * advances the revision either records the matching body or forgets it.
+   */
+  const heads = new Map<string, Rec | null>()
   /** Bodies the overlay API materialized, keyed as Studio addresses them. */
   const overlayDocs = new Map<string, Rec>()
   /** Addresses the branch has tombstoned — see {@link OverlayEcho.setOverlaySuppressed}. */
@@ -590,6 +884,9 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       synthetic: false,
       paneRev: false,
     })
+    /* The revision just moved to this read's, so the body a patch would be
+     * computed against is this read's body. */
+    heads.set(id, value)
   }
 
   function seedFromResult(value: unknown, authoritative: boolean): void {
@@ -606,6 +903,7 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       /* The branch removed this address, so the pane's HEAD is `null` and only a
        * create-shaped frame can ever apply to it again. */
       setDocState(id, {rev: undefined, updatedAt: undefined, paneRev: true})
+      heads.set(id, null)
       return
     }
     const rev = typeof document._rev === 'string' && document._rev !== '' ? document._rev : undefined
@@ -631,6 +929,9 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       updatedAt: typeof document._updatedAt === 'string' ? document._updatedAt : undefined,
       paneRev: true,
     })
+    /* This — not `doc` — is what the pane's HEAD actually carries, so it is the
+     * subject the next frame's mendoza patch describes. */
+    heads.set(id, document)
   }
 
   /** Learn the real revision chain from an event another client produced. */
@@ -643,6 +944,16 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       updatedAt: typeof event.timestamp === 'string' ? event.timestamp : undefined,
       synthetic: false,
     })
+    /*
+     * ANOTHER CLIENT MOVED THIS DOCUMENT AND THE FRAME DOES NOT SAY TO WHAT.
+     * The pair listener runs with `includeResult: false`
+     * (`datastores:1663`), so an upstream frame carries mutations and effects
+     * but no body. The revision advanced, so whatever the echo believed the
+     * pane held is now stale — forgetting it is the only honest option, and it
+     * downgrades the next frame's `revert` to "undescribed" rather than letting
+     * it state a body that has been overwritten.
+     */
+    heads.delete(event.documentId)
   }
 
   /* ------------------------------------------------------ subscriptions */
@@ -877,6 +1188,66 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
      * delivery time, after any earlier frame in the same burst has landed. */
     if (transition !== 'disappear') transition = previousRev ? 'update' : 'appear'
 
+    /*
+     * ───────────────────────────────────────────────────────────────────────────
+     * `effects` — THE SAME CLAIM AS `mutations`, IN MENDOZA.
+     *
+     * See {@link OverlayMendozaEffects} for why a frame without this is not a
+     * frame at all, and for the three `sanity@6.8.0` consumers that read it.
+     *
+     * `apply` is derived from THIS FRAME'S OWN mutation list applied to the
+     * body the pane's HEAD carries, so the two halves of the frame are one
+     * statement rather than two independent guesses. The HEAD body is taken as
+     * `null` whenever the frame has no `previousRev`: that is not an
+     * assumption, it is the frame's own assertion — a create-shaped frame is
+     * the only thing `Document.considerIncoming` accepts against a missing
+     * document, and `appliesToMissingDocument` above has already enforced it.
+     *
+     * `revert`'s only listener-path reader is `isDeletePatch` inside
+     * `getEffectState` (`useBundleDocuments-BYW8M9LS.js:4952`) — checked: the
+     * only two places in `sanity@6.8.0` that APPLY a revert
+     * (`buildReleaseEditEvents` in the releases tool chunk, `trackFieldChanges`
+     * in the tasks tool chunk — deliberately named by function rather than by
+     * hashed filename, since this module does not depend on either) both
+     * iterate TRANSLOG transactions from `getTransactionsLogs`, never listener
+     * frames. So the
+     * load-bearing part of `revert` is whether it is `[0, null]`, and that is
+     * decided by `previousRev` alone, which the whole frame chain already rests
+     * on. The body is stated when known and left undescribed when not, because
+     * an invented one would be read back as content by nothing and as a lie by
+     * a human.
+     */
+    const headBody: Rec | null | undefined =
+      previousRev === undefined ? null : heads.has(plan.documentId) ? heads.get(plan.documentId)! : undefined
+
+    let apply: unknown[]
+    if (transition === 'disappear') {
+      apply = statedValue(null)
+    } else {
+      const outcome = resultingBody(headBody, mutations, timestamp)
+      if (outcome.ok) {
+        apply = statedValue(outcome.body === null ? null : withoutRev(outcome.body))
+      } else {
+        /* ANNOUNCED, NOT SILENT (§5.5). The frame is still delivered — its
+         * `mutations` are true and the pane needs them — but nothing here will
+         * pretend to know the resulting body. */
+        apply = UNDESCRIBED
+        noteError(
+          `cannot state a mendoza effect for ${plan.documentId}: this frame contains ` +
+            `${outcome.reason}, which this module will not approximate. The frame is still ` +
+            `delivered and the edit still applies; only the document history timeline will ` +
+            `show this revision as unchanged until the document is re-read.`,
+        )
+      }
+    }
+
+    const revert =
+      previousRev === undefined
+        ? statedValue(null)
+        : headBody === undefined || headBody === null
+          ? UNDESCRIBED
+          : statedValue(withoutRev(headBody))
+
     return {
       type: 'mutation',
       eventId: `${transactionId}#${plan.documentId}@overlay`,
@@ -885,6 +1256,7 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
       transition,
       identity,
       mutations,
+      effects: {apply, revert},
       /* Omitted entirely (not `undefined`-valued) when unknown:
        * `sequentializeListenerEvents` compares `base.revision === chain[0].previousRev`,
        * and a missing draft has base revision `undefined`. */
@@ -992,6 +1364,9 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
         ...existing,
         mutations: [...existing.mutations, ...frame.mutations],
         transition: frame.transition,
+        /* One transaction describes ONE transition, so the merged effect runs
+         * from where the FIRST frame started to where the LAST one ends. */
+        effects: {apply: frame.effects.apply, revert: existing.effects.revert},
       })
     }
     const built = order.map((documentId) => byDocument.get(documentId)!)
@@ -1046,12 +1421,26 @@ export function createOverlayEcho(options: OverlayEchoOptions = {}): OverlayEcho
           doc: undefined,
           synthetic: true,
         })
+        heads.set(event.documentId, null)
       } else {
         setDocState(event.documentId, {
           rev: event.resultRev,
           updatedAt: event.timestamp,
           synthetic: true,
         })
+        /*
+         * The revision just advanced to this frame's, so the pane's HEAD is now
+         * whatever this frame STATED it to be — read back off the frame itself
+         * rather than recomputed, so the echo's memory and its published claim
+         * can never drift apart. A frame that could not state a body forgets
+         * the old one instead of keeping a value the pane no longer holds.
+         */
+        const stated = event.effects.apply
+        if (stated.length === 2 && stated[0] === MENDOZA_VALUE_OP && isRec(stated[1])) {
+          heads.set(event.documentId, {...(stated[1] as Rec), _rev: event.resultRev})
+        } else {
+          heads.delete(event.documentId)
+        }
       }
     })
     return delivered

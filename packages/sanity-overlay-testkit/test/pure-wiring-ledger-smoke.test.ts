@@ -226,6 +226,16 @@ const WIRING: Readonly<Record<string, WiringEntry>> = {
     where: 'studio-boot-smoke.test.ts',
     note: 'the view, handed a runtime; the smoke boot proves the real config installs `__SANITY_OVERLAY__` and that it agrees with an independent `/state`.',
   },
+  'studio-doc-existence.test.ts': {
+    seam: 'elsewhere',
+    where: 'studio-reference-validation.test.ts',
+    note:
+      'the `/data/doc` existence probe against a hand-built client, read through six transcribed ' +
+      'consumers. The seam — does sanity 6.8.0 actually route the question here, and does the ' +
+      'answer change what validation concludes — is driven for real there: the real ' +
+      '`createDocumentPreviewStore` over the real `@sanity/client`, a real overlay API and a ' +
+      'loopback lake over real HTTP.',
+  },
   'studio-document-action-delivery.test.ts': {
     seam: 'smoke',
     where: 'studio-boot-smoke.test.ts',
@@ -348,11 +358,22 @@ const WIRING: Readonly<Record<string, WiringEntry>> = {
     where: 'proxy-cors.test.ts',
     note: 'endpoint classification; the enforcement boundary is the proxy, and the proxy suite runs the guard behind a real server.',
   },
-  'write-guard.test.ts': {
-    seam: 'elsewhere',
-    where: 'proxy-cors.test.ts',
-    note: 'the shared write-guard contract plus its permanent RED baseline; the same guard runs behind a real proxy there.',
-  },
+  /*
+   * `write-guard.test.ts` USED TO BE HERE, and this note is why it is not.
+   *
+   * It was classified `elsewhere` on the grounds that the guard is a pure
+   * predicate over a request line. That stopped being the whole file when the
+   * derived completeness check was added: it enumerates every `/data/<op>` out
+   * of the SHIPPED `sanity@6.8.0` dist, so the suite now reads the filesystem
+   * and its denominator is a real installed package rather than a list. This
+   * ledger noticed before anyone did — "these grew a real filesystem/socket/
+   * store — good news; remove them from the ledger" — which is the whole point
+   * of it, so the entry is removed rather than the check weakened.
+   *
+   * The enforcement seam is unchanged and still covered: `proxy-cors.test.ts`
+   * runs the same guard behind a real proxy, and `origin-referring-documents.test.ts`
+   * drives the `/data/references` case through a real server with a real client.
+   */
   'listener-matrix.test.ts': {
     seam: 'blind',
     note:

@@ -281,14 +281,14 @@ export function branchAssetAddresses(
   overlay: OverlaySource,
   targets: readonly AssetDedupTarget[],
 ): string[] {
-  const wanted = new Set(targets.map((target) => `${target.type} ${target.hash}`))
+  const wanted = new Set(targets.map((target) => `${target.type}\u0000${target.hash}`))
   const out: string[] = []
   for (const [address, document] of overlay.documents) {
     const record = document as unknown as Rec
     const type = record._type
     const hash = record[HASH_FIELD]
     if (typeof type !== 'string' || typeof hash !== 'string') continue
-    if (!wanted.has(`${type} ${hash}`)) continue
+    if (!wanted.has(`${type}\u0000${hash}`)) continue
     out.push(address)
   }
   out.sort()

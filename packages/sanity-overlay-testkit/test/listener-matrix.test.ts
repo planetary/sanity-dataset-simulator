@@ -27,12 +27,18 @@
  * enforce (chain check, create-first-when-missing, `_rev = resultRev`). Asserting
  * that the emitter's own bookkeeping agrees with itself would prove nothing.
  */
-import {describe, expect, it} from 'vitest'
+import {createRequire} from 'node:module'
+import {describe, expect, it, vi} from 'vitest'
 import {
   createEchoProtocol,
   type EchoMutationEvent,
   type EchoProtocol,
 } from '../../../examples/kitchen-sink/spikeA/echoProtocol'
+import {
+  createOverlayEcho,
+  type OverlayEcho,
+  type OverlayMutationEvent,
+} from '../../sanity-overlay-studio/src/client/echo'
 
 type Rec = Record<string, unknown>
 
@@ -680,14 +686,60 @@ describe('§21.4.1 criterion 5 — event payloads match the version-pinned contr
     })
   }
 
-  it('omits `effects` — only the global preview listener consumes mendoza', () => {
-    const protocol = protocolWith()
-    const frames: EchoMutationEvent[] = []
-    protocol.subscribe(PAIR_IDS, (event) => frames.push(event))
+  /*
+   * ───────────────────────────────────────────────────────────────────────────
+   * THIS TEST USED TO ASSERT THE OPPOSITE, AND THE REASON IT GAVE WAS FALSE.
+   *
+   * It read:
+   *
+   *     it('omits `effects` — only the global preview listener consumes
+   *        mendoza', …)
+   *         expect(frames[0]).not.toHaveProperty('effects')
+   *
+   * The premise — "only the global preview listener consumes mendoza" — is
+   * contradicted by `sanity@6.8.0` in three separate places, all of them fed by
+   * the PAIR listener, i.e. by exactly the channel these frames are merged into
+   * (`client/facade.ts` `wrapListen`, which only attaches a local channel to
+   * `*[_id in $ids]`):
+   *
+   *   1. lib/datastores-DqFH7RLd.js:1676 — `getPairListener` itself subscribes
+   *      with `effectFormat: "mendoza"`, so EVERY real pair frame carries
+   *      `effects`. The omission was ours alone.
+   *   2. lib/index.js:5688 — `getRemoteTransactionsSubscription`'s
+   *      `onMutationReceived` reads `remoteMutation.effects.apply` /
+   *      `.revert` unguarded. `remoteMutation` reaches it through
+   *      `bufferedDocument.onRemoteMutation` (datastores:1462), which copies
+   *      `mutation.effects` off the `@sanity/mutator` `Mutation` built from the
+   *      raw frame (datastores:1486, `new Mutation(mutationEvent)`). A frame
+   *      with no `effects` therefore throws
+   *      `TypeError: Cannot read properties of undefined (reading 'apply')`
+   *      on every draft edit — `apply` there is a MENDOZA PATCH PROPERTY, not
+   *      `Function.prototype.apply`.
+   *   3. lib/datastores-DqFH7RLd.js:6821 → :6859 — the history/timeline
+   *      `Aligner` does `applyPatch(state.attrs, evt.effects.apply)` on the
+   *      same `remoteSnapshots` stream. It both throws on a missing `effects`
+   *      AND reconstructs revision content from `apply`, so an EMPTY patch
+   *      would silently rebuild the pre-edit body.
+   *
+   * The `sanity/lib/index.js:5682` guard that used to make this look harmless
+   * (`variant !== documentVariantType → return`) does not save us: `version` is
+   * stamped downstream by `setVersion("draft")` (datastores:1740, applied in
+   * `checkoutPair` at :1888), so a draft frame always matches a draft pane.
+   *
+   * The replacement asserts the contract against the SHIPPED echo
+   * (`sanity-overlay-studio/src/client/echo.ts`), which is the frame source a
+   * real Studio consumes. The spike protocol this file otherwise exercises is
+   * PRD §0.6 evidence code that no Studio imports.
+   */
+  it('does NOT omit `effects` — the pair listener is a mendoza consumer', () => {
+    const echo = studioEcho([PUBLISHED, DRAFT])
+    const frames = studioFrames(echo, PAIR_IDS)
 
-    protocol.emit(protocol.planActions(editAction('No effects')).plans, 'tx-1')
+    echo.emit(echo.planActions(editAction('Now with effects')).plans, 'tx-1')
 
-    expect(frames[0]).not.toHaveProperty('effects')
+    expect(frames[0]).toHaveProperty('effects')
+    expect(Array.isArray(frames[0]?.effects.apply)).toBe(true)
+    expect(Array.isArray(frames[0]?.effects.revert)).toBe(true)
   })
 
   it('moves the timestamp forward even when the clock does not', () => {
@@ -783,5 +835,460 @@ describe('§21.4.1 two-pane and two-tab convergence', () => {
     protocol.emit(protocol.planActions(editAction('Delivered anyway')).plans, 'tx-1')
 
     expect(healthy.head('drafts.article-1')).toMatchObject({title: 'Delivered anyway'})
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════ *
+ * THE MENDOZA `effects` CONTRACT — driven against sanity 6.8.0's own readers
+ *
+ * WHY THIS BLOCK TARGETS THE SHIPPED ECHO AND NOT THE SPIKE
+ * `client/facade.ts` `wrapListen` merges `createOverlayEcho`'s frames into the
+ * observable `client.observable.listen('*[_id in $ids]', …)` returns — i.e. the
+ * PAIR listener, upstream of `dedupeListenerEvents` and of every consumer cited
+ * below. The spike protocol the rest of this file exercises is §0.6 evidence
+ * code nothing imports at runtime.
+ *
+ * ORACLE DISCIPLINE
+ * Nothing here re-derives what the echo computed. The two oracles are foreign
+ * libraries resolved THROUGH the pinned `sanity@6.8.0`, so they are the exact
+ * copies the Studio under test runs:
+ *   - `mendoza@3.0.8` `applyPatch` decides what a patch MEANS;
+ *   - `@sanity/mutator@6.8.0` `Mutation` decides what the frame's own
+ *     `mutations` DO.
+ * A frame is truthful exactly when those two independent answers agree. An
+ * empty `{apply: [], revert: []}` cannot satisfy that: `applyPatch(doc, [])` is
+ * a verified no-op, so it would claim the document did not change.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const kitchenSinkRequire = createRequire(
+  new URL('../../../examples/kitchen-sink/package.json', import.meta.url),
+)
+const sanityRequire = createRequire(kitchenSinkRequire.resolve('sanity'))
+
+const {applyPatch: applyMendozaPatch} = sanityRequire('mendoza') as {
+  applyPatch: (left: unknown, patch: readonly unknown[]) => unknown
+}
+
+interface MutatorMutation {
+  apply(document: Rec | null): Rec | null
+}
+const {Mutation} = sanityRequire('@sanity/mutator') as {
+  Mutation: new (params: Rec) => MutatorMutation
+}
+
+/* ---- sanity 6.8.0, transcribed verbatim with line references ------------ */
+
+/** `lib/useBundleDocuments-BYW8M9LS.js:4956` */
+function isDeletePatch(patch: readonly unknown[]): boolean {
+  return patch[0] === 0 && patch[1] === null
+}
+
+/** `lib/useBundleDocuments-BYW8M9LS.js:4952` */
+function getEffectState(effect?: {apply: readonly unknown[]; revert: readonly unknown[]}): string {
+  const modified = Boolean(effect)
+  const deleted = effect && isDeletePatch(effect.apply)
+  const created = effect && isDeletePatch(effect.revert)
+  return deleted ? 'deleted' : created ? 'created' : modified ? 'modified' : 'noop'
+}
+
+/**
+ * `lib/index.js:5678-5696` — `getRemoteTransactionsSubscription`'s
+ * `onMutationReceived`, the function whose `remoteMutation.effects.apply` read
+ * is the reported TypeError. `version` is what `setVersion(…)` stamps
+ * downstream (datastores:1740), supplied here as `checkoutPair` supplies it.
+ */
+function onMutationReceived(
+  remoteMutation: {version: string; effects?: {apply: unknown[]; revert: unknown[]}},
+  options: {documentVariantType: string; isLiveEdit: boolean},
+): {refetched: boolean; effectState?: string} {
+  const variant = remoteMutation.version
+  if (variant !== options.documentVariantType) return {refetched: false}
+  if (variant === 'published' && !options.isLiveEdit) return {refetched: true}
+  const effectState = getEffectState({
+    apply: remoteMutation.effects!.apply,
+    revert: remoteMutation.effects!.revert,
+  })
+  if (effectState === 'created' || effectState === 'deleted') return {refetched: true, effectState}
+  return {refetched: false, effectState}
+}
+
+/** `lib/datastores-DqFH7RLd.js:6859` — the history/timeline `Aligner._apply`. */
+function alignerApply(attrs: Rec | null, frame: OverlayMutationEvent): unknown {
+  return applyMendozaPatch(attrs, frame.effects.apply)
+}
+
+/** Every `applyPatch` call site in sanity strips `_rev` first (`omitRev`). */
+function omitRev(document: Rec | null): Rec | null {
+  if (document === null) return null
+  const {_rev: _ignored, ...rest} = document
+  return rest
+}
+
+/* ---- the shipped echo, wired the way `facade.ts` wires it --------------- */
+
+function studioEcho(snapshot: Rec[], overrides: Rec = {}): OverlayEcho {
+  let tick = 0
+  const echo = createOverlayEcho({
+    now: () => Date.UTC(2026, 0, 1) + (tick += 1000),
+    ...overrides,
+  })
+  echo.seedFromResult(snapshot, true)
+  return echo
+}
+
+function studioFrames(echo: OverlayEcho, ids: readonly string[]): OverlayMutationEvent[] {
+  const frames: OverlayMutationEvent[] = []
+  echo.subscribe(ids, (event) => {
+    if (event.type === 'mutation') frames.push(event)
+  })
+  return frames
+}
+
+const GUARD_FIELD = '_empty_action_guard_pseudo_field_'
+
+describe('listener frames carry mendoza `effects` that sanity 6.8.0 can read', () => {
+  it('no longer throws in `onMutationReceived` on an ordinary draft edit', () => {
+    const echo = studioEcho([PUBLISHED, DRAFT])
+    const frames = studioFrames(echo, PAIR_IDS)
+
+    echo.emit(echo.planActions(editAction('Typed')).plans, 'tx-1')
+
+    /* The reported defect, reproduced through sanity's own function. */
+    expect(() =>
+      onMutationReceived(
+        {...frames[0]!, version: 'draft'},
+        {documentVariantType: 'draft', isLiveEdit: false},
+      ),
+    ).not.toThrow()
+  })
+
+  it('describes an edit exactly as @sanity/mutator applies it — mendoza is the oracle', () => {
+    const echo = studioEcho([PUBLISHED, DRAFT])
+    const frames = studioFrames(echo, PAIR_IDS)
+
+    echo.emit(echo.planActions(editAction('Typed into the pane')).plans, 'tx-1')
+    const frame = frames[0]!
+
+    /* ORACLE A — what the pane will hold: the REAL mutator applying the
+     * frame's OWN mutations to the REAL HEAD the pane opened with. */
+    const applied = new Mutation({
+      mutations: frame.mutations,
+      transactionId: frame.transactionId,
+      resultRev: frame.resultRev,
+      previousRev: frame.previousRev,
+      timestamp: frame.timestamp,
+    }).apply({...DRAFT})
+
+    /* ORACLE B — what the frame's `effects` CLAIM, decoded by real mendoza. */
+    const claimed = alignerApply(omitRev({...DRAFT}), frame)
+
+    expect(claimed).toEqual(omitRev(applied))
+    /* And the claim is not vacuous: it must actually carry the new title. */
+    expect(claimed).toMatchObject({title: 'Typed into the pane'})
+    expect(claimed).not.toHaveProperty(GUARD_FIELD)
+  })
+
+  it('classifies an edit as `modified` — not created, not deleted', () => {
+    const echo = studioEcho([PUBLISHED, DRAFT])
+    const frames = studioFrames(echo, PAIR_IDS)
+
+    echo.emit(echo.planActions(editAction('Still just an edit')).plans, 'tx-1')
+
+    expect(getEffectState(frames[0]!.effects)).toBe('modified')
+    expect(
+      onMutationReceived(
+        {...frames[0]!, version: 'draft'},
+        {documentVariantType: 'draft', isLiveEdit: false},
+      ),
+    ).toEqual({refetched: false, effectState: 'modified'})
+  })
+
+  it('classifies a branch-created draft as `created`, so the events panel refetches', () => {
+    /*
+     * THE CASE `{apply: [], revert: []}` GETS WRONG. An empty effect reports
+     * `modified` for a document that did not exist a moment ago, so
+     * `onMutationReceived` never calls `onRefetch()` and the events panel never
+     * learns the version appeared (lib/index.js:5691-5694).
+     */
+    const echo = studioEcho([])
+    const body: Rec = {
+      _id: 'drafts.branch-only',
+      _type: 'article',
+      _createdAt: '2026-01-01T00:00:00.000Z',
+      title: 'Born on the branch',
+    }
+    echo.setOverlayDocument('drafts.branch-only', body)
+    const frames = studioFrames(echo, ['drafts.branch-only'])
+
+    echo.emit(
+      echo.planActions([
+        {actionType: 'sanity.action.document.create', attributes: body},
+      ]).plans,
+      'tx-create',
+    )
+
+    const frame = frames[0]!
+    expect(frame.transition).toBe('appear')
+    expect(getEffectState(frame.effects)).toBe('created')
+    expect(frame.effects.revert).toEqual([0, null])
+    /* Applying it to a missing document must reconstruct the body — exactly
+     * what `isVersionCreateTransaction` relies on
+     * (lib/useBundleDocuments-BYW8M9LS.js:11202). */
+    expect(alignerApply(null, frame)).toMatchObject({
+      _id: 'drafts.branch-only',
+      title: 'Born on the branch',
+    })
+  })
+
+  it('classifies the draft side of a publish as `deleted`', () => {
+    const echo = studioEcho([PUBLISHED, DRAFT])
+    const frames = studioFrames(echo, PAIR_IDS)
+
+    echo.emit(
+      echo.planActions([
+        {
+          actionType: 'sanity.action.document.publish',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+        },
+      ]).plans,
+      'tx-publish',
+    )
+
+    const draftFrame = frames.find((frame) => frame.documentId === 'drafts.article-1')!
+    expect(draftFrame.transition).toBe('disappear')
+    expect(draftFrame.effects.apply).toEqual([0, null])
+    expect(getEffectState(draftFrame.effects)).toBe('deleted')
+    expect(alignerApply({...DRAFT}, draftFrame)).toBeNull()
+
+    /* The published side is a content transition, and it must state the body
+     * the draft carried — a publish claiming "nothing changed" would leave the
+     * history timeline showing the pre-publish published document. */
+    const publishedFrame = frames.find((frame) => frame.documentId === 'article-1')!
+    expect(getEffectState(publishedFrame.effects)).toBe('modified')
+    expect(alignerApply(omitRev({...PUBLISHED}), publishedFrame)).toMatchObject({
+      _id: 'article-1',
+      title: DRAFT.title,
+    })
+  })
+
+  it('never claims a transition it cannot describe — the fallback is announced', () => {
+    /*
+     * A patch shape the echo does not fully understand (`insert`,
+     * `diffMatchPatch`, an array-selector path) must NOT be spelled as a
+     * confident mendoza patch. §5.5 forbids a SILENT approximation, so the
+     * floor is an empty patch plus a stated reason — never a fabricated body.
+     */
+    const onError = vi.fn()
+    const echo = studioEcho([PUBLISHED, DRAFT], {onError})
+    const frames = studioFrames(echo, PAIR_IDS)
+
+    echo.emit(
+      echo.planActions([
+        {
+          actionType: 'sanity.action.document.edit',
+          draftId: 'drafts.article-1',
+          publishedId: 'article-1',
+          patch: {insert: {after: 'body[-1]', items: [{_type: 'block'}]}},
+        },
+      ]).plans,
+      'tx-insert',
+    )
+
+    const frame = frames[0]!
+    expect(frame.effects.apply).toEqual([])
+    /* Still a legal frame for every other consumer, and still `modified`. */
+    expect(getEffectState(frame.effects)).toBe('modified')
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('drafts.article-1'))
+    expect(onError.mock.calls.map(String).join('\n')).toMatch(/insert/)
+  })
+
+  /* ------------------------------------------------------------------ *
+   * The bounded applier, pinned op by op against the REAL mutator.
+   *
+   * The whole risk of stating a body rather than an empty patch is that the
+   * body might be WRONG — a wrong body in the history timeline is worse than
+   * no body. So every operation the echo claims to understand is decided here
+   * by `@sanity/mutator`, never by re-deriving the expected value by hand.
+   * ------------------------------------------------------------------ */
+
+  const PATCHABLE: Rec = {
+    _id: 'drafts.article-1',
+    _type: 'article',
+    _rev: 'lake-draft-rev-1',
+    _createdAt: '2025-12-01T00:00:00.000Z',
+    _updatedAt: '2025-12-02T00:00:00.000Z',
+    title: 'Article 1 draft',
+    views: 10,
+    meta: {slug: 'article-1', locale: 'en'},
+  }
+
+  function frameForPatch(body: Rec, onError?: (message: string) => void): OverlayMutationEvent {
+    const echo = studioEcho([PATCHABLE], onError ? {onError} : {})
+    const frames = studioFrames(echo, ['drafts.article-1'])
+    echo.emit(
+      echo.planMutations({mutations: [{patch: {id: 'drafts.article-1', ...body}}]}).plans,
+      'tx-patch',
+    )
+    return frames[0]!
+  }
+
+  it.each([
+    ['set', {set: {title: 'Renamed'}}],
+    ['set on a dotted path', {set: {'meta.slug': 'renamed'}}],
+    ['setIfMissing filling a gap', {setIfMissing: {subtitle: 'Added'}}],
+    ['setIfMissing leaving a value alone', {setIfMissing: {title: 'MUST NOT WIN'}}],
+    ['unset', {unset: ['title']}],
+    ['unset on a dotted path', {unset: ['meta.locale']}],
+    ['unset of an absent field', {unset: ['absentField']}],
+    ['unset of an absent dotted path', {unset: ['meta.absent']}],
+    ['inc', {inc: {views: 5}}],
+    ['dec', {dec: {views: 3}}],
+    ['several ops at once', {set: {title: 'Both'}, unset: ['meta.locale'], inc: {views: 1}}],
+  ])('states the same body @sanity/mutator computes for `%s`', (_label, body) => {
+    const frame = frameForPatch(body as Rec)
+
+    const applied = new Mutation({
+      mutations: frame.mutations,
+      transactionId: frame.transactionId,
+      resultRev: frame.resultRev,
+      previousRev: frame.previousRev,
+      timestamp: frame.timestamp,
+    }).apply({...PATCHABLE, meta: {...(PATCHABLE.meta as Rec)}})
+
+    expect(alignerApply(omitRev({...PATCHABLE, meta: {...(PATCHABLE.meta as Rec)}}), frame)).toEqual(
+      omitRev(applied),
+    )
+    /* NON-VACUITY: an empty patch would satisfy `toEqual` only if the mutation
+     * genuinely changed nothing, and none of these do. */
+    expect(frame.effects.apply).not.toEqual([])
+  })
+
+  it.each([
+    ['insert', {insert: {after: 'body[-1]', items: [{_type: 'block'}]}}],
+    ['diffMatchPatch', {diffMatchPatch: {title: '@@ -1,5 +1,5 @@\n-Hello\n+Hullo\n'}}],
+    ['an array-selector path', {set: {'body[0].text': 'x'}}],
+    ['a keyed-selector path', {set: {'body[_key=="a"].text': 'x'}}],
+    ['an unknown operation', {merge: {title: 'x'}}],
+    /*
+     * FOUND BY THE ORACLE, NOT BY INSPECTION. `@sanity/mutator` throws
+     * `Invalid tokens in jsonpath 'nothing-here' @ 7` on a hyphen, so a path
+     * this module accepted but the pane's own patcher rejects would have been
+     * a confident claim about a patch that cannot even be parsed.
+     */
+    ['a path the mutator cannot tokenize', {unset: ['nothing-here']}],
+    ['a leading-digit segment', {set: {'0bad': 'x'}}],
+    ['an empty path', {set: {'': 'x'}}],
+  ])('refuses to invent a body for `%s`, and says so', (_label, body) => {
+    const onError = vi.fn()
+    const frame = frameForPatch(body as Rec, onError)
+
+    expect(frame.effects.apply).toEqual([])
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('drafts.article-1'))
+    /* The frame is still delivered, still chains, and still classifies. */
+    expect(frame.previousRev).toBe(PATCHABLE._rev)
+    expect(frame.mutations.length).toBeGreaterThan(0)
+    expect(getEffectState(frame.effects)).toBe('modified')
+  })
+
+  it('states `effects` for every frame of every supported action', () => {
+    /*
+     * THE CLASS. One missing field on one action shape was the whole defect, so
+     * the contract is asserted across the action table rather than on an edit.
+     */
+    const cases: Array<{name: string; run: (echo: OverlayEcho) => void}> = [
+      {name: 'edit', run: (echo) => echo.emit(echo.planActions(editAction('E')).plans, 'tx')},
+      {
+        name: 'publish',
+        run: (echo) =>
+          echo.emit(
+            echo.planActions([
+              {
+                actionType: 'sanity.action.document.publish',
+                draftId: 'drafts.article-1',
+                publishedId: 'article-1',
+              },
+            ]).plans,
+            'tx',
+          ),
+      },
+      {
+        name: 'unpublish',
+        run: (echo) =>
+          echo.emit(
+            echo.planActions([
+              {
+                actionType: 'sanity.action.document.unpublish',
+                draftId: 'drafts.article-1',
+                publishedId: 'article-1',
+              },
+            ]).plans,
+            'tx',
+          ),
+      },
+      {
+        name: 'discard',
+        run: (echo) =>
+          echo.emit(
+            echo.planActions([
+              {actionType: 'sanity.action.document.discard', draftId: 'drafts.article-1'},
+            ]).plans,
+            'tx',
+          ),
+      },
+      {
+        name: 'delete',
+        run: (echo) =>
+          echo.emit(
+            echo.planActions([
+              {
+                actionType: 'sanity.action.document.delete',
+                publishedId: 'article-1',
+                includeDrafts: ['drafts.article-1'],
+              },
+            ]).plans,
+            'tx',
+          ),
+      },
+      {
+        name: 'restore',
+        run: (echo) =>
+          echo.emit(
+            echo.planActions([
+              {
+                actionType: 'sanity.action.document.replaceDraft',
+                publishedId: 'article-1',
+                attributes: {...DRAFT, title: 'Restored'},
+              },
+            ]).plans,
+            'tx',
+          ),
+      },
+      {
+        name: 'raw mutate',
+        run: (echo) =>
+          echo.emit(
+            echo.planMutations({mutations: [{createOrReplace: {...DRAFT, title: 'Raw'}}]}).plans,
+            'tx',
+          ),
+      },
+    ]
+
+    for (const testCase of cases) {
+      const echo = studioEcho([PUBLISHED, DRAFT])
+      const frames = studioFrames(echo, PAIR_IDS)
+      testCase.run(echo)
+
+      expect(frames.length, testCase.name).toBeGreaterThan(0)
+      for (const frame of frames) {
+        expect(frame, `${testCase.name} / ${frame.documentId}`).toHaveProperty('effects')
+        expect(Array.isArray(frame.effects.apply), testCase.name).toBe(true)
+        expect(Array.isArray(frame.effects.revert), testCase.name).toBe(true)
+        /* `getEffectState` must never see an effect it reads as `noop`: that is
+         * the value it returns for a MISSING effect, and it is the one answer
+         * no delivered frame can honestly carry. */
+        expect(getEffectState(frame.effects), testCase.name).not.toBe('noop')
+      }
+    }
   })
 })

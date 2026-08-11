@@ -40,6 +40,13 @@ import {
   type PlannedEvent,
 } from './echo'
 import {STAGING_WRITE_POLICY, isStagingWrite} from 'sanity-overlay-client/stagingHost'
+import {
+  classifyOverlayDocRead,
+  overlayDocAnswer,
+  overlayDocOpinion,
+  type OverlayBranchLookup,
+  type OverlayDocOpinion,
+} from './docReads'
 import {classifyOverlayHistoryRead, emptyOverlayHistoryAnswer} from './history'
 import type {StudioReadRouter} from './reads'
 import type {
@@ -140,6 +147,24 @@ export interface OverlayFacadeOptions {
    * before this option existed.
    */
   branchHolds?: (documentId: string) => boolean
+  /**
+   * The branch as a lookup by document ADDRESS, for the `/data/doc` existence
+   * probe (`docReads.ts`).
+   *
+   * SEPARATE FROM {@link OverlayFacadeOptions.branchHolds} because the two
+   * questions are different, not because one is a better spelling of the other.
+   * `branchHolds` answers "does the branch have anything to say about this id",
+   * which is all a history read needs. The existence probe needs to know WHICH
+   * thing — a body or a tombstone — because those produce opposite answers, and
+   * for a content-carrying probe it needs the body itself.
+   *
+   * SYNCHRONOUS, for the same reason `branchHolds` is: the call site is
+   * `request()` and the decision has to be made before the delegation happens.
+   *
+   * ABSENT MEANS UNCHANGED: every `/data/doc` read is delegated to base exactly
+   * as it was before this option existed.
+   */
+  branchView?: () => OverlayBranchLookup
   /**
    * Deadline for one DELEGATED read, in ms. See {@link DEFAULT_READ_TIMEOUT_MS}.
    * `0` or a negative number disables it.
@@ -490,16 +515,45 @@ function absoluteRequestUrl(client: object, target: unknown): string {
 /** One wrapper per real client, so `wrapWithOverlay(x)` is referentially stable. */
 const facadeCache = new WeakMap<object, object>()
 
+/**
+ * The dataset this facade is FOR, read once from the client it is built around.
+ *
+ * READ AT WRAP TIME, NEVER AT CALL TIME, and that is the entire point.
+ * `client.withConfig({projectId, dataset})` produces a clone pointed at somebody
+ * else's dataset, and `CLONING_METHODS` re-wraps that clone with THIS facade —
+ * so a call-time `t.config().dataset` would answer with the foreign dataset and
+ * the check would agree with itself. sanity 6.8.0 makes exactly that call:
+ * `useBundleDocuments:33273` `fetchDocumentAvailability` is the cross-dataset
+ * reference probe, and it asks `/data/doc/<theirDataset>/<id>`.
+ *
+ * `undefined` when the client will not say, which leaves the `/data/doc` claim
+ * off entirely rather than guessing — a fail-closed default for a check whose
+ * whole job is to stop one dataset answering for another.
+ */
+function homeDatasetOf(client: object): string | undefined {
+  const config = (client as Rec).config
+  if (typeof config !== 'function') return undefined
+  try {
+    const value = (config as () => unknown).call(client)
+    return isRec(value) && typeof value.dataset === 'string' ? value.dataset : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function wrapWithOverlay<T extends object>(client: T, options: OverlayFacadeOptions): T {
   const cached = facadeCache.get(client)
   if (cached) return cached as T
-  const facade = createFacade(options)
+  const facade = createFacade(options, homeDatasetOf(client))
   const proxy = facade.wrap(client, 'promise')
   facadeCache.set(client, proxy)
   return proxy
 }
 
-function createFacade(options: OverlayFacadeOptions): {
+function createFacade(
+  options: OverlayFacadeOptions,
+  homeDataset: string | undefined,
+): {
   wrap: <T extends object>(target: T, kind: Kind) => T
 } {
   const {echo, transport} = options
@@ -586,6 +640,107 @@ function createFacade(options: OverlayFacadeOptions): {
       subscriber.next(value)
       subscriber.complete()
       onDelivered?.()
+    })
+  }
+
+  /**
+   * A promise, delivered on the observable channel — one value then complete,
+   * or the rejection.
+   *
+   * `closed` is not decoration: `client.observable.request` is what Studio
+   * unsubscribes from when a pane closes mid-flight, and a `next` after that
+   * would push a value into a torn-down rxjs chain.
+   */
+  function observableFrom<T>(work: Promise<T>): MinimalObservable<T> {
+    return makeObservable<T>((subscriber) => {
+      let closed = false
+      void work.then(
+        (value) => {
+          if (closed) return
+          subscriber.next(value)
+          subscriber.complete()
+        },
+        (error: unknown) => {
+          if (closed) return
+          subscriber.error(error)
+        },
+      )
+      return () => {
+        closed = true
+      }
+    })
+  }
+
+  /**
+   * ───────────────────────────────────────────────────────────────────────────
+   * `/data/history` IS A GAP, AND A GAP THE EDITOR IS NOT TOLD ABOUT IS A LIE.
+   *
+   * The facade answers a branch document's history reads with an EMPTY history
+   * (`history.ts`) rather than base's, and that is the right answer — but it is
+   * an answer, and a diff view or a restore affordance built on it describes a
+   * document with no past. For a document the branch CREATED that is simply
+   * true. For a base document the branch has EDITED it is not: the document has
+   * a real upstream lineage, and `branchHolds` cannot tell the two apart
+   * (see its own doc comment). Both are therefore told the same thing, and
+   * §5.5 requires that "the branch's history is not shown here" be said rather
+   * than deduced from an empty list.
+   *
+   * WHY IT IS NOT SERVED FOR REAL. Sanity's history plane is three endpoints
+   * that only make sense together: `events`, `documents?revision=<rev>` and the
+   * transaction log. The revisions the first two are keyed by come OUT of the
+   * translog — and the translog is fetched with the global `fetch()`, which no
+   * wrapper around a client method can reach (see the class table in the
+   * `request` branch). Serving two of three would hand the diff view revision
+   * ids nothing can resolve, which is a worse failure than an empty timeline
+   * and a sentence saying why.
+   *
+   * ONCE PER DOCUMENT, not once per read: the timeline machinery re-asks on
+   * every pane focus, and a message per read would bury everything else in the
+   * status panel.
+   * ───────────────────────────────────────────────────────────────────────────
+   */
+  const announcedEmptyHistory = new Set<string>()
+
+  /**
+   * OFF THE CALLER'S STACK, and that is not tidiness.
+   *
+   * The read this announces is subscribed to by `DocumentEventsPane` DURING ITS
+   * OWN RENDER, and `onError` is `runtime.ts`'s `log`, which ends in `notify()`
+   * — the status banner's subscriber, i.e. `setState` on a different component.
+   * Delivered synchronously that is a render-phase update, and React said so:
+   *
+   *   Cannot update a component (`OverlayStatusLayout`) while rendering a
+   *   different component (`DocumentEventsPane`).
+   *
+   * Not a warning to silence: React discards and re-runs the interrupted
+   * render, and in the session that produced this the surrounding tree fell
+   * back to its error boundary. The set is still updated synchronously, so
+   * "once per document" holds even if two panes ask in the same tick.
+   *
+   * `queueMicrotask` rather than `setTimeout`: the message must reach the panel
+   * in the same frame a person is looking at, and a microtask runs after the
+   * current stack unwinds but before paint. A host without it falls back to a
+   * resolved promise, which schedules on the same queue.
+   */
+  const deferAnnouncement =
+    typeof queueMicrotask === 'function'
+      ? queueMicrotask
+      : (task: () => void): void => {
+          void Promise.resolve().then(task)
+        }
+
+  function announceEmptyHistory(ids: readonly string[]): void {
+    const fresh = ids.filter((id) => !announcedEmptyHistory.has(id))
+    if (fresh.length === 0) return
+    for (const id of fresh) announcedEmptyHistory.add(id)
+    deferAnnouncement(() => {
+      noteError(
+        `[sanity-overlay-studio] this document's history is NOT shown: ${fresh.join(', ')} ` +
+          `is held by the branch, and the branch keeps its own edit log rather than Sanity's. ` +
+          `The timeline was answered EMPTY rather than with the base dataset's history, which ` +
+          `belongs to different content than the pane is showing. If this document also exists ` +
+          `in the base dataset, its history is still there — it is just not reachable from here.`,
+      )
     })
   }
 
@@ -1689,50 +1844,139 @@ function createFacade(options: OverlayFacadeOptions): {
             const isWrite = plane !== undefined && method !== 'GET' && method !== 'HEAD'
             /*
              * ─────────────────────────────────────────────────────────────────
-             * A DOCUMENTED READ GAP, NOT AN OVERSIGHT. §5.5 forbids pretending.
+             * THE RAW-`request` READ CLASS, AND WHAT EACH MEMBER GETS.
              *
-             * A raw `request({uri})` READ is delegated to the base dataset
-             * untouched, and some of those really do carry document content or
-             * document EXISTENCE. Transcribed from sanity 6.8.0, the ones that
-             * matter (`node_modules/sanity/lib/…`):
+             * A raw `request({uri})` READ used to be delegated to the base
+             * dataset untouched, in every case. Some of those carry document
+             * CONTENT or document EXISTENCE, and staging's answer to those is
+             * not the branch's. Transcribed from sanity 6.8.0
+             * (`node_modules/sanity/lib/…`), with the verdict for each:
              *
-             *   datastores-DqFH7RLd.js:249   `/data/doc/<ds>/<ids>?excludeContent=true`
-             *                                — preview availability: does this
-             *                                  document exist? A branch-created
-             *                                  document reads as missing.
-             *   datastores-DqFH7RLd.js:5533  `/data/doc/<ds>/<ids>`
-             *                                — validation's reference-exists probe.
-             *   datastores-DqFH7RLd.js:7122  `/data/history/<ds>/documents/…`
-             *   datastores-DqFH7RLd.js:7133  ditto — `getDocumentAtRevision`,
-             *                                  which feeds the diff view and
-             *                                  history restore.
+             *  INTERCEPTED — answered from the branch (`docReads.ts`):
+             *   datastores-DqFH7RLd.js:244   `/data/doc/<ds>/<ids>?excludeContent=true`
+             *                                  preview availability, the fallback
+             *                                  inside `observeDocumentAvailability`
+             *   datastores-DqFH7RLd.js:5533  `createBatchedGetDocumentExists`
+             *   structureTool-EN0gOzyJ.js:739  delete-confirm existence probe
+             *   useBundleDocuments…:34102    `gdr.availability` — and note that
+             *                                  this one's `excludeContent` sits
+             *                                  where @sanity/client never reads
+             *                                  it, so it is a CONTENT read
+             *
+             *  INTERCEPTED — answered EMPTY, and said out loud (`history.ts`):
              *   useBundleDocuments…:5009     `/data/history/<ds>/events/documents/<id>`
              *   useBundleDocuments…:5101     `/data/history/<ds>/documents/<id>?revision=`
-             *   structureTool-EN0gOzyJ.js:744, :761 — delete-confirm existence
-             *                                  probe and cross-dataset references.
+             *   datastores-DqFH7RLd.js:7122, :7133  `getHistory`,
+             *                                  `getDocumentAtRevision`
              *
-             * They are answered by the BASE DATASET, so anything a branch created
-             * looks absent to them and anything a branch deleted looks present.
+             *  DELEGATED, and wrong about the branch by construction:
+             *   useBundleDocuments…:33275    `/data/doc/<OTHER ds>/<id>` —
+             *                                  `cross-dataset-refs.availability`.
+             *                                  Same endpoint as the five above
+             *                                  but addressed to a dataset this
+             *                                  overlay is not for, and the
+             *                                  dataset gate refuses to answer
+             *                                  it. A branch-created or
+             *                                  branch-deleted document is
+             *                                  invisible to it either way, which
+             *                                  is correct: it is asking about
+             *                                  somebody else's dataset, where
+             *                                  this branch does not exist.
+             *   structureTool-EN0gOzyJ.js:761 `/data/references/<ds>/documents/<id>/to`
+             *                                  — a CROSS-DATASET index only the
+             *                                  Content Lake maintains. A branch
+             *                                  reference is invisible to it and
+             *                                  a branch-deleted one still counts.
+             *                                  Nothing here can compute it: it
+             *                                  spans datasets this session has no
+             *                                  credential for. Gated behind
+             *                                  `getDocumentExistence`, which IS
+             *                                  intercepted, so a branch-deleted
+             *                                  document now answers "no such
+             *                                  document" before this runs.
+             *   datastores-DqFH7RLd.js:7158  `/data/history/<ds>/transactions/…`
+             *                                  through `client.request` — see the
+             *                                  translog note below; the same
+             *                                  NDJSON body, on a path this facade
+             *                                  deliberately does not claim.
              *
-             * THE TWO HISTORY ONES ARE NO LONGER DELEGATED — see below and
-             * `history.ts`. `/data/doc` still is: it is an EXISTENCE question,
-             * not a history one, and the overlay origin answers it from branch
-             * state already.
+             *  DELEGATED, and correct: everything else on the list is a PROJECT-
+             *  plane read — `/projects/*`, `/users/*`, `/auth/*`, `/features`,
+             *  `/access/*`, `/journey/*`, `/schedules/*`, `/media-libraries/*`,
+             *  `/intake/*`, `/subscriptions/*`, `/help`. None of them is about a
+             *  document, so the branch has nothing to say about any of them.
              *
-             * Strictly worse, and genuinely UNREACHABLE from any client proxy:
-             * the timeline reads its transaction log with the GLOBAL `fetch()`,
-             * built from `client.getUrl()` + `client.config().token`
-             * (`datastores-DqFH7RLd.js:6876`, `:7097`;
-             * `useBundleDocuments…:4822`). No wrapper around a client method can
-             * see those at all — and it is the translog, not the events feed,
-             * that produced the live `getEditEvents` TypeError, because
-             * `{"transactions":[]}` on an NDJSON endpoint decodes to one bogus
-             * transaction with no `effects`. `EMPTY_TRANSLOG_NDJSON` states the
-             * contract that closes it; enforcing it belongs to whatever serves
-             * `apiHost`, which is why the constant is exported rather than used.
+             *  UNREACHABLE from any client proxy, still: the timeline reads its
+             *  transaction log with the GLOBAL `fetch()`, built from
+             *  `client.getUrl()` + `client.config().token`
+             *  (`datastores-DqFH7RLd.js:6868` `getJsonStream`, called at `:7097`;
+             *  `useBundleDocuments…:4822`). No wrapper around a client method can
+             *  see those at all — and it is the translog, not the events feed,
+             *  that produced the live `getEditEvents` TypeError, because
+             *  `{"transactions":[]}` on an NDJSON endpoint decodes to one bogus
+             *  transaction with no `effects`. `EMPTY_TRANSLOG_NDJSON` states the
+             *  contract that closes it; enforcing it belongs to whatever serves
+             *  `apiHost`, which is why the constant is exported rather than used.
              * ─────────────────────────────────────────────────────────────────
              */
             if (!isWrite) {
+              /*
+               * THE EXISTENCE PROBE, ANSWERED ABOUT THE BRANCH.
+               *
+               * `docReads.ts` carries the whole argument for why this is a
+               * lookup rather than a second read path. Two properties decide
+               * the shape of the call here:
+               *
+               *   - base is asked whenever ANY requested id is one the branch
+               *     has no opinion about, and its envelope is EDITED rather
+               *     than replaced. A batch of a hundred ids with one branch
+               *     document in it still gets base's answer for the other 99.
+               *   - base is NOT asked when the branch can answer every id. That
+               *     is not an optimisation: it removes a network dependency
+               *     from a probe whose answer is already known, and a request
+               *     nobody needs is a request that can hang (§5.5).
+               *
+               * The method test is load-bearing for the same reason it is on
+               * the history read: `/data/doc` carries no write plane, so a POST
+               * aimed at one of these paths reaches here.
+               */
+              const branchView = options.branchView
+              const docRead =
+                branchView === undefined || (method !== 'GET' && method !== 'HEAD')
+                  ? undefined
+                  : classifyOverlayDocRead(request)
+              if (
+                docRead !== undefined &&
+                branchView !== undefined &&
+                /* THE DATASET GATE. See `homeDatasetOf`: a cross-dataset probe
+                 * travels on a clone of this very proxy, and the branch has
+                 * nothing to say about somebody else's dataset.
+                 *
+                 * This is ALSO the fail-closed case, without a second test for
+                 * it: a client that would not state a dataset leaves
+                 * `homeDataset` undefined, and no string equals `undefined`, so
+                 * "I could not check" delegates. Written as one comparison
+                 * rather than two so there is no branch a test cannot reach. */
+                docRead.dataset === homeDataset
+              ) {
+                const view = branchView()
+                const opinions: OverlayDocOpinion[] = docRead.ids.map((id) =>
+                  overlayDocOpinion(view, id),
+                )
+                if (opinions.some((opinion) => opinion !== undefined)) {
+                  if (opinions.every((opinion) => opinion !== undefined)) {
+                    const answer = overlayDocAnswer({read: docRead, base: undefined, opinions})
+                    return kind === 'observable'
+                      ? observableOf(answer)
+                      : Promise.resolve(answer)
+                  }
+                  const merged = firstValueOf(tapReadErrors(fn.apply(t, args))).then((base) =>
+                    overlayDocAnswer({read: docRead, base, opinions}),
+                  )
+                  return kind === 'observable' ? observableFrom(merged) : merged
+                }
+              }
+
               /*
                * A BRANCH DOCUMENT'S UPSTREAM HISTORY IS EMPTY, AND SAYING SO IS
                * NOT AN APPROXIMATION.
@@ -1773,6 +2017,7 @@ function createFacade(options: OverlayFacadeOptions): {
                 branchHolds !== undefined &&
                 historyRead.ids.every((id) => branchHolds(id))
               ) {
+                announceEmptyHistory(historyRead.ids)
                 const answer = emptyOverlayHistoryAnswer(historyRead)
                 return kind === 'observable' ? observableOf(answer) : Promise.resolve(answer)
               }

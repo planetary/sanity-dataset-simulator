@@ -68,8 +68,28 @@ const NO_READ_OPS = ['/mutate', '/actions', '/upload']
 /** Agent Actions that reach Content Lake: `/agent/action/<verb>/<dataset>`. */
 const AGENT_WRITE_ACTIONS = new Set(['patch', 'generate', 'transform', 'translate', 'prompt'])
 
-/** Data-plane operations with read semantics, relative to `/data` or a resource base. */
-const READ_DATA_OPS = ['/query', '/doc', '/listen', '/history', '/export', '/live/events', '/ping']
+/**
+ * Data-plane operations with read semantics, relative to `/data` or a resource
+ * base.
+ *
+ * `/references` is the referring-documents index the delete-confirm dialog
+ * reads (`sanity@6.8.0 structureTool-EN0gOzyJ.js:762`). It is a GET over an
+ * index and writes nothing; it is absent from the evidence log this list was
+ * otherwise built from because the probe is gated behind an existence check
+ * that used to answer "absent" for everything. See the long note on the same
+ * constant in `examples/kitchen-sink/spikeB-proxy/writeGuard.mjs` — the two
+ * lists are under one contract and must not drift.
+ */
+const READ_DATA_OPS = [
+  '/query',
+  '/doc',
+  '/listen',
+  '/history',
+  '/references',
+  '/export',
+  '/live/events',
+  '/ping',
+]
 
 /**
  * Data-plane reads that legitimately arrive over POST: `_dataRequest()` falls

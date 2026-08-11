@@ -7,6 +7,9 @@
  * would pass it fails loudly instead. A contract no bad implementation can
  * fail is not a contract.
  */
+import {readdirSync, readFileSync} from 'node:fs'
+import {createRequire} from 'node:module'
+import {dirname, join} from 'node:path'
 import {describe, expect, it} from 'vitest'
 // @ts-expect-error — plain-JS guard shared with the Node proxy; no .d.ts by design
 import {
@@ -385,5 +388,102 @@ describe('normalizePath', () => {
   it('never throws on a malformed percent-escape', () => {
     expect(() => normalizePath('/data/mutate/%zz%')).not.toThrow()
     expect(normalizePath('/data/mutate/%zz%')).toBe('/data/mutate/%zz%')
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════ *
+ * THE DERIVED COMPLETENESS CHECK — the enumerated cases cannot find this class
+ *
+ * WHY IT EXISTS. `/data/references` was missing from the guard's read
+ * allowlist, and every hand-written case in the contract passed anyway: nobody
+ * had written the case, because nobody had seen the request. It stayed
+ * invisible for a second reason no list of examples can model — the request is
+ * GATED behind `getDocumentExistence`, which in Mode 2 answered "absent" for
+ * every id until the overlay learned to answer it truthfully. The hole opened
+ * when a NEIGHBOURING component stopped lying, and the symptom was four E2E
+ * specs failing on a missing tombstone.
+ *
+ * So the oracle here is not a list. It is `sanity@6.8.0` itself: every
+ * `/data/<operation>` the shipped bundle can construct is enumerated out of the
+ * dist, and each one must be CLASSIFIED — named in the table below as a read or
+ * a write, and agreed with by the guard. A Studio upgrade that introduces a new
+ * data-plane operation fails here BY NAME, rather than as a 403 in a browser
+ * that nobody can trace back to this file.
+ *
+ * ON THE DENOMINATOR. Two shapes reach the wire and both are scanned: a literal
+ * `/data/<op>` in a template string, and `getDataUrl("<op>", …)`, which
+ * `@sanity/client` expands to `/data/<op>/<dataset>`. The scan asserts it found
+ * the operations already known to be there, so a broken regex cannot pass by
+ * finding nothing.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Every data-plane operation `sanity@6.8.0` can address, and what it is.
+ *
+ * `read: true` means the guard MUST admit a GET/HEAD of it — refusing breaks a
+ * Studio surface. `read: false` means the guard must refuse it whatever the
+ * verb, which is the `NO_READ_OPS` rule and the reason a GET probe at
+ * `/data/mutate` is still a write.
+ */
+const DATA_PLANE_OPERATIONS: Readonly<Record<string, {read: boolean; why: string}>> = Object.freeze({
+  query: {read: true, why: 'GROQ'},
+  doc: {read: true, why: 'document fetch and the existence probe'},
+  listen: {read: true, why: 'the listener stream'},
+  history: {read: true, why: 'events, documents-at-revision and the translog'},
+  references: {
+    read: true,
+    why: 'the referring-documents index — structureTool:762, the delete-confirm dialog',
+  },
+  export: {read: true, why: 'dataset export'},
+  ping: {read: true, why: 'dataset-scoped health check'},
+  mutate: {read: false, why: 'the mutation endpoint'},
+  actions: {read: false, why: 'the document-actions endpoint'},
+})
+
+describe('write-guard · every data-plane operation sanity 6.8.0 can address is classified', () => {
+  const requireFromExample = createRequire(
+    new URL('../../../examples/kitchen-sink/package.json', import.meta.url),
+  )
+  const lib = join(dirname(requireFromExample.resolve('sanity/package.json')), 'lib')
+
+  const found = new Set<string>()
+  for (const name of readdirSync(lib)) {
+    if (!name.endsWith('.js')) continue
+    const source = readFileSync(join(lib, name), 'utf8')
+    for (const match of source.matchAll(/\/data\/([a-zA-Z][a-zA-Z0-9_-]*)/g)) found.add(match[1]!)
+    for (const match of source.matchAll(/getDataUrl\(\s*["'`]([a-zA-Z][a-zA-Z0-9_-]*)/g)) {
+      found.add(match[1]!)
+    }
+  }
+
+  it('the scan actually found the operations already known to be there', () => {
+    /* The denominator. A regex that matched nothing would make every case below
+     * vacuous, which is the one failure a completeness check must not have. */
+    expect([...found].sort()).toEqual(expect.arrayContaining(['doc', 'history', 'references']))
+  })
+
+  it('names no operation the table has not classified', () => {
+    const unclassified = [...found].filter((op) => !(op in DATA_PLANE_OPERATIONS)).sort()
+    expect(unclassified).toEqual([])
+  })
+
+  it.each(
+    Object.entries(DATA_PLANE_OPERATIONS)
+      .filter(([, spec]) => spec.read)
+      .map(([op, spec]) => [op, spec.why] as const),
+  )('admits a GET and a HEAD of /data/%s — %s', (op) => {
+    const url = `/v2025-02-19/data/${op}/parity/article-01`
+    expect(isWriteRequest({method: 'GET', url})).toBe(false)
+    expect(isWriteRequest({method: 'HEAD', url})).toBe(false)
+  })
+
+  it.each(
+    Object.entries(DATA_PLANE_OPERATIONS)
+      .filter(([, spec]) => !spec.read)
+      .map(([op, spec]) => [op, spec.why] as const),
+  )('refuses /data/%s on every verb — %s', (op) => {
+    for (const method of ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']) {
+      expect(isWriteRequest({method, url: `/v2025-02-19/data/${op}/parity`})).toBe(true)
+    }
   })
 })

@@ -508,6 +508,51 @@ const READ_PASSTHROUGH: WriteGuardCase[] = (
     ['GET', '/v2025-02-19/data/doc/' + DS + '/article-01', 'document fetch'],
     ['GET', '/v2025-02-19/data/history/' + DS + '/article-01', 'document history'],
     ['GET', '/v2025-02-19/data/export/' + DS, 'dataset export is a read'],
+
+    /* ---- `/data/references` — the referring-documents index --------------
+     *
+     * THE DEFECT THIS ARRIVED WITH, measured 2026-08-10 in the local E2E stack:
+     *
+     *   GET /v2025-02-19/data/references/parity/documents/e2e-actions-delete/to
+     *     -> 403  gate: write-guard  refusal: OVERLAY_WRITE_BLOCKED
+     *
+     * Delete and Unpublish then never wrote a tombstone, four E2E specs failed,
+     * and the visible symptom was a React error boundary tearing the document
+     * pane down — none of which names the guard.
+     *
+     * `sanity@6.8.0 lib/structureTool-EN0gOzyJ.js:762` issues it as
+     *   `url: /data/references/<ds>/documents/<id>/to?excludeInternalReferences=true&excludePaths=true`
+     * from the delete-confirm dialog, to list the documents that still point at
+     * the one being removed. It is a GET, it returns an index, and it writes
+     * nothing.
+     *
+     * WHY IT WENT UNNOTICED UNTIL NOW, which is the part worth keeping: the
+     * probe is GATED behind `getDocumentExistence`. Until the branch could
+     * answer that question the document always read as ABSENT in Mode 2, so
+     * this request was never issued and the missing allowlist entry was
+     * unreachable. Teaching the overlay to answer existence truthfully is what
+     * made it reachable. A guard hole that only opens once a neighbouring
+     * component starts telling the truth is exactly the kind the enumerated
+     * cases below cannot be trusted to find on their own — see the derived
+     * completeness check in `test/write-guard.test.ts`.
+     */
+    [
+      'GET',
+      '/v2025-02-19/data/references/' +
+        DS +
+        '/documents/article-01/to?excludeInternalReferences=true&excludePaths=true',
+      'the referring-documents index, exactly as structureTool:762 spells it',
+    ],
+    [
+      'GET',
+      '/v2025-02-19/data/references/' + DS + '/documents/drafts.article-01/to',
+      'the same index for a draft id, with no query string',
+    ],
+    [
+      'HEAD',
+      '/v2025-02-19/data/references/' + DS + '/documents/article-01/to',
+      'HEAD on the referring-documents index',
+    ],
     ['GET', '/vX/data/live/events/' + DS, 'the Live Events SSE stream'],
     ['GET', '/v2026-05-04/users/me', 'current-user lookup — observed on every Studio boot'],
     ['GET', '/v2025-02-19/projects/' + PID, 'project metadata'],

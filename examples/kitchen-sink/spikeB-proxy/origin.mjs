@@ -985,6 +985,169 @@ export async function createOriginHandler(options = {}) {
   }
 
   /* ---------------------------------------------------------------- *
+   * THE ORIGIN IS NOT THE ONLY WRITER OF `.sanity-overlay/`
+   * ---------------------------------------------------------------- *
+   *
+   * `state` above is a projection of the disk, and for a long time it was built
+   * exactly once — here, at construction — and thereafter only ever mutated by
+   * this file's own `/data/mutate` and `/data/actions` handlers. That is correct
+   * for a process that owns its storage, and Mode 2 does not:
+   *
+   *   playwright.config.ts     runOrigin.mjs --root=$OVERLAY_ROOT      (:3999)
+   *   e2e/harness/…Harness.mjs the overlay API on the SAME root  (:3997/:3998)
+   *
+   * With `sanity-overlay-studio` installed, an edit is intercepted in the
+   * browser and committed to the OVERLAY API, which writes the overlay root.
+   * Nothing tells this process. So the projection stayed at whatever the disk
+   * held when the process started — for the E2E stack, EMPTY — for the whole
+   * session, while the branch on disk filled up.
+   *
+   * WHY THAT IS NOT A COSMETIC STALENESS
+   * ────────────────────────────────────
+   * This origin is where the Studio facade DELEGATES. A GROQ read the branch
+   * planner declines to answer exactly is recorded as a `passthrough` and sent
+   * to the data plane, which in Mode 2 is here. A passthrough was therefore not
+   * a fallback to a less convenient source — it was a confident `[]` from a
+   * source that had been told nothing since boot. PRD §5.5 asks for the right
+   * answer or a stated refusal; an empty array shaped exactly like a real answer
+   * is neither, and it is what a user saw as "No results" in the reference
+   * picker for a document sitting in the branch.
+   *
+   * WHY READ-TIME, AND NOT A WATCHER
+   * ────────────────────────────────
+   * Watching the overlay root — `fs.watch`, or a poll, the way the local site's
+   * client does — was the obvious alternative and it is the wrong one HERE. A
+   * watcher is eventually consistent: between a `/commit` landing on disk and
+   * the event arriving there is a window in which this process still answers
+   * from the old projection, and it answers SILENTLY. That is the same class of
+   * defect, merely smaller and harder to reproduce. Reading the commit point on
+   * the same tick as the answer has no window at all.
+   *
+   * It is also affordable, which is what makes the choice available: the check
+   * is one small JSON file (`manifest.json`), and a full re-projection happens
+   * only when that file says the corpus actually moved.
+   *
+   * WHAT IS COMPARED, AND WHY IT IS SUFFICIENT
+   * ──────────────────────────────────────────
+   * Not `revision` alone. The E2E harness resets by DELETING the overlay root
+   * and letting the overlay API recreate it, so revision runs backwards to 0 and
+   * can revisit a number this process has already seen with a different corpus
+   * behind it. `corpusToken` therefore names the identity of the overlay
+   * (`overlayId`, `createdAt`) alongside the commit point, and then the
+   * content-addressed `checksum` of every head — which is precisely and only
+   * what `hydrate` reads. Two manifests with equal tokens cannot project to
+   * different documents.
+   *
+   * THE ONE THING THIS DOES NOT SEE, SAID OUT LOUD
+   * ──────────────────────────────────────────────
+   * A human hand-editing `documents/<id>/intent.json` changes the disk without
+   * moving the manifest, and §14.3 direct-edit reconciliation — which is what
+   * turns such an edit into a commit point — belongs to the overlay API's
+   * `pollDirectEdits`, not here. Once ANY reconciler has run, the manifest moves
+   * and this sees it. Until then the manifest is the commit point and this file
+   * reads the commit point, deliberately.
+   * ---------------------------------------------------------------- */
+
+  /**
+   * A value that changes if and only if `hydrate` could project something
+   * different. Cheap: the manifest is already parsed by the time this runs.
+   *
+   * `JSON.stringify` of nested arrays rather than a joined string, because the
+   * only failure mode that matters here is a FALSE MATCH — two different
+   * corpora collapsing to one token, which would serve stale documents and
+   * report nothing at all. Any single-character separator can be forged by a
+   * logical id containing that character; JSON escaping cannot be. (A false
+   * MISMATCH is merely one extra re-projection, and costs only time.)
+   */
+  function corpusToken(theManifest) {
+    const heads = Object.entries(theManifest.documentHeads ?? {})
+      .map(([logicalId, head]) => [logicalId, head?.checksum ?? ''])
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    return JSON.stringify([
+      theManifest.overlayId,
+      theManifest.createdAt ?? '',
+      theManifest.status ?? '',
+      theManifest.revision,
+      theManifest.transactionHead ?? '',
+      heads,
+    ])
+  }
+
+  let hydratedToken = corpusToken(manifest)
+
+  /** The token for "there is no overlay at this root". Distinct from any manifest's. */
+  const ABSENT_TOKEN = JSON.stringify(['<absent>'])
+
+  /**
+   * Bring `manifest` and `state` up to the bytes on disk, if they are not there
+   * already.
+   *
+   * AN ABSENT OVERLAY IS AN EMPTY CORPUS, NOT AN ERROR.
+   * ──────────────────────────────────────────────────
+   * This refused with a 503 at first, on the reasoning that "the branch is
+   * momentarily not there" and "the branch is empty" are different facts. Two
+   * things were wrong with that.
+   *
+   * Empirically: `e2e/harness/overlayHarness.mjs` `POST /reset` does
+   * `rmSync(root)` and restarts the overlay API against the empty directory,
+   * and `e2e/playwright/fixtures.ts` calls it BEFORE EVERY TEST. The origin is
+   * not restarted with it, so an absent `.sanity-overlay/` is not an exceptional
+   * mid-flight glimpse — it is a routine state that every spec passes through.
+   * Refusing produced 72 `OVERLAY_ORIGIN_BRANCH_UNAVAILABLE` responses in one
+   * run and failed five specs that had nothing to do with this change.
+   *
+   * And on the merits: Mode 2 has no base, so the overlay IS the dataset. A
+   * dataset that does not exist contains no documents, and `[]` is therefore the
+   * correct answer rather than a plausible-looking guess. What §5.5 forbids is a
+   * STALE corpus presented as a current one — which is what this function
+   * exists to prevent and is the opposite of reporting emptiness truthfully.
+   *
+   * A WRITE is not given the same treatment and does not need to be:
+   * `store.commitTransaction` refuses against an overlay that is not there, and
+   * that refusal is named and surfaces as an error. Nothing is silently dropped.
+   *
+   * A manifest that is on disk but UNPARSEABLE is deliberately not handled here.
+   * `FsOverlayStore` already owns that rule (§14.3: refuse malformed JSON,
+   * retain the last valid in-memory state, write a diagnostic copy), and a
+   * second opinion about it in this file is how the CORS predicate above drifted
+   * into a security hole.
+   */
+  async function refreshFromDisk() {
+    let current = null
+    try {
+      current = await store.inspect()
+    } catch (error) {
+      if (error?.code !== 'OVERLAY_NOT_FOUND') throw error
+    }
+
+    if (current === null) {
+      if (hydratedToken === ABSENT_TOKEN) return
+      /* `manifest` is left alone: it still describes the overlay this origin was
+       * started for, which is what `/projects` and `/datasets` answer about, and
+       * inventing a manifest for an overlay that is not there would be worse
+       * than reporting the one we were configured with. Only the CORPUS is
+       * emptied, because only the corpus is a claim about content. */
+      state = createOverlayState({
+        overlayId: manifest.overlayId,
+        /* 0 is what `createOverlay` stamps on an overlay that holds nothing, so
+         * it is the honest revision for a corpus with nothing in it — carrying
+         * the last-seen number forward would report progress that no longer has
+         * anything behind it. */
+        revision: 0,
+        documents: {},
+      })
+      hydratedToken = ABSENT_TOKEN
+      return
+    }
+
+    const token = corpusToken(current)
+    if (token === hydratedToken) return
+    manifest = current
+    state = await hydrate(store, current)
+    hydratedToken = token
+  }
+
+  /* ---------------------------------------------------------------- *
    * reads
    * ---------------------------------------------------------------- */
 
@@ -1204,6 +1367,21 @@ export async function createOriginHandler(options = {}) {
 
   /** Run one core call and push its result through the store. Serialised. */
   async function commit(idempotencyKey, apply) {
+    /*
+     * THE WRITE PATH READS THE PROJECTION TOO, and a stale one here is worse
+     * than a stale read: `apply` builds the next document from `state`, so an
+     * ancestor this process last saw at boot is content SILENTLY overwritten
+     * rather than merely content not shown. Refreshed inside `commit`, which
+     * means inside `enqueue`'s serialisation — so the projection cannot move
+     * between this line and the `store.commitTransaction` below.
+     *
+     * Deliberately NOT hoisted into the route table beside the read refresh:
+     * `assertWriteIsNotForged` runs before a body is read precisely so a forged
+     * request costs the server nothing, and a manifest read in front of it would
+     * spend work on exactly the caller that control exists to reject.
+     */
+    await refreshFromDisk()
+
     sequence += 1
     const transactionId = `origin-${String(sequence).padStart(6, '0')}-${crypto.randomUUID().slice(0, 8)}`
     const applied = apply({
@@ -1467,6 +1645,17 @@ export async function createOriginHandler(options = {}) {
           return jsonAnswer({ok: true, mode: 'origin'})
         }
         if (ds !== dataset) return unknownDataset(ds)
+
+        /*
+         * THE ONE PLACE A READ LEARNS WHAT IS ON DISK.
+         *
+         * `query` and `doc` are the two routes that project `state`; `listen`
+         * opens a socket, `history` is a constant, and `mutate`/`actions`
+         * refresh inside `commit` behind their own CSRF gate. Naming the two
+         * rather than refreshing the whole `data` case keeps the write guard's
+         * "a forged request costs the server nothing" property intact.
+         */
+        if (operation === 'query' || operation === 'doc') await refreshFromDisk()
 
         switch (operation) {
           case 'query': {

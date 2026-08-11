@@ -334,6 +334,13 @@ export function createOverlayRuntime(options: OverlayRuntimeOptions): OverlayRun
         const view = overlaySource()
         return view.documents.has(documentId) || view.tombstones.has(documentId)
       },
+      /* THE EXISTENCE ORACLE — the same view, read for WHICH opinion rather than
+       * WHETHER there is one. `/data/doc` asks "does this document exist", and
+       * a body and a tombstone are opposite answers to it, so the probe needs
+       * the distinction `branchHolds` collapses. Read fresh on every call, like
+       * the GROQ path's `overlay()`: the branch moves under a long-lived
+       * client. */
+      branchView: overlaySource,
       assets,
       ...('origin' in assetOrigin ? {assetOrigin: assetOrigin.origin} : {}),
       ...(options.readTimeoutMs === undefined ? {} : {readTimeoutMs: options.readTimeoutMs}),

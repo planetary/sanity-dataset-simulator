@@ -9,16 +9,26 @@
  * The fourth is a **strong reference**, and two facts about this stack make it
  * unreachable from the form:
  *
- *   1. THE REFERENCE PICKER CANNOT FIND OVERLAY DOCUMENTS. Studio's reference
- *      search is a `score(boost(… match text::query($__query)), …)` findability
- *      query; the facade cannot answer it locally, so it is a recorded
- *      passthrough to the Mode 2 origin. The origin hydrates its GROQ corpus
- *      ONCE, at process start (`spikeB-proxy/origin.mjs` — `state` is assigned
- *      only at startup and in its own `/commit` handler), and in this topology
- *      the Studio's writes go to the overlay API, never to the origin. Measured:
- *      `*[]{_id}` against the running origin returns `[]` while the overlay
- *      holds two documents, and the picker says *No results*. So a document the
- *      branch created can never be picked.
+ *   1. THE REFERENCE PICKER COULD NOT FIND OVERLAY DOCUMENTS — FIXED 2026-08-10,
+ *      AND THIS ENTRY IS KEPT AS THE RECORD OF WHY THE SEED STILL EXISTS.
+ *
+ *      Studio's reference search is a
+ *      `score(boost(… match text::query($__query)), …)` findability query; the
+ *      facade cannot answer it locally, so it is a recorded passthrough to the
+ *      Mode 2 origin. The origin hydrated its GROQ corpus ONCE, at process
+ *      start, and in this topology the Studio's writes go to the overlay API,
+ *      never to the origin — so it answered a confident `[]` from a source that
+ *      had been told nothing since boot, and the picker said *No results*.
+ *      `origin.mjs` now re-reads the commit point on the same tick as the
+ *      answer (`refreshFromDisk`), and
+ *      `specs/local/09-branch-visibility.spec.ts` drives the picker through the
+ *      real form and asserts the reference reaches `intent.json`.
+ *
+ *      THE SEED IS STILL CORRECT, for a different reason than it was written
+ *      for: the specs that use it are about what a DOCUMENT ACTION does to the
+ *      overlay, and making each of them depend on a search index as well would
+ *      couple thirty assertions to one subsystem. Spec 09 owns the picker; the
+ *      rest state their precondition and get on with their subject.
  *
  *   2. A STRONG REFERENCE MUST POINT AT A **PUBLISHED** DOCUMENT. Sanity's
  *      inferred reference validator resolves existence through

@@ -41,7 +41,7 @@
  * ==========================================================================
  */
 import {execFileSync} from 'node:child_process'
-import {existsSync, readFileSync} from 'node:fs'
+import {existsSync, readdirSync, readFileSync} from 'node:fs'
 import {createRequire} from 'node:module'
 import {dirname, join} from 'node:path'
 import {fileURLToPath} from 'node:url'
@@ -92,6 +92,47 @@ export const UPGRADE_BASELINE: readonly BaselineEntry[] = Object.freeze([
       'Everything. It is the only seam that hands the Studio our wrapped client, so without it ' +
       'every Studio write reaches the shared dataset and no read sees the branch. It is declared ' +
       '`@hidden @beta` on a `@hidden @beta` interface, so nothing obliges Sanity to keep it.',
+  },
+  {
+    /*
+     * A BASELINE ENTRY FOR A GAP, WHICH IS THE UNUSUAL CASE HERE.
+     *
+     * Every other entry names a behaviour this system DEPENDS ON and must be
+     * told about when it moves. This one names a behaviour that DEFEATS it: the
+     * timeline's transaction log is fetched with the global `fetch()`, so no
+     * wrapper around a client method can see it, and `history.ts` therefore
+     * states `EMPTY_TRANSLOG_NDJSON` as a contract for whatever serves
+     * `apiHost` instead of enforcing it.
+     *
+     * It belongs in the baseline for exactly the reason the file's header
+     * gives. "The translog is unreachable" is currently written in three source
+     * comments, and a comment is the artefact that goes stale silently — the
+     * day Sanity routes that read through `client.request`, the gap CLOSES, the
+     * comments become false, and §32.2 history acquires a route nobody notices
+     * is available. A red test is how that news arrives.
+     */
+    package: 'sanity',
+    verified: '6.8.0',
+    fact:
+      'Both translog reads the document timeline actually makes — `TimelineController` (datastores:7097) ' +
+      'and `getTransactionsLogs` (useBundleDocuments:4822) — go through `getJsonStream`, which calls the ' +
+      'GLOBAL `fetch()`; the client contributes only `getUrl()` and `config().token`. The one translog ' +
+      'read that IS on `client.request` (`getTransactions`, datastores:7157) is published on `HistoryStore` ' +
+      'for plugins and has no caller anywhere in the bundle.',
+    reliedOnIn: [
+      'packages/sanity-overlay-studio/src/client/history.ts (states EMPTY_TRANSLOG_NDJSON as a contract it cannot enforce)',
+      'packages/sanity-overlay-studio/src/client/facade.ts (the read-class table, and why the history answer is EMPTY rather than served)',
+      'packages/sanity-overlay-testkit/test/studio-history-endpoints.test.ts',
+    ],
+    check:
+      'the timeline transaction log is still fetched with the global fetch, out of reach of a client wrapper',
+    breaks:
+      'Nothing breaks — it IMPROVES, silently, which is why it needs a test rather than a comment. ' +
+      'A timeline read moving onto `client.request`, or a Studio call site appearing for the already-' +
+      'wrappable `getTransactions`, makes the third of Sanity’s three history endpoints servable — and ' +
+      '§32.2 branch history stops being blocked on a transport the facade cannot see. Until then the ' +
+      'empty-and-announced timeline (`announceEmptyHistory`) is the honest answer, and delegating ' +
+      '`getTransactions` is right because nothing asks.',
   },
   {
     package: '@sanity/client',
@@ -334,6 +375,126 @@ describe('§2 every depended-on behaviour still holds in the installed build', (
     expect(body).toMatch(/unstable_clientFactory\?:\s*\(options: ClientConfig\) => SanityClient/)
   })
 
+  it('the timeline transaction log is still fetched with the global fetch, out of reach of a client wrapper', () => {
+    /*
+     * ─────────────────────────────────────────────────────────────────────────
+     * MEASURED, AND THE MEASUREMENT CORRECTED THE CLAIM IT WAS WRITTEN FOR.
+     *
+     * This check began as "the translog is fetched with the global `fetch()`,
+     * full stop" — the sentence three source comments carry and that §32.2
+     * branch history is recorded as blocked by. Enumerating the WHOLE bundle
+     * rather than the two known line numbers turned up a THIRD translog read
+     * the flat version of the claim is false about:
+     *
+     *   datastores-DqFH7RLd.js:7097   TimelineController      global `fetch`
+     *   useBundleDocuments…:4822      getTransactionsLogs     global `fetch`
+     *   datastores-DqFH7RLd.js:7157   getTransactions         `client.request`  ← wrappable
+     *
+     * So the honest claim has two halves, and both are asserted below.
+     *
+     *   1. THE TWO READS THE TIMELINE ACTUALLY MAKES are on `getJsonStream`,
+     *      which calls the global `fetch` with no client on the response path.
+     *      The client contributes `getUrl()` and `config().token` — both
+     *      wrappable — so a facade can REDIRECT these reads and can never
+     *      ANSWER them. That asymmetry is the whole reason
+     *      `EMPTY_TRANSLOG_NDJSON` is stated in `history.ts` as a contract for
+     *      whatever serves `apiHost` instead of being enforced there.
+     *
+     *   2. THE ONE READ THAT IS WRAPPABLE HAS NO CALLER. `getTransactions` is
+     *      published on `HistoryStore` (`index-C1EcC1UN.d.ts:6686`) for
+     *      plugins, and nothing inside `sanity@6.8.0` invokes it — there is no
+     *      `.getTransactions(` anywhere in the bundle. Intercepting it would
+     *      therefore serve a caller that does not exist, and would move the
+     *      timeline not at all.
+     *
+     * WHAT MAKES THIS WORTH A TEST RATHER THAN A PARAGRAPH: either half can
+     * change silently in an upgrade, and both changes are good news that nobody
+     * would otherwise go looking for. A timeline read moving onto
+     * `client.request`, or a Studio call site appearing for `getTransactions`,
+     * unblocks §32.2 — and arrives here as a red line naming the file.
+     * ─────────────────────────────────────────────────────────────────────────
+     */
+    const lib = sanityLibDir()
+    const chunks = readdirSync(lib).filter((name) => name.endsWith('.js'))
+    /* The denominator, asserted: a lib directory that failed to list would make
+     * every "no call site does X" below vacuously true. */
+    expect(chunks.length).toBeGreaterThan(50)
+
+    const translogLines: {file: string; line: number; text: string}[] = []
+    const propertyCalls: string[] = []
+    let jsonStreamBody: string | undefined
+    let wrappableBody: string | undefined
+    for (const name of chunks) {
+      const source = readFileSync(join(lib, name), 'utf8')
+      source.split('\n').forEach((text, index) => {
+        if (/\/data\/history\/\$\{[^}]*\}\/transactions\//.test(text)) {
+          translogLines.push({file: name, line: index + 1, text})
+        }
+        /* The consumer probe for half 2. A property call is the only way to
+         * reach `historyStore.getTransactions`; the bare identifier appears in
+         * this bundle as a local in `index.js:4618` and as a prefix of
+         * `getTransactionsLogs`, and neither is this function. */
+        if (/\.getTransactions\(/.test(text)) propertyCalls.push(`${name}:${index + 1}`)
+      })
+      const start = source.indexOf('async function getJsonStream(url, token) {')
+      if (start !== -1) jsonStreamBody = source.slice(start, source.indexOf('\n}', start))
+      const wrappableStart = source.indexOf('getTransactions = async (client, documentIds) => {')
+      if (wrappableStart !== -1) {
+        wrappableBody = source.slice(wrappableStart, source.indexOf('\n}', wrappableStart))
+      }
+    }
+
+    /* ---- half 1: the reader the timeline uses ---------------------------- */
+
+    expect(jsonStreamBody, '`getJsonStream` is gone — re-verify the whole entry').toBeDefined()
+    expect(jsonStreamBody).toMatch(/return getStream\(await fetch\(url, options\)\)/)
+    expect(jsonStreamBody).not.toContain('.request(')
+    /* No client reaches the response path at all — not even to produce it. */
+    expect(jsonStreamBody).not.toContain('client')
+
+    /* Every translog URL in the bundle, enumerated. A fourth one appearing is
+     * itself the news, whichever transport it is on. */
+    const byLocation = new Map(translogLines.map((entry) => [`${entry.file}:${entry.line}`, entry]))
+    expect([...byLocation.keys()].sort()).toEqual([
+      'datastores-DqFH7RLd.js:7097',
+      'datastores-DqFH7RLd.js:7157',
+      'useBundleDocuments-BYW8M9LS.js:4822',
+    ])
+
+    for (const where of ['datastores-DqFH7RLd.js:7097', 'useBundleDocuments-BYW8M9LS.js:4822']) {
+      const text = byLocation.get(where)!.text
+      expect(`${where} reads via getJsonStream: ${text.includes('getJsonStream(')}`).toBe(
+        `${where} reads via getJsonStream: true`,
+      )
+      /* THE LINE THAT WOULD FLIP. A timeline translog read on `client.request`
+       * — or `client.fetch`, or the observable spelling — is one this facade
+       * COULD answer. Deliberately not `.not.toContain('client')`:
+       * `client.getUrl` and `client.config` are both on these lines, and
+       * neither produces a response. */
+      expect(`${where} issues a client request: ${/\.(request|fetch)\(/.test(text)}`).toBe(
+        `${where} issues a client request: false`,
+      )
+      /* …and the wrappable half, stated rather than implied: the URL really is
+       * built off the client, so interception can redirect but not satisfy. */
+      expect(`${where} builds its URL off the client: ${text.includes('.getUrl(')}`).toBe(
+        `${where} builds its URL off the client: true`,
+      )
+    }
+
+    /* ---- half 2: the wrappable read, and its absent caller --------------- */
+
+    /* The whole function, not the URL line: minified output puts the URL on
+     * `:7157` and the request that carries it on `:7158`. */
+    expect(wrappableBody, '`getTransactions` is gone — re-verify half 2').toBeDefined()
+    expect(wrappableBody).toContain('/data/history/${dataset}/transactions/')
+    expect(wrappableBody).toContain('client.request(')
+    expect(wrappableBody).not.toContain('getJsonStream(')
+
+    /* Nothing calls it. When something does, this is the line that says so —
+     * and `facade.ts`'s read-class table stops being right to delegate it. */
+    expect(propertyCalls).toEqual([])
+  })
+
   it('config(newConfig) still returns the same instance', () => {
     const client = createClient({...CONFIG})
 
@@ -501,6 +662,18 @@ const CITED_SANITY_CHUNKS: Readonly<Record<string, readonly string[]>> = Object.
     'packages/sanity-overlay-studio/src/client/facade.ts',
     'packages/sanity-overlay-studio/src/client/reads.ts',
   ],
+  /*
+   * The document-action hook runtime: `defineHookStateComponent` at `:26` and
+   * the `handleNext(id, hookState)` collector at `:31` that DROPS a `null`
+   * return. `sanityConfigResolution.ts` reproduces that reducer, so it has to
+   * cite the lines it reproduces.
+   *
+   * ADDED BY THE CHECK BELOW RATHER THAN BY HAND. `sanityConfigResolution.ts`
+   * arrived in f797062 citing this chunk twice while the table said nothing
+   * about it, so `finds no cited chunk the baseline forgot to list` was red at
+   * HEAD — which is exactly the job that test was written to do.
+   */
+  'useStudioUrl-90xCJc-c.js': ['packages/sanity-overlay-testkit/src/sanityConfigResolution.ts'],
 })
 
 describe('§3 the dist chunks our source cites still exist in the installed sanity', () => {

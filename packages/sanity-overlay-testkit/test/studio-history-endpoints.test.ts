@@ -446,7 +446,20 @@ describe('facade · the reads it deliberately does NOT claim', () => {
     expect(h.delegated).toHaveLength(1)
   })
 
-  it('leaves /data/doc availability delegated, and records why it is in the class', async () => {
+  it('leaves /data/doc availability to the HISTORY oracle alone — it is a different question', async () => {
+    /*
+     * `branchHolds` is the history oracle and it is deliberately not enough to
+     * answer an EXISTENCE probe: it collapses "the branch holds a body" and
+     * "the branch holds a tombstone", which are opposite answers to
+     * `/data/doc`. So this harness — which wires `branchHolds` and nothing else
+     * — must still delegate the probe untouched.
+     *
+     * The probe IS answered from the branch, through the separate `branchView`
+     * oracle; `studio-doc-existence.test.ts` owns that, and
+     * `studio-reference-validation.test.ts` drives it through sanity's own
+     * validation chain. What this pins is that the two oracles stay separate:
+     * a history option must never start deciding existence by accident.
+     */
     const h = harness([BRANCH_DRAFT, BRANCH_PUBLISHED])
     h.setBaseAnswer({documents: [], omitted: [{id: BRANCH_DRAFT, reason: 'existence'}]})
     const answer = await (h.wrapped.request as (r: unknown) => Promise<unknown>)({

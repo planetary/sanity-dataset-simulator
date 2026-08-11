@@ -64,10 +64,13 @@
  * indexes its answer by document id too (`datastores-DqFH7RLd.js:5533`
  * `availability.omitted.reduce(…)`, `structureTool-EN0gOzyJ.js:744`
  * `({omitted}) => omitted.filter(…)`, both of which throw on a missing
- * `omitted`) — but it is an EXISTENCE question, not a history one, and the
- * overlay origin already answers it from branch state. Claiming it here would
- * override a correct answer with a guess. It stays delegated, and
- * `test/studio-history-endpoints.test.ts` pins that boundary.
+ * `omitted`) — but it is an EXISTENCE question, not a history one, and it is
+ * answered by `docReads.ts` against a DIFFERENT oracle. The distinction is not
+ * bookkeeping: this module's `branchHolds` collapses "the branch holds a body"
+ * and "the branch holds a tombstone", which is all a history read needs and is
+ * exactly the distinction an existence probe turns on. Claiming `/data/doc`
+ * here would answer it with the wrong question's oracle, and
+ * `test/studio-history-endpoints.test.ts` pins that the two stay apart.
  */
 
 type Rec = Record<string, unknown>

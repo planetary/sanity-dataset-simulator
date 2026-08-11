@@ -115,8 +115,38 @@ const AGENT_WRITE_ACTIONS = new Set(['patch', 'generate', 'transform', 'translat
  * resource base. Sources: `_getDataUrl()` in @sanity/client, and the GET
  * traffic in proxy-log.jsonl (`/data/query` x54, `/data/listen` x26,
  * `/data/doc` x8, `/data/history` x16, `/data/ping` x3).
+ *
+ * `/references` IS NOT IN THAT LOG, AND THAT IS THE INTERESTING PART.
+ * ------------------------------------------------------------------
+ * `sanity@6.8.0 lib/structureTool-EN0gOzyJ.js:762` issues
+ *   `GET /data/references/<ds>/documents/<id>/to?excludeInternalReferences=true&excludePaths=true`
+ * from the delete-confirm dialog, to list the documents still pointing at the
+ * one being removed. It reads an index and writes nothing.
+ *
+ * It is absent from the 422-line evidence log because the probe is GATED behind
+ * `getDocumentExistence`, and in Mode 2 that answered "absent" for every id
+ * until the overlay learned to answer it from branch state. So the allowlist
+ * gap was unreachable, and it opened the moment a NEIGHBOURING component
+ * started telling the truth: `GET …/references/… -> 403 OVERLAY_WRITE_BLOCKED`,
+ * a React error boundary tearing down the document pane, and Delete and
+ * Unpublish silently never writing a tombstone (four E2E specs, 2026-08-10).
+ *
+ * The lesson is in the guard's own header: an allowlist built from observed
+ * traffic is only as complete as what the observation could reach. The
+ * derived check in `packages/sanity-overlay-testkit/test/write-guard.test.ts`
+ * enumerates `/data/<op>` out of the shipped Studio bundle instead, so the next
+ * one of these fails by name rather than as a 403 in someone's browser.
  */
-const READ_DATA_OPS = ['/query', '/doc', '/listen', '/history', '/export', '/live/events', '/ping']
+const READ_DATA_OPS = [
+  '/query',
+  '/doc',
+  '/listen',
+  '/history',
+  '/references',
+  '/export',
+  '/live/events',
+  '/ping',
+]
 
 /**
  * Data-plane reads that legitimately arrive over POST: `_dataRequest()` falls
