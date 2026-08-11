@@ -20,6 +20,29 @@ Enforced structurally, not by documentation: a suite-wide outbound monitor fails
 
 `OVERLAY_MODE` selects the store: `off` (native Sanity), `fs` (JSON files, **the only working overlay mode**), `memory` (tests), `blob` (not implemented, throws).
 
+## What works where
+
+✅ built and browser-validated · ⚠️ engine-level only, or partial · ✗ not built
+
+| Feature | Local (`fs`) | Vercel preview (`blob`) |
+|---|:---:|:---:|
+| Install into a fresh project (tarballs) | ✅ | ✗ |
+| Studio editing — scalar, slug, text fields | ✅ | ✗ |
+| Portable Text, arrays, objects | ⚠️ | ✗ |
+| Publish / unpublish / delete / discard / duplicate | ✅ | ✗ |
+| Live read-only staging base under the overlay | ✅ | ✗ |
+| Canonical `.sanity-overlay/` files, deterministic Git diff | ✅ | ✗ |
+| Registered GROQ queries (site + CLI) | ✅ | ✗ |
+| Studio lists and search (unfiltered exact; typed search refused) | ⚠️ | ✗ |
+| References — resolve + incoming | ✅ | ✗ |
+| References — authoring via the picker | ⚠️ | ✗ |
+| Conflict detection + banner (resolution panel partial) | ⚠️ | ✗ |
+| Checkpoint / export / import (CLI) | ✅ | ✗ |
+| Branch assets (upload path exists, no browser pass) | ⚠️ | ✗ |
+| Overlay revision history + restore | ✗ | ✗ |
+| Write-block enforcement, server-side audited | ✅ | ✗ |
+| Durable persistence + PR identity across deploys | n/a | ✗ |
+
 ## Try it
 
 Prereqs: Node 22+, pnpm 10 (`corepack enable` picks up the pinned version).
