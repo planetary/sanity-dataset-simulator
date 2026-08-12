@@ -244,6 +244,28 @@ describe('§28.5 automatic rebase preconditions', () => {
     expect(result.merge.document?.title).toBe('Branch title')
   })
 
+  it('an UNOBSERVABLE base still blocks the rebase, but is not called a deletion', () => {
+    /* Rebasing needs a current base to rebase ONTO, so `currentBase: null`
+     * must block whatever the reason — but "The base document was deleted" is
+     * an OBSERVATION, and nobody made it (see the merge suite's unobservable-
+     * base tests, 2026-08-11). The precondition must state the true reason. */
+    const result = autoRebase(
+      rebaseRequest({
+        currentBase: null,
+        baseStatus: 'present',
+        localMaterialized: LOCAL_TITLE,
+        localTouchedPaths: [['title']],
+      }),
+    )
+
+    expect(result.applied).toBe(false)
+    const precondition = result.preconditions.find(
+      (candidate) => candidate.id === 'no-base-deletion-or-parent-shape-change',
+    )
+    expect(precondition?.satisfied).toBe(false)
+    expect(precondition?.detail).not.toContain('deleted')
+  })
+
   it('blocks on a parent shape change', () => {
     const result = autoRebase(
       rebaseRequest({

@@ -448,7 +448,7 @@ function applyPatch(
       ? deepClone(resolved)
       : baseline.document
 
-  const {document, touchedPaths} = applyOperations(startingPoint, mutation.operations, {
+  const {document, touchedPaths, operations} = applyOperations(startingPoint, mutation.operations, {
     ...(context.allowTypeChange === undefined ? {} : {allowTypeChange: context.allowTypeChange}),
   })
 
@@ -458,7 +458,11 @@ function applyPatch(
     version,
     document,
     touchedPaths,
-    operations: mutation.operations,
+    /* The RESOLVED spellings, not `mutation.operations`: a numeric insert
+     * anchor may have been normalized to the §13.6-encodable index it actually
+     * landed at (negative and out-of-range anchors are legal on the wire but
+     * cannot be stored — encoding them crashes the next hydration). */
+    operations,
     ancestorKind: baseline.ancestorKind,
     ...(baseline.ancestorRevision === undefined
       ? {}

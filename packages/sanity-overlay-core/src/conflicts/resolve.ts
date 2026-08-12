@@ -19,7 +19,11 @@ import type {
 } from '../types/conflict'
 import type {SanityDocument} from '../types/document'
 import type {OverlayPath} from '../types/path'
-import type {OverlayDocumentOrigin} from '../types/record'
+import type {
+  LocalDocumentVersion,
+  OverlayDocumentOrigin,
+  OverlayDocumentRecord,
+} from '../types/record'
 import {encodeOverlayPath} from '../encoding'
 import {deepClone, getAtPath, removeAtPath, setAtPath} from '../mutations/paths'
 
@@ -273,6 +277,178 @@ export function resolveConflict(request: ResolveConflictRequest): ConflictResolu
       actor: request.actor,
     },
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * resolveRecordConflict — the record-level wrapper (§28.1, §28.3)
+ * ------------------------------------------------------------------ */
+
+export interface ResolveRecordConflictRequest {
+  record: OverlayDocumentRecord
+  conflictId: string
+  action: ConflictResolutionAction
+  now: string
+  transactionId: string
+  actor: OverlayActor
+  /** The current base document, for `accept-current-staging`. */
+  currentBase: SanityDocument | null
+  /** The operator's value, for `manual-edit`. */
+  value?: unknown
+  /** Reserved for `rename-branch-id`, which this wrapper refuses (see below). */
+  newId?: string
+}
+
+export interface ResolveRecordConflictResult {
+  record: OverlayDocumentRecord
+  transaction: ConflictResolutionTransaction
+}
+
+/**
+ * Apply one §28.3 resolution to a WHOLE document record.
+ *
+ * `resolveConflict` above is pure and version-scoped, and for a long time
+ * nothing lifted it onto an {@link OverlayDocumentRecord} — so the Studio's
+ * fully-built resolution UI POSTed a `conflictResolution` commit the API had
+ * no branch for, and the CLI's `conflicts` verb could list but never resolve
+ * (found live 2026-08-11). This wrapper is that lift, shared by both.
+ *
+ * Semantics per action family:
+ *
+ *   - `keep-as-branch-created` — the record's whole point of contact with the
+ *     base is severed: `origin: 'branch'`, `base: null`, every local version
+ *     re-anchored `branch-created`. Content untouched.
+ *   - `accept-base-deletion` — both perspectives tombstoned, local versions
+ *     dropped (§16.4 "accept deletion" is about the DOCUMENT, not one
+ *     perspective).
+ *   - path actions (`keep-branch-value`, `accept-current-staging`,
+ *     `manual-edit`, `remove-local-override`) — applied through
+ *     {@link resolveConflict} to every non-null local version, so a document
+ *     with both a draft and a published branch state resolves coherently.
+ *   - `rename-branch-id` — REFUSED, by name: a rename moves the manifest head
+ *     to a new logical id, which is store-level surgery a record-scoped
+ *     function must not pretend to do. It stays a loud error until a
+ *     store-level rename exists.
+ */
+export function resolveRecordConflict(
+  request: ResolveRecordConflictRequest,
+): ResolveRecordConflictResult {
+  const {record, conflictId, action} = request
+
+  const conflict = record.conflicts.find((candidate) => candidate.id === conflictId)
+  if (conflict === undefined) {
+    throw invalid(
+      `Conflict ${JSON.stringify(conflictId)} is not present on ${record.logicalId}`,
+      {conflictId, documentId: record.logicalId},
+    )
+  }
+  if (conflict.resolution !== undefined) {
+    throw invalid(
+      `Conflict ${JSON.stringify(conflictId)} is already resolved (${conflict.resolution.type}); ` +
+        'resolving it again would overwrite a recorded decision (PRD §28.1)',
+      {conflictId, documentId: record.logicalId},
+    )
+  }
+  if (action === 'rename-branch-id') {
+    throw invalid(
+      'rename-branch-id moves the manifest head to a new logical id — store-level surgery this ' +
+        'record-scoped resolution does not perform. Resolve it from a tool that owns the store.',
+      {conflictId, documentId: record.logicalId},
+    )
+  }
+  if (!applicableResolutionActions(conflict).includes(action)) {
+    throw invalid(
+      `Action ${action} is not applicable to a ${conflict.type} conflict (PRD §28.3); ` +
+        `it offers: ${applicableResolutionActions(conflict).join(', ')}`,
+      {conflictId, action, conflictType: conflict.type},
+    )
+  }
+
+  const applyTo = (
+    version: LocalDocumentVersion | null,
+    tombstone: boolean,
+  ): ConflictResolutionResult | null => {
+    if (version === null) return null
+    return resolveConflict({
+      documentId: record.logicalId,
+      now: request.now,
+      transactionId: request.transactionId,
+      actor: request.actor,
+      conflict,
+      action,
+      currentBase: request.currentBase,
+      localMaterialized: version.materialized,
+      touchedPaths: version.touchedPaths,
+      origin: record.origin,
+      localTombstone: tombstone,
+      ...(request.value === undefined ? {} : {value: request.value}),
+    })
+  }
+
+  const draftResult = applyTo(record.local.draft, record.local.draftTombstone)
+  const publishedResult = applyTo(record.local.published, record.local.publishedTombstone)
+  const primary =
+    draftResult ??
+    publishedResult ??
+    /* A record with no local version at all (both tombstoned) can still carry
+     * a resolvable conflict — stamp it against an empty version. */
+    resolveConflict({
+      documentId: record.logicalId,
+      now: request.now,
+      transactionId: request.transactionId,
+      actor: request.actor,
+      conflict,
+      action,
+      currentBase: request.currentBase,
+      localMaterialized: null,
+      touchedPaths: [],
+      origin: record.origin,
+      localTombstone: true,
+      ...(request.value === undefined ? {} : {value: request.value}),
+    })
+
+  const branchCreated = action === 'keep-as-branch-created'
+  const deletionAccepted = action === 'accept-base-deletion'
+
+  const nextVersion = (
+    version: LocalDocumentVersion | null,
+    result: ConflictResolutionResult | null,
+  ): LocalDocumentVersion | null => {
+    if (deletionAccepted) return null
+    if (version === null || result === null) return version
+    if (result.localMaterialized === null) return null
+    const rebased: LocalDocumentVersion = {
+      ...version,
+      materialized: result.localMaterialized,
+      touchedPaths: result.touchedPaths,
+      updatedAt: request.now,
+    }
+    if (branchCreated) {
+      const {ancestorRevision: _dropped, ...rest} = rebased
+      return {...rest, ancestorKind: 'branch-created'}
+    }
+    return rebased
+  }
+
+  const next: OverlayDocumentRecord = {
+    ...record,
+    origin: branchCreated ? 'branch' : record.origin,
+    /* Severing base ancestry is the whole point of keep-as-branch-created: an
+     * ancestor left behind would re-enter every future merge. */
+    base: branchCreated ? null : record.base,
+    local: {
+      draft: nextVersion(record.local.draft, draftResult),
+      published: nextVersion(record.local.published, publishedResult),
+      draftTombstone: deletionAccepted ? true : record.local.draftTombstone,
+      publishedTombstone: deletionAccepted ? true : record.local.publishedTombstone,
+    },
+    conflicts: record.conflicts.map((candidate) =>
+      candidate.id === conflictId ? primary.conflict : candidate,
+    ),
+    updatedAt: request.now,
+    updatedBy: request.actor,
+  }
+
+  return {record: next, transaction: primary.transaction}
 }
 
 /* ------------------------------------------------------------------ *

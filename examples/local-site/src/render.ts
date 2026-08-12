@@ -8,7 +8,13 @@
  * Every interpolated value goes through {@link escapeHtml}. Branch content is
  * whatever an editor typed, so the page must survive an editor typing a tag.
  */
-import type {ArticleDetail, ArticleSummary, SiteReadContext} from './data'
+import type {
+  ArticleDetail,
+  ArticleSection,
+  ArticleSummary,
+  PortableTextBlock,
+  SiteReadContext,
+} from './data'
 
 /** HTML text/attribute escaping. Deliberately escapes quotes too. */
 export function escapeHtml(value: unknown): string {
@@ -92,6 +98,52 @@ export function renderArticleList(
   return layout('Pieces', body, context)
 }
 
+/**
+ * One Portable Text block → one paragraph. Spans are concatenated in order;
+ * an inline object (the schema's `inlineStat`) renders as its label/value pair
+ * rather than vanishing. Marks are NOT styled — this site proves the content
+ * round-trips, not a rich-text renderer; the Next.js port swaps in
+ * `@portabletext/react` here.
+ */
+function renderPortableText(blocks: readonly PortableTextBlock[]): string {
+  return blocks
+    .filter((block) => block._type === 'block')
+    .map((block) => {
+      const text = (block.children ?? [])
+        .map((child) => {
+          if (typeof child.text === 'string') return escapeHtml(child.text)
+          if (child.label !== undefined) {
+            return `<span class="badge">${escapeHtml(child.label)}: ${escapeHtml(child.value ?? '')}</span>`
+          }
+          return ''
+        })
+        .join('')
+      return text === '' ? '' : `<p>${text}</p>`
+    })
+    .filter((line) => line !== '')
+    .join('\n')
+}
+
+/** The two kitchen-sink section shapes; an unknown `_type` renders nothing. */
+function renderSections(sections: readonly ArticleSection[]): string {
+  return sections
+    .map((section) => {
+      if (section._type === 'quoteSection' && section.quote !== undefined) {
+        const attribution =
+          section.attribution === undefined
+            ? ''
+            : `<footer class="meta">— ${escapeHtml(section.attribution)}</footer>`
+        return `<blockquote>${escapeHtml(section.quote)}${attribution}</blockquote>`
+      }
+      if (section._type === 'statsSection' && section.heading !== undefined) {
+        return `<p><strong>${escapeHtml(section.heading)}</strong> <span class="badge">${escapeHtml(section.count ?? 0)}</span></p>`
+      }
+      return ''
+    })
+    .filter((line) => line !== '')
+    .join('\n')
+}
+
 export function renderArticleDetail(article: ArticleDetail, context: SiteReadContext): string {
   const meta: string[] = []
   if (article.author?.name) meta.push(`by ${escapeHtml(article.author.name)}`)
@@ -100,11 +152,16 @@ export function renderArticleDetail(article: ArticleDetail, context: SiteReadCon
     .map((tag) => `<span class="badge">${escapeHtml(tag)}</span>`)
     .join(' ')
 
+  const bodyHtml = renderPortableText(article.body ?? [])
+  const sectionsHtml = renderSections(article.sections ?? [])
+
   const body = [
     '<p><a href="/">&larr; all pieces</a></p>',
     `<h1>${escapeHtml(article.title ?? '(untitled)')}</h1>`,
     meta.length === 0 ? '' : `<p class="meta">${meta.join(' &middot; ')}</p>`,
     tags === '' ? '' : `<p>${tags}</p>`,
+    bodyHtml,
+    sectionsHtml,
     `<p class="meta">${escapeHtml(article._id)}</p>`,
   ]
     .filter((line) => line !== '')

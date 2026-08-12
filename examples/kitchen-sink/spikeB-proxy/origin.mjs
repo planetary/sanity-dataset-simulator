@@ -60,6 +60,7 @@ import {
   discardDraft,
   isForbiddenKey,
   publish,
+  recordFromIntent,
   resolveVersionBatch,
   toPublishedId,
   unpublish,
@@ -975,7 +976,25 @@ export async function createOriginHandler(options = {}) {
     const heads = await theStore.listChangedDocuments(theManifest.overlayId, {includeUnchanged: true})
     for (const head of heads) {
       const read = await theStore.readDocumentByLogicalId(theManifest.overlayId, head.logicalId)
-      if (read?.record) documents[read.record.logicalId] = read.record
+      if (read?.record) {
+        documents[read.record.logicalId] = read.record
+        continue
+      }
+      /* The fresh-clone path — `.runtime/` is gitignored, so a cloned overlay
+       * has intents and snapshots but no records. Same rebuild the overlay API
+       * does (see `hydrateState` in sanity-overlay-next): `recordFromIntent`
+       * refuses anything it cannot rebuild honestly, and refused documents
+       * stay unserved rather than guessed at. */
+      if (read?.intent) {
+        const rebuilt = recordFromIntent(read.intent, {
+          overlayId: theManifest.overlayId,
+          baseSnapshot: read.baseSnapshot,
+          runtimeRevision: read.head.runtimeRevision,
+          createdAt: read.head.updatedAt,
+          updatedAt: read.head.updatedAt,
+        })
+        if (rebuilt !== null) documents[rebuilt.logicalId] = rebuilt
+      }
     }
     return createOverlayState({
       overlayId: theManifest.overlayId,

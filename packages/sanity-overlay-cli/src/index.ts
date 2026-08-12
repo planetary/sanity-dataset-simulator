@@ -29,6 +29,12 @@ export {
 } from './cli'
 export type {CliCommand} from './cli'
 
+export {runAttach} from './commands/attach'
+export type {AttachOptions} from './commands/attach'
+
+export {runDev} from './commands/dev'
+export type {DevOptions} from './commands/dev'
+
 export {EXIT, EXIT_CODE_TABLE} from './exit'
 export type {ExitCode} from './exit'
 

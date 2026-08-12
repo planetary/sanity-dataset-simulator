@@ -47,6 +47,9 @@ importers:
       sanity-overlay-core:
         specifier: workspace:*
         version: link:../sanity-overlay-core
+      sanity-overlay-next:
+        specifier: workspace:*
+        version: link:../sanity-overlay-next
       sanity-overlay-query:
         specifier: workspace:*
         version: link:../sanity-overlay-query

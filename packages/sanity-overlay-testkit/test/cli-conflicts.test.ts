@@ -142,3 +142,83 @@ describe('conflicts', () => {
     ])
   })
 })
+
+/* ------------------------------------------------------------------ *
+ * conflicts --resolve — the resolution verb (§28.1, §28.3)
+ * ------------------------------------------------------------------ *
+ *
+ * Listing without resolving left the CLI able to FAIL a script on a conflict
+ * and unable to act on one (found live 2026-08-11, with two hard
+ * BASE_DOCUMENT_DELETED conflicts and no wired resolution path anywhere).
+ * Same confirm discipline as reset/rebase: no --confirm exits 3, --dry-run
+ * never writes.
+ */
+
+describe('conflicts --resolve', () => {
+  it('refuses without --confirm, naming the decision it would record', async () => {
+    const fixture = await createOverlayFixture()
+    await seedConflicts(fixture, 'article-1', [{type: 'BASE_DOCUMENT_DELETED'}])
+
+    const run = await runCliCapture(
+      ['conflicts', '--resolve', 'article-1', '--action', 'keep-as-branch-created'],
+      {cwd: fixture.root},
+    )
+    expect(run.code).toBe(EXIT.CONFIRMATION_REQUIRED)
+    expect(`${run.stdout}${run.stderr}`).toContain('--confirm')
+
+    /* And nothing was written. */
+    const after = await runCliCapture(['conflicts'], {cwd: fixture.root})
+    expect(after.code).toBe(EXIT.FINDINGS)
+  })
+
+  it('resolves with --confirm and the conflict leaves the unresolved list', async () => {
+    const fixture = await createOverlayFixture()
+    await seedConflicts(fixture, 'article-1', [{type: 'BASE_DOCUMENT_DELETED'}])
+
+    const run = await runCliCapture(
+      ['conflicts', '--resolve', 'article-1', '--action', 'keep-as-branch-created', '--confirm'],
+      {cwd: fixture.root},
+    )
+    expect(run.code).toBe(EXIT.OK)
+    expect(run.stdout).toContain('keep-as-branch-created')
+
+    const after = await runCliCapture(['conflicts', '--json'], {cwd: fixture.root})
+    const parsed = JSON.parse(after.stdout)
+    expect(parsed.summary.total).toBe(0)
+    expect(after.code).toBe(EXIT.OK)
+  })
+
+  it('--dry-run reports the plan and writes nothing, even with --confirm', async () => {
+    const fixture = await createOverlayFixture()
+    await seedConflicts(fixture, 'article-1', [{type: 'BASE_DOCUMENT_DELETED'}])
+
+    const run = await runCliCapture(
+      [
+        'conflicts',
+        '--resolve',
+        'article-1',
+        '--action',
+        'accept-base-deletion',
+        '--confirm',
+        '--dry-run',
+      ],
+      {cwd: fixture.root},
+    )
+    expect(run.code).toBe(EXIT.OK)
+
+    const after = await runCliCapture(['conflicts'], {cwd: fixture.root})
+    expect(after.code).toBe(EXIT.FINDINGS)
+  })
+
+  it('refuses an action the conflict does not offer, listing what it does', async () => {
+    const fixture = await createOverlayFixture()
+    await seedConflicts(fixture, 'article-1', [{type: 'BASE_DOCUMENT_DELETED'}])
+
+    const run = await runCliCapture(
+      ['conflicts', '--resolve', 'article-1', '--action', 'remove-local-override', '--confirm'],
+      {cwd: fixture.root},
+    )
+    expect(run.code).not.toBe(EXIT.OK)
+    expect(`${run.stdout}${run.stderr}`).toContain('keep-as-branch-created')
+  })
+})

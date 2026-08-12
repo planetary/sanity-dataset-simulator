@@ -429,6 +429,129 @@ describe('PRD §35.4 mutation tests', () => {
     expect(encodedPaths(local.touchedPaths)).toEqual(['$.sections[_key=a1]'])
   })
 
+  /**
+   * NUMERIC INSERT ANCHORS FOLLOW CONTENT LAKE, NOT ARRAY-BOUNDS PEDANTRY.
+   *
+   * Found live, 2026-08-11, by the first browser spec to type into a Portable
+   * Text field: `sanity@6.8.0` starts every PT body with ONE atomic batch —
+   * `setIfMissing {body: []}`, then `insert {before: "body[0]"}`, then a
+   * `diffMatchPatch` per keystroke. `resolveInsertTarget` rejected anchor
+   * index 0 against the empty array as OVERLAY_PATH_NOT_FOUND, the 400 killed
+   * the whole transaction, and the editor re-buffered and re-failed the same
+   * batch forever: text on screen, disk empty, `Saving...` for good.
+   *
+   * Content Lake documents the semantics these tests pin: a numeric anchor
+   * out of range is applied at the NEAREST VALID POSITION, and a negative
+   * index counts from the end (`-1` is the last element, so `after: [-1]` is
+   * "append"). The whole class is covered here — empty arrays, both ends,
+   * negative indices, and replace — because Studio's "Add item" button spells
+   * append as `after: tags[-1]`, which the pre-fix code silently PREPENDED
+   * (anchorIndex -1 + 1 = 0) rather than rejecting. `_key` anchors stay
+   * strict: a missing key is still an error, matching upstream.
+   */
+  it('§35.4 insert before index 0 of an EMPTY array lands the items (the Studio PT opening batch)', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'setIfMissing', path: ['pt'], value: []},
+      {
+        type: 'insert',
+        path: ['pt', 0],
+        position: 'before',
+        items: [{_key: 'blk1', _type: 'block', children: []}],
+      },
+    ])
+
+    const local = draftOf(state, 'article-1')!
+    expect((local.materialized.pt as {_key: string}[]).map((item) => item._key)).toEqual(['blk1'])
+  })
+
+  it('§35.4 insert after index -1 of an EMPTY array lands the items', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'setIfMissing', path: ['pt'], value: []},
+      {type: 'insert', path: ['pt', -1], position: 'after', items: ['only']},
+    ])
+
+    expect(draftOf(state, 'article-1')!.materialized.pt).toEqual(['only'])
+  })
+
+  it('§35.4 insert after index -1 APPENDS to a non-empty array (the "Add item" spelling)', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'insert', path: ['tags', -1], position: 'after', items: ['three']},
+    ])
+
+    // Pre-fix this PREPENDED: -1 was spliced literally, not counted from the end.
+    expect(draftOf(state, 'article-1')!.materialized.tags).toEqual(['one', 'two', 'three'])
+  })
+
+  it('§35.4 insert before a past-the-end index clamps to append', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'insert', path: ['tags', 99], position: 'before', items: ['three']},
+    ])
+
+    expect(draftOf(state, 'article-1')!.materialized.tags).toEqual(['one', 'two', 'three'])
+  })
+
+  it('§35.4 insert after a past-the-end index clamps to append', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'insert', path: ['tags', 99], position: 'after', items: ['three']},
+    ])
+
+    expect(draftOf(state, 'article-1')!.materialized.tags).toEqual(['one', 'two', 'three'])
+  })
+
+  it('§35.4 insert before a past-the-start negative index clamps to prepend', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'insert', path: ['tags', -99], position: 'before', items: ['zero']},
+    ])
+
+    expect(draftOf(state, 'article-1')!.materialized.tags).toEqual(['zero', 'one', 'two'])
+  })
+
+  it('§35.4 replace at a past-the-end index replaces the NEAREST element (the last one)', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'insert', path: ['tags', 99], position: 'replace', items: ['last']},
+    ])
+
+    expect(draftOf(state, 'article-1')!.materialized.tags).toEqual(['one', 'last'])
+  })
+
+  it('§35.4 replace at index -1 replaces the last element', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'insert', path: ['tags', -1], position: 'replace', items: ['last']},
+    ])
+
+    expect(draftOf(state, 'article-1')!.materialized.tags).toEqual(['one', 'last'])
+  })
+
+  it('§35.4 replace against an EMPTY array has nothing to remove and lands the items', () => {
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'setIfMissing', path: ['pt'], value: []},
+      {type: 'insert', path: ['pt', 0], position: 'replace', items: ['only']},
+    ])
+
+    expect(draftOf(state, 'article-1')!.materialized.pt).toEqual(['only'])
+  })
+
+  it('§35.4 a negative-index insert never stores a negative path — every recorded operation stays §13.6-encodable', () => {
+    /* Found live, 2026-08-11, by the reload half of the structured-fields
+     * browser spec: the write applied and the file was right, but the stored
+     * operation kept its raw `['tags', -1]` path, and the next hydration died
+     * inside `encodeOverlayPath` ("Array index segment must be a non-negative
+     * integer") — which in the browser is the structure tool crashing on
+     * reload. Applying an operation and storing an operation the canonical
+     * format cannot spell must not both happen. */
+    const {state} = patchDraft(emptyState(), 'article-1', [
+      {type: 'insert', path: ['tags', -1], position: 'after', items: ['three']},
+      {type: 'insert', path: ['tags', 99], position: 'before', items: ['four']},
+    ])
+
+    const local = draftOf(state, 'article-1')!
+    for (const operation of local.operations) {
+      if (!('path' in operation)) continue
+      expect(() => encodeOverlayPath(operation.path)).not.toThrow()
+    }
+    expect(local.materialized.tags).toEqual(['one', 'two', 'three', 'four'])
+  })
+
   it('§35.4 "Replace array segment." replaces the anchored item with the supplied items', () => {
     const {state} = patchDraft(emptyState(), 'article-1', [
       {

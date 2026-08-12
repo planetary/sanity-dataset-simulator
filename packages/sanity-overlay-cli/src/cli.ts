@@ -15,7 +15,9 @@ import {parseArgs} from 'node:util'
 import {runCi} from './commands/ci'
 import {runCleanup} from './commands/cleanup'
 import {runCodemod} from './commands/codemod'
+import {runAttach} from './commands/attach'
 import {runConflicts} from './commands/conflicts'
+import {runDev} from './commands/dev'
 import {runDiff} from './commands/diff'
 import {runExport, runImport} from './commands/checkpoint'
 import {runHistory} from './commands/history'
@@ -107,6 +109,16 @@ export const COMMANDS_BEYOND_PRD = Object.freeze({
     'PRD §37 Phase 5 Frontend migration → "Add lint rule for direct client imports and unregistered queries", enforcing §22.5 "CI runs … the lint rule in error mode". The task is mandated; §14.5 names no verb for it.',
   codemod:
     'PRD §37 Phase 5 Frontend migration → "Build and run client-import codemod", enforcing §22.5 "CI runs the codemod in check mode". The task is mandated; §14.5 names no verb for it.',
+  attach:
+    'The counterpart to `dev --detached` (owner request, 2026-08-11): binds a detached overlay ' +
+    'to the real Sanity project once it exists. §14.5 names no verb for it because the PRD ' +
+    'assumes the base identity is known at creation; starting content before the project is ' +
+    'provisioned is the workflow that breaks that assumption.',
+  dev:
+    'Roadmap "pleasant DX" (owner request, 2026-08-11): one command that runs the overlay API ' +
+    'against --root, creates the overlay when the directory has none, and prints the Studio/site ' +
+    'wiring. §14.5 names no verb for running the server; every launcher until now was an example ' +
+    'script with its own env recipe.',
   ci:
     'PRD §37 Phase 6 CI → the whole ten-line block ("Validate overlay file schemas", "Validate branch schema", "Validate strong references", "Check unsupported plugins", "Check no write tokens in preview configuration", "Check checkpoint status policy", "Report conflict summary on PR", the base drift scan and the PR status refresh). Every one of those tasks is mandated and §14.5 names a verb for none of them. One verb rather than seven, because a CI job needs ONE exit code over the whole checklist and seven commands would each have reported a different half of it.',
 } as const)
@@ -136,6 +148,8 @@ export const CLI_COMMANDS = Object.freeze([
   'lint',
   'codemod',
   'ci',
+  'dev',
+  'attach',
 ] as const)
 
 export type CliCommand = (typeof CLI_COMMANDS)[number]
@@ -171,10 +185,35 @@ const COMMAND_OPTIONS: Record<CliCommand, Record<string, unknown>> = {
     confirm: {type: 'boolean'},
     'dry-run': {type: 'boolean'},
   },
+  attach: {
+    project: {type: 'string'},
+    dataset: {type: 'string'},
+    'api-version': {type: 'string'},
+    confirm: {type: 'boolean'},
+    'dry-run': {type: 'boolean'},
+    force: {type: 'boolean'},
+  },
+  dev: {
+    port: {type: 'string'},
+    'studio-origin': {type: 'string'},
+    project: {type: 'string'},
+    dataset: {type: 'string'},
+    'api-version': {type: 'string'},
+    id: {type: 'string'},
+    branch: {type: 'string'},
+    repository: {type: 'string'},
+    detached: {type: 'boolean'},
+  },
   conflicts: {
     document: {type: 'string'},
     all: {type: 'boolean'},
     actions: {type: 'boolean'},
+    resolve: {type: 'string'},
+    action: {type: 'string'},
+    conflict: {type: 'string'},
+    value: {type: 'string'},
+    confirm: {type: 'boolean'},
+    'dry-run': {type: 'boolean'},
   },
   query: {
     list: {type: 'boolean'},
@@ -282,6 +321,8 @@ const USAGE_SUMMARY: Record<CliCommand, string> = {
   reset: 'discard branch state (destructive — needs --confirm)',
   rebase: 'replace the merge ancestor with the current base (destructive — needs --confirm)',
   conflicts: 'list unresolved conflicts and the resolution actions that apply',
+  dev: 'run the overlay API locally and print the Studio/site wiring (Ctrl-C to stop)',
+  attach: 'bind a detached overlay to a real Sanity project (needs --confirm)',
   query: 'evaluate a REGISTERED query against the branch',
   export:
     'write a checkpoint tree (--output) or a portable bundle (--bundle); --mark-checkpoint records it in the manifest',
@@ -402,11 +443,45 @@ async function dispatch(
         confirm: values.confirm === true,
         dryRun: values['dry-run'] === true,
       })
+    case 'attach':
+      return runAttach(ctx, {
+        ...(typeof values.project === 'string' ? {project: values.project} : {}),
+        ...(typeof values.dataset === 'string' ? {dataset: values.dataset} : {}),
+        ...(typeof values['api-version'] === 'string' ? {apiVersion: values['api-version']} : {}),
+        confirm: values.confirm === true,
+        dryRun: values['dry-run'] === true,
+        force: values.force === true,
+      })
+    case 'dev': {
+      const port = typeof values.port === 'string' ? Number(values.port) : undefined
+      if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) {
+        throw usageError(`--port must be an integer between 0 and 65535, got ${values.port}`)
+      }
+      return runDev(ctx, {
+        ...(port === undefined ? {} : {port}),
+        ...(typeof values['studio-origin'] === 'string'
+          ? {studioOrigin: values['studio-origin']}
+          : {}),
+        ...(typeof values.project === 'string' ? {project: values.project} : {}),
+        ...(typeof values.dataset === 'string' ? {dataset: values.dataset} : {}),
+        ...(typeof values['api-version'] === 'string' ? {apiVersion: values['api-version']} : {}),
+        ...(typeof values.id === 'string' ? {overlayId: values.id} : {}),
+        ...(typeof values.branch === 'string' ? {branch: values.branch} : {}),
+        ...(typeof values.repository === 'string' ? {repository: values.repository} : {}),
+        detached: values.detached === true,
+      })
+    }
     case 'conflicts':
       return runConflicts(ctx, {
         ...(typeof values.document === 'string' ? {document: values.document} : {}),
         all: values.all === true,
         actions: values.actions === true,
+        ...(typeof values.resolve === 'string' ? {resolve: values.resolve} : {}),
+        ...(typeof values.action === 'string' ? {action: values.action} : {}),
+        ...(typeof values.conflict === 'string' ? {conflict: values.conflict} : {}),
+        ...(typeof values.value === 'string' ? {value: values.value} : {}),
+        confirm: values.confirm === true,
+        dryRun: values['dry-run'] === true,
       })
     case 'query':
       return runQuery(ctx, {

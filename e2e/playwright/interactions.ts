@@ -27,7 +27,7 @@
  */
 import {type Locator, type Page, expect} from '@playwright/test'
 
-import {STUDIO, actionTestId} from './selectors'
+import {STUDIO, actionTestId, fieldTestId} from './selectors'
 
 /** The pane the document form lives in. Scopes every field locator. */
 export function documentPane(page: Page): Locator {
@@ -103,6 +103,158 @@ export async function waitForSettled(page: Page, timeout = 15_000): Promise<bool
   } catch {
     return false
   }
+}
+
+/**
+ * One field's wrapper, by schema name. The anchor for array and PT fields,
+ * which render no textbox and cannot be located by accessible name the way
+ * `field()` does — `add-single-primitive-button` names the widget kind, and a
+ * document with two arrays has two of them.
+ */
+export function fieldRoot(page: Page, name: string): Locator {
+  return documentPane(page).getByTestId(fieldTestId(name)).last()
+}
+
+/**
+ * Type into the Portable Text editor.
+ *
+ * TWO DELIBERATE DEPARTURES from `setField()`:
+ *
+ * 1. The editor renders INERT behind a full-size "Click to activate" overlay
+ *    (`ActivateOnFocus` in the dist). Typing without dismissing it goes
+ *    nowhere, silently — the exact failure shape this suite exists to catch,
+ *    so the overlay is clicked when present and the contenteditable is
+ *    required to be focused before any key is pressed.
+ *
+ * 2. `pressSequentially()` rather than `fill()`. The PT editor is a synthetic-
+ *    event editor: it builds its model from `beforeinput` events, and `fill()`
+ *    sets the value in one programmatic step the editor never hears about.
+ *    This is NOT the §35.12 keystroke spec (no concurrent remote patch, no
+ *    cursor assertions) — it is just the only way to get text in at all.
+ */
+export async function typePortableText(page: Page, name: string, text: string): Promise<void> {
+  const editor = fieldRoot(page, name).getByTestId(STUDIO.ptEditor)
+  await expect(editor).toBeVisible()
+
+  const overlay = editor.getByTestId(STUDIO.ptActivateOverlay)
+  if ((await overlay.count()) > 0 && (await overlay.first().isVisible())) {
+    await overlay.first().click()
+  }
+
+  const surface = editor.locator('[contenteditable="true"]').first()
+  await expect(surface).toBeVisible()
+  await surface.click()
+  await expect(surface).toBeFocused()
+  await surface.pressSequentially(text)
+  await surface.blur()
+}
+
+/**
+ * The open array-item edit dialog, whichever of the two ids this build gave it
+ * (see `editObjectDialog` in `selectors.ts` — confirmed on a real run).
+ */
+export function objectEditDialog(page: Page): Locator {
+  return page
+    .getByTestId(STUDIO.nestedObjectDialog)
+    .or(page.getByTestId(STUDIO.editPortalDialog))
+    .or(page.getByTestId(STUDIO.editObjectDialog))
+    .last()
+}
+
+/**
+ * Add an item to an ARRAY-OF-OBJECTS field and leave its edit dialog open.
+ *
+ * Which button renders is a fact about the schema, not the data: one member
+ * type gets `add-single-object-button`; several get `add-multiple-object-
+ * button` plus a menu of member-type labels. Both paths end in the same place
+ * — Studio opens the item's edit dialog.
+ */
+export async function addArrayObjectItem(
+  page: Page,
+  name: string,
+  memberTypeLabel?: string,
+): Promise<Locator> {
+  const root = fieldRoot(page, name)
+  const multiple = root.getByTestId(STUDIO.addMultipleObjectButton)
+  const single = root.getByTestId(STUDIO.addSingleObjectButton)
+
+  /* `count()` answers about the DOM AS IT IS, and asking before the form has
+   * rendered answers 0 for both buttons — which silently picks the wrong
+   * branch (seen once as a 90 s timeout on a button `sections` never renders).
+   * Wait until whichever button this schema gets exists, THEN branch. */
+  await expect(multiple.or(single).first()).toBeVisible()
+
+  if ((await multiple.count()) > 0) {
+    if (memberTypeLabel === undefined) {
+      throw new Error(`array "${name}" has several member types; pass the label to insert`)
+    }
+    await multiple.first().click()
+    await page.getByRole('menuitem', {name: memberTypeLabel, exact: false}).first().click()
+  } else {
+    await single.first().click()
+  }
+
+  const dialog = objectEditDialog(page)
+  await expect(dialog).toBeVisible()
+  return dialog
+}
+
+/**
+ * Set one field INSIDE the open array-item dialog.
+ *
+ * Strings and `text` areas are textboxes; numbers are spinbuttons — both
+ * located by rendered label, same doctrine as `field()`. `fill()` is correct
+ * here: these are plain inputs, not synthetic-event editors.
+ */
+export async function setDialogField(
+  page: Page,
+  label: string,
+  value: string,
+): Promise<void> {
+  const dialog = objectEditDialog(page)
+  const input = dialog
+    .getByRole('textbox', {name: label, exact: true})
+    .or(dialog.getByRole('spinbutton', {name: label, exact: true}))
+  await expect(input.first()).toBeVisible()
+  await input.first().fill(value)
+  await input.first().blur()
+}
+
+/** Close the array-item dialog. Edits are already committed per keystroke. */
+export async function closeObjectDialog(page: Page): Promise<void> {
+  const dialog = objectEditDialog(page)
+  const close = dialog.getByRole('button', {name: 'Close dialog', exact: true})
+  if ((await close.count()) > 0) await close.first().click()
+  else await page.keyboard.press('Escape')
+  for (const id of [STUDIO.nestedObjectDialog, STUDIO.editPortalDialog, STUDIO.editObjectDialog]) {
+    await expect(page.getByTestId(id)).toHaveCount(0)
+  }
+}
+
+/**
+ * Append one value to a PRIMITIVE array field (`tags`).
+ *
+ * By role + rendered label: the enabled "Add item" button of a primitive
+ * array carries NO test id in the pinned build (the only
+ * `add-single-primitive-button` in the dist is a disabled placeholder —
+ * confirmed on a real run, where the test-id locator timed out against a
+ * perfectly clickable button). The new item is the last unlabelled textbox
+ * in the field.
+ */
+export async function addPrimitiveArrayItem(
+  page: Page,
+  name: string,
+  value: string,
+): Promise<void> {
+  const root = fieldRoot(page, name)
+  const add = root.getByRole('button', {name: 'Add item', exact: true})
+  await expect(add.first()).toBeVisible()
+  const before = await root.getByRole('textbox').count()
+  await add.first().click()
+  const input = root.getByRole('textbox').nth(before)
+  await expect(input).toBeVisible()
+  await input.fill(value)
+  await input.blur()
 }
 
 /**

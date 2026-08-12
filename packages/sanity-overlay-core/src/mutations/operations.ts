@@ -59,6 +59,17 @@ export interface AppliedOperation {
    * that the increment was already folded into the materialized value.
    */
   resultValue?: unknown
+  /**
+   * The operation as it must be RECORDED, when that differs from the input.
+   * §13.6 canonical paths cannot spell a negative array index, but Content
+   * Lake insert anchors may be negative (`after: tags[-1]` is Studio's "Add
+   * item"). The insert applies against the live array, so this carries the
+   * same operation re-anchored at the resolved non-negative index — storing
+   * the raw one instead crashes the NEXT hydration inside `encodeOverlayPath`,
+   * long after the write reported success (found live 2026-08-11: the
+   * structure tool crashed on reload while the document on disk was correct).
+   */
+  normalizedOperation?: OverlayOperation
 }
 
 function operationError(message: string, details: Record<string, unknown> = {}): never {
@@ -173,14 +184,20 @@ function resolveInsertTarget(document: SanityDocument, path: OverlayPath): Inser
   }
 
   if (typeof last === 'number') {
-    if (last >= parent.value.length) {
-      throw new OverlayPathError(
-        'OVERLAY_PATH_NOT_FOUND',
-        `insert anchor index ${last} is out of range for an array of length ${parent.value.length}`,
-        {path: encodeOverlayPath(path), length: parent.value.length},
-      )
-    }
-    return {arrayPath, array: parent.value, anchorIndex: last, numericAnchor: true}
+    /*
+     * CONTENT LAKE SEMANTICS, NOT ARRAY-BOUNDS PEDANTRY. A negative index
+     * counts from the end (`-1` is the last element), and an out-of-range
+     * anchor is applied at the NEAREST VALID POSITION rather than rejected —
+     * `applyInsert` clamps per position. This is load-bearing for the pinned
+     * Studio: its very first Portable Text batch is `setIfMissing {body: []}`
+     * + `insert {before: "body[0]"}` (anchor 0 against a length-0 array), and
+     * its "Add item" button spells append as `after: tags[-1]`. Rejecting the
+     * former 400'd the whole atomic batch — the editor re-buffered and
+     * re-failed it forever, text on screen, disk empty (found live
+     * 2026-08-11); splicing the latter literally PREPENDED.
+     */
+    const normalized = last < 0 ? parent.value.length + last : last
+    return {arrayPath, array: parent.value, anchorIndex: normalized, numericAnchor: true}
   }
 
   throw new OverlayPathError(
@@ -207,17 +224,38 @@ function applyInsert(
   const next = [...target.array]
   let removedKey: string | null = null
 
+  const clamp = (value: number, lower: number, upper: number): number =>
+    Math.min(Math.max(value, lower), upper)
+
+  /* The anchor index the recorded operation must carry: resolved against the
+   * array the insert actually ran on, and never negative (§13.6). Computed
+   * against `target.array` BEFORE the splice mutates `next`. */
+  let recordedAnchor: number | null = null
+
   if (target.anchorIndex === null) {
     if (op.position === 'before') next.unshift(...items)
     else if (op.position === 'after') next.push(...items)
     else next.splice(0, next.length, ...items)
   } else if (op.position === 'before') {
-    next.splice(target.anchorIndex, 0, ...items)
+    /* A `_key` anchor is always in range; the clamps only ever move a NUMERIC
+     * out-of-range anchor to the nearest valid position (Content Lake
+     * semantics — see resolveInsertTarget). */
+    const at = clamp(target.anchorIndex, 0, next.length)
+    recordedAnchor = at
+    next.splice(at, 0, ...items)
   } else if (op.position === 'after') {
-    next.splice(target.anchorIndex + 1, 0, ...items)
+    const at = clamp(target.anchorIndex, -1, next.length - 1)
+    recordedAnchor = Math.max(at, 0)
+    next.splice(at + 1, 0, ...items)
+  } else if (next.length === 0) {
+    /* Replace against an empty array: nothing to remove, the items land. */
+    recordedAnchor = 0
+    next.splice(0, 0, ...items)
   } else {
-    removedKey = itemKey(next[target.anchorIndex])
-    next.splice(target.anchorIndex, 1, ...items)
+    const at = clamp(target.anchorIndex, 0, next.length - 1)
+    recordedAnchor = at
+    removedKey = itemKey(next[at])
+    next.splice(at, 1, ...items)
   }
 
   // §17.7 key-collision detection: a local insert may not duplicate a `_key`.
@@ -258,7 +296,21 @@ function applyInsert(
       ? operationError('insert cannot target the document root', {})
       : (setAtPath(document, target.arrayPath, next) as SanityDocument)
 
-  return {document: document2, touchedPaths, noop: false}
+  /* Re-anchor the recorded operation when a numeric anchor was normalized or
+   * clamped — the raw spelling may be un-encodable (§13.6 has no negative
+   * index) and the resolved one is what the insert actually did. */
+  const rawAnchor = op.path[op.path.length - 1]
+  const normalizedOperation =
+    target.numericAnchor && recordedAnchor !== null && rawAnchor !== recordedAnchor
+      ? {...op, path: [...target.arrayPath, recordedAnchor]}
+      : undefined
+
+  return {
+    document: document2,
+    touchedPaths,
+    noop: false,
+    ...(normalizedOperation === undefined ? {} : {normalizedOperation}),
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -442,15 +494,28 @@ export function applyOperations(
   document: SanityDocument,
   operations: readonly OverlayOperation[],
   options: ApplyOperationOptions = {},
-): {document: SanityDocument; touchedPaths: OverlayPath[]; results: AppliedOperation[]} {
+): {
+  document: SanityDocument
+  touchedPaths: OverlayPath[]
+  results: AppliedOperation[]
+  /**
+   * The operations as they must be RECORDED — identical to the input except
+   * where an operation resolved to a different canonical spelling (see
+   * `AppliedOperation.normalizedOperation`). Callers that persist operations
+   * must store these, never the raw input.
+   */
+  operations: OverlayOperation[]
+} {
   let current = document
   const touchedPaths: OverlayPath[] = []
   const results: AppliedOperation[] = []
+  const recorded: OverlayOperation[] = []
   for (const operation of operations) {
     const applied = applyOperation(current, operation, options)
     current = applied.document
     touchedPaths.push(...applied.touchedPaths)
     results.push(applied)
+    recorded.push(applied.normalizedOperation ?? operation)
   }
-  return {document: current, touchedPaths, results}
+  return {document: current, touchedPaths, results, operations: recorded}
 }

@@ -25,6 +25,7 @@ export {
   applicableResolutionActions,
   isAcknowledgementValid,
   resolveConflict,
+  resolveRecordConflict,
 } from './resolve'
 export type {
   AcknowledgeConflictRequest,
@@ -34,4 +35,6 @@ export type {
   ConflictResolutionResult,
   ConflictResolutionTransaction,
   ResolveConflictRequest,
+  ResolveRecordConflictRequest,
+  ResolveRecordConflictResult,
 } from './resolve'

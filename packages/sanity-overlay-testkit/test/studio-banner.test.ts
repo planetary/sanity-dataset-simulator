@@ -54,6 +54,29 @@ function fakeReact(): ReactLike & {effects: (() => void | (() => void))[]} {
   }
 }
 
+/* The fake `useState` above always returns the initializer, which is why the
+ * expanded-details assertions below need their own variant — the component's
+ * `useState(false)` can never be flipped by a click in this harness (no DOM,
+ * no renderer), so "expanded" is exercised by starting the hook there instead. */
+function fakeReactExpanded(): ReactLike & {effects: (() => void | (() => void))[]} {
+  const effects: (() => void | (() => void))[] = []
+  return {
+    effects,
+    createElement: (type: unknown, props?: unknown, ...children: unknown[]): FakeElement => ({
+      type: String(type),
+      props: (props ?? {}) as Record<string, unknown>,
+      children: children.filter(Boolean) as FakeElement[],
+    }),
+    useEffect: (effect) => {
+      effects.push(effect)
+    },
+    useState: <S>(_initial: S | (() => S)): [S, (next: S | ((prev: S) => S)) => void] => [
+      true as unknown as S,
+      () => {},
+    ],
+  }
+}
+
 function flatten(node: unknown, out: FakeElement[] = []): FakeElement[] {
   if (typeof node !== 'object' || node === null) return out
   const element = node as FakeElement
@@ -70,6 +93,16 @@ function textOf(node: unknown): string {
 
 function findBanner(node: unknown): FakeElement | undefined {
   return flatten(node).find((element) => element.props['data-testid'] === 'overlay-status-banner')
+}
+
+function findDetails(node: unknown): FakeElement | undefined {
+  return flatten(node).find((element) => element.props['data-testid'] === 'overlay-banner-details')
+}
+
+function findToggle(node: unknown): FakeElement | undefined {
+  return flatten(node).find(
+    (element) => element.props['data-testid'] === 'overlay-banner-details-toggle',
+  )
 }
 
 interface HarnessOptions {
@@ -119,17 +152,24 @@ describe('the banner is additive, never a replacement', () => {
 })
 
 describe('what the banner says', () => {
-  it('shows the §21.3 lines', () => {
+  /* 2026-08-11 redesign: the single strip rendered identity, storage, base,
+   * revision, checkpoint, API endpoint and conflicts at equal weight, which is
+   * what the user found confusing. Tier 1 (always visible) now keeps only the
+   * headline, "Overlay revision:" and blocking facts; Storage/Base/Conflicts/
+   * Checkpoint/Overlay API move to the collapsed Tier 2 — see "the two-tier
+   * split" and "the details tier" below for their coverage. */
+  it('shows only the §21.3 headline and revision in the collapsed tier', () => {
     const {react} = harness()
     const Layout = createOverlayStatusLayout(react)
     const text = textOf(Layout({renderDefault: () => react.createElement('main')}))
 
     expect(text).toContain('BRANCH OVERLAY')
-    expect(text).toMatch(/Storage: filesystem/)
-    expect(text).toMatch(/Base: .*read only/)
-    expect(text).toMatch(/Conflicts: 0 soft, 0 hard/)
-    expect(text).toMatch(/Checkpoint: up to date/)
-    expect(text).toMatch(/Overlay API: http:\/\/localhost:3998/)
+    expect(text).toMatch(/Overlay revision:/)
+    expect(text).not.toMatch(/Storage: filesystem/)
+    expect(text).not.toMatch(/Base: .*read only/)
+    expect(text).not.toMatch(/Conflicts: 0 soft, 0 hard/)
+    expect(text).not.toMatch(/Checkpoint: up to date/)
+    expect(text).not.toMatch(/Overlay API: http:\/\/localhost:3998/)
   })
 
   it('exposes the state and severity as data attributes a browser check can assert on', () => {
@@ -169,6 +209,82 @@ describe('what the banner says', () => {
     expect(textOf(Layout({renderDefault: () => react.createElement('main')}))).toMatch(
       /Overlay revision: 9/,
     )
+  })
+})
+
+describe('the two-tier split', () => {
+  /* overlayBannerViewModel is the pure surface the tier split must be provable
+   * against, since the fake useState above can never be flipped by a click. */
+  it('puts only the "Overlay revision" line in summaryLines, everything else in detailLines', async () => {
+    const {runtime, react} = harness({fetchResult: {ok: true, revision: 9, documents: []}})
+    await runtime.refresh()
+    void react
+
+    const model = overlayBannerViewModel(runtime)
+    expect(model.summaryLines.map((line) => line.label)).toEqual(['Overlay revision'])
+    expect(model.summaryLines[0]!.value).toBe('9')
+    expect(model.detailLines.map((line) => line.label)).toEqual([
+      'Overlay',
+      'Storage',
+      'Base',
+      'Conflicts',
+      'Checkpoint',
+      'Overlay API',
+    ])
+    expect(model.detailLines.some((line) => line.label === 'Overlay revision')).toBe(false)
+  })
+})
+
+describe('the details tier', () => {
+  it('renders a collapsed Details toggle and omits the details region by default', () => {
+    const {react} = harness()
+    const Layout = createOverlayStatusLayout(react)
+    const tree = Layout({renderDefault: () => react.createElement('main')})
+
+    const toggle = findToggle(tree)
+    expect(toggle).toBeDefined()
+    expect(toggle?.children.filter((child) => typeof child === 'string')).toEqual(['Details'])
+    expect(findDetails(tree)).toBeUndefined()
+  })
+
+  it('shows the detail lines once expanded, and flips the toggle label', async () => {
+    const {runtime} = harness({fetchResult: {ok: true, revision: 9, documents: []}})
+    await runtime.refresh()
+
+    const expandedReact = fakeReactExpanded()
+    const Layout = createOverlayStatusLayout(expandedReact)
+    // The runtime is registered under '*' by harness(); reuse it under the expanded fake.
+    const tree = Layout({renderDefault: () => expandedReact.createElement('main')})
+
+    const toggle = findToggle(tree)
+    expect(toggle?.children.filter((child) => typeof child === 'string')).toEqual(['Hide details'])
+
+    const details = findDetails(tree)
+    expect(details).toBeDefined()
+    const text = textOf(details)
+    expect(text).toMatch(/Storage: filesystem/)
+    expect(text).toMatch(/Base: .*read only/)
+    expect(text).toMatch(/Conflicts: 0 soft, 0 hard/)
+    expect(text).toMatch(/Checkpoint: up to date/)
+    expect(text).toMatch(/Overlay API: http:\/\/localhost:3998/)
+    expect(text).not.toMatch(/Overlay revision:/)
+  })
+
+  it('keeps runtime messages out of the collapsed tier and shows them once expanded', async () => {
+    const {runtime} = harness({fetchThrows: true})
+    await runtime.refresh()
+
+    const collapsedReact = fakeReact()
+    const collapsedTree = createOverlayStatusLayout(collapsedReact)({
+      renderDefault: () => collapsedReact.createElement('main'),
+    })
+    expect(textOf(collapsedTree)).not.toMatch(/ECONNREFUSED/)
+
+    const expandedReact = fakeReactExpanded()
+    const expandedTree = createOverlayStatusLayout(expandedReact)({
+      renderDefault: () => expandedReact.createElement('main'),
+    })
+    expect(textOf(findDetails(expandedTree))).toMatch(/ECONNREFUSED/)
   })
 })
 
@@ -264,5 +380,93 @@ describe('the effect wiring', () => {
     expect(runtime.status()).toBeDefined()
     expect(typeof teardown).toBe('function')
     ;(teardown as () => void)()
+  })
+})
+
+describe('resolved conflicts leave the banner (2026-08-11)', () => {
+  /**
+   * FOUND LIVE, minutes after resolution first worked end to end: the summary
+   * line said "Conflicts: 0 soft, 0 hard" while two ⛔ rows still rendered —
+   * each ending in a dangling "— " where the action labels used to be,
+   * because `conflictPanelModel` correctly gives a RESOLVED conflict zero
+   * actions but the banner never filtered. A banner is "what needs you";
+   * resolved conflicts are history and belong to the panel, not the strip.
+   */
+  it('does not render a ⛔ row for a conflict that carries a resolution', async () => {
+    const {runtime, react} = harness({
+      fetchResult: {
+        ok: true,
+        revision: 30,
+        documents: [
+          {
+            logicalId: 'article-1',
+            conflicts: [
+              {
+                id: 'c1',
+                documentId: 'article-1',
+                severity: 'hard',
+                type: 'BASE_DOCUMENT_DELETED',
+                detectedAt: '2026-08-01T00:00:00.000Z',
+                resolution: {
+                  type: 'keep-local',
+                  resolvedAt: '2026-08-11T21:00:00.000Z',
+                  resolvedBy: {type: 'user', id: 'user-1'},
+                },
+              },
+            ],
+          },
+        ],
+      },
+    })
+    await runtime.refresh()
+
+    const model = overlayBannerViewModel(runtime)
+    expect(model.conflicts).toHaveLength(0)
+
+    const Layout = createOverlayStatusLayout(react)
+    const text = textOf(Layout({renderDefault: () => react.createElement('main')}))
+    expect(text).not.toContain('⛔')
+    expect(text).not.toContain('article-1 (whole document)')
+  })
+
+  it('still renders the unresolved one when resolved and unresolved coexist', async () => {
+    const {runtime, react} = harness({
+      fetchResult: {
+        ok: true,
+        revision: 30,
+        documents: [
+          {
+            logicalId: 'article-1',
+            conflicts: [
+              {
+                id: 'c1',
+                documentId: 'article-1',
+                severity: 'hard',
+                type: 'BASE_DOCUMENT_DELETED',
+                detectedAt: '2026-08-01T00:00:00.000Z',
+                resolution: {
+                  type: 'keep-local',
+                  resolvedAt: '2026-08-11T21:00:00.000Z',
+                  resolvedBy: {type: 'user', id: 'user-1'},
+                },
+              },
+              {
+                id: 'c2',
+                documentId: 'article-1',
+                severity: 'soft',
+                type: 'SAME_PATH_CHANGED',
+                path: ['title'],
+                detectedAt: '2026-08-01T00:00:00.000Z',
+              },
+            ],
+          },
+        ],
+      },
+    })
+    await runtime.refresh()
+
+    const model = overlayBannerViewModel(runtime)
+    expect(model.conflicts).toHaveLength(1)
+    expect(model.conflicts[0]!.id).toBe('c2')
   })
 })

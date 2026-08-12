@@ -1,8 +1,8 @@
 # `e2e/` — the browser suite roadmap Phase 5 exits on
 
 > **Status: runs locally, green.** `@playwright/test` is installed at the
-> workspace root and the local suite passed on 2026-08-10 (recorded in
-> `e2e/.artifacts/run/`). It is **not in CI** — every browser assertion is a
+> workspace root and the local suite passed on 2026-08-11 — 63 passed, 4
+> skipped (recorded in `e2e/.artifacts/run/`). It is **not in CI** — every browser assertion is a
 > manual run. The live suite (`E2E_MODE=live`) needs the repo `.env`
 > credentials and skips without them. Scenario-by-scenario coverage and the
 > deliberate gaps are listed below, without rounding up.
@@ -29,7 +29,7 @@ E2E_MODE=live pnpm exec playwright test    # against the real project + READ tok
 
 ```bash
 node --test e2e/audit/predicates.test.mjs      # runs today · 31 assertions
-node --test e2e/playwright/selectors.test.mjs  # runs today · 45 assertions
+node --test e2e/playwright/selectors.test.mjs  # runs today · 56 assertions
 node e2e/audit/runAudit.mjs                    # the network audit, standalone
 ```
 
@@ -222,6 +222,11 @@ top.
 | 8 | The site renders branch content; `mode: off` renders staging | `local/08-local-site.spec.ts` | **asserted** | server-rendered HTML from two ports |
 | 8b | A tombstoned document 404s on the site | `local/08-local-site.spec.ts` | **scaffolded** (`skip`) | needs an id shared by base and Studio |
 | 9 | Network audit — no staging writes | `local/99-network-audit.spec.ts` | **asserted** | two server-side JSONL logs |
+| 10 | Portable Text typed into a real editor lands as keyed blocks, exact text | `local/10-structured-fields.spec.ts` | **asserted** | disk (`intent.json`), then DOM after reload |
+| 10b | Keyed object-array items: both member types, `_key` identity, number stays a number | `local/10-structured-fields.spec.ts` | **asserted** | disk |
+| 10c | Editing an existing keyed item updates by `_key`, not delete+insert | `local/10-structured-fields.spec.ts` | **asserted** | disk (`_key` stable across edits) |
+| 10d | Primitive array items land in order | `local/10-structured-fields.spec.ts` | **asserted** | disk |
+| 10e | All structured values survive a full reload | `local/10-structured-fields.spec.ts` | **asserted** | DOM + disk |
 | 10 | Staging untouched, against the upstream API | `live/01-staging-untouched.spec.ts` | **asserted (live)** | `_rev` + `_updatedAt` + no `drafts.<id>` |
 | — | Selector provenance against the pinned build | `playwright/selectors.test.mjs` | **asserted, RUNS TODAY** | `sanity@6.8.0` dist |
 | — | Audit predicate negative controls | `audit/predicates.test.mjs` | **asserted, RUNS TODAY** | synthetic logs + the committed log |
@@ -240,8 +245,13 @@ top.
   giving the suite a write token.
 - **§35.13 Scenario A step 9–10 (checkpoint → Git)** and **Scenario F (Blob stale
   write)** — blocked on the checkpoint action and on Gate C respectively.
-- **Reference selection, keyed-array reorder, Portable Text editing** — §35.12
-  items with no spec here. Named so the gap is visible.
+- **Reference selection and keyed-array REORDER (drag)** — §35.12 items with no
+  spec here. Named so the gap is visible. Portable Text editing, keyed-array
+  add/edit and primitive arrays left this list on 2026-08-11
+  (`local/10-structured-fields.spec.ts`) — a run that immediately found two
+  product defects the Node suites could not see: numeric insert anchors
+  rejected instead of clamped (Studio's opening PT batch 400'd forever), and
+  the raw `[-1]` anchor stored to disk crashing the next hydration.
 
 ---
 
@@ -249,7 +259,7 @@ top.
 
 ```
 node --test e2e/audit/predicates.test.mjs        31 assertions   green
-node --test e2e/playwright/selectors.test.mjs    45 assertions   green
+node --test e2e/playwright/selectors.test.mjs    56 assertions   green
 ```
 
 The first proves the network audit can fail. The second proves every selector

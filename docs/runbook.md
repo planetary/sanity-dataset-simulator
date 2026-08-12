@@ -15,7 +15,7 @@
 |---|---|---|
 | Studio | 3333 | `pnpm --filter kitchen-sink dev` |
 | Track B proxy (write guard) | 3999 | `node examples/kitchen-sink/spikeB-proxy/proxy.mjs` |
-| Overlay API | 3998 | `node examples/kitchen-sink/overlayApiServer.mjs` |
+| Overlay API | 3998 | `sanity-overlay dev --root <dir>` (the distributable front door, 2026-08-11 — creates the overlay when missing and prints the Studio/site wiring) or `node examples/kitchen-sink/overlayApiServer.mjs` |
 | Site reading the overlay | 4000 | `pnpm --filter local-site dev` |
 
 Port 3333 is fixed: the overlay API grants CORS to exactly one origin.
@@ -236,6 +236,18 @@ which is what makes merge a pure function and two evaluations byte-identical.
 
 Persistence is **not** an append-only log. The stored list is the set of disagreements *currently true*: newly detected ones are added, a previously known one is kept (preserving `detectedAt` and any `resolution`) **only while all three compared values are unchanged**, and one that is no longer detected is **dropped — resolved or not**.
 
+### Resolving one (wired 2026-08-11)
+
+Three equivalent paths, all ending in one §28.1 overlay transaction through core's `resolveRecordConflict`:
+
+- **Studio** — the "Resolve conflicts" document action (the banner itself is read-only by design; it lists the applicable actions, the document action invokes them).
+- **CLI** — `sanity-overlay conflicts --resolve <documentId> --action <action> --confirm` (`--dry-run` previews; more than one unresolved conflict on the document needs `--conflict <id>`). `accept-current-staging` is refused offline — it needs the current base document, which the CLI cannot observe (§16.1).
+- **API** — `POST /commit` with `kind: "conflictResolution"` (idempotent; replays like every other commit kind).
+
+### BASE_DOCUMENT_DELETED requires an observation (fixed 2026-08-11)
+
+A commit that arrives without usable `baseDocuments` used to be read as "the base was deleted" whenever the record had a merge ancestor — which in Mode 2 (no base plane exists; the facade sends `baseDocuments: []`) manufactured hard conflicts on every edit of a base-ancestored document. Deletion now requires the explicit `baseStatus: 'deleted'` signal from something that performed a direct base read (§16.1) — the §16.6 drift scan, when it exists. An unobservable base merges as "nothing new observed" and a rebase without a base still blocks, with the honest reason.
+
 ### Severity, and what it blocks
 
 | Type | Default severity |
@@ -446,6 +458,43 @@ The test asserting the failure is deliberately pinned red-when-fixed: *"WHEN THE
 ---
 
 ## 6. Other things you will hit
+
+### Studio says "Couldn't reach the Sanity servers" over the Mode 2 origin — the TLS one-time step
+
+The Mode 2 data plane (`runOrigin.mjs`) serves `https://<projectId>.localhost:3999`
+with a self-signed certificate, and a cross-origin XHR to an untrusted-certificate
+origin fails **silently** — Studio reads it as a network failure. Once per browser
+profile: open `https://<projectId>.localhost:3999/v2025-02-19/users/me` directly and
+accept the certificate, then reload the Studio.
+
+**Firefox cannot be fixed this way.** Its manually-accepted certificate exceptions
+do not apply to `wss:` WebSocket connections (a bug open since at least 2015), so
+Studio's listener socket keeps failing after the exception is granted. Use
+Chrome/Chromium (the browser the E2E suite pins), or install
+`mkcert` + `mkcert -install` for a locally-trusted certificate — that fixes every
+browser and removes the interstitial step for good.
+
+**Tailscale breaks the Node-side tests for the same hostname.** With MagicDNS
+active the system resolver (100.100.100.100) does not answer `*.localhost`, so
+Node's `getaddrinfo` fails (`ENOTFOUND b1n03q3z.localhost`) and the suites that
+dial the proxy from Node (`studio-boot-smoke`, `proxy-tls-live`,
+`studio-reference-validation`) go red — observed 2026-08-11, ~15 tests. Browsers
+are unaffected (they resolve `*.localhost` internally per RFC 6761). Re-run off
+the tailnet, or configure Tailscale DNS to keep the local resolver.
+
+### A fresh clone served zero documents — fixed 2026-08-11, and what remains refused
+
+`.runtime/` is gitignored, so a clone of a repo with a committed `.sanity-overlay/`
+has intents and snapshots but no records. `hydrateState` (overlay API) and the
+Mode 2 origin now rebuild records from the committed surface via
+`recordFromIntent` (PRD §14.4 step 6, §29.7 step 4). Two refusals are deliberate
+and remain: a patch-mode intent whose base snapshot is missing, and a document
+carrying **unresolved** conflicts (their payloads are deliberately excluded from
+the committed summaries, §29.2). Refused documents stay unserved — the CLI
+(`status`, `inspect`) still sees them, which is how you tell "refused" from
+"absent". Rebuilt documents carry a deterministic `_rev` of the form
+`overlay.rehydrated.<intent-checksum-prefix>`; the original transaction `_rev`
+lived only in `.runtime/`.
 
 ### Proxy write guard 403 — working as designed
 

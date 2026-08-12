@@ -29,9 +29,12 @@
  */
 import {checksum} from '../checksum'
 import {encodeOverlayPath} from '../encoding'
+import {applyOperations} from '../mutations/operations'
+import {deepClone} from '../mutations/paths'
 import {OVERLAY_FORMAT_VERSION, isKeySegment} from '../types/index'
 import type {
   BaseDocumentVersion,
+  LocalDocumentVersion,
   OverlayConflict,
   OverlayConflictSeverity,
   OverlayConflictType,
@@ -317,4 +320,166 @@ function baseRevision(
   lastObserved: string | undefined,
 ): string | undefined {
   return version?.revision ?? lastObserved
+}
+
+/* ------------------------------------------------------------------ *
+ * Record reconstruction — the inverse projection (PRD §14.4 step 6, §29.7)
+ * ------------------------------------------------------------------ */
+
+export interface RecordFromIntentOptions {
+  overlayId: string
+  /** The committed `snapshots/<sha>.json` the intent's `base.snapshotRef` names, or `null`. */
+  baseSnapshot: OverlayBaseSnapshot | null
+  runtimeRevision: string
+  createdAt: string
+  updatedAt: string
+}
+
+/**
+ * Rebuild an {@link OverlayDocumentRecord} from the COMMITTED surface — the
+ * review-facing intent plus its content-addressed base snapshot.
+ *
+ * WHY. `.runtime/` is gitignored, so a fresh clone of a repository with a
+ * committed `.sanity-overlay/` has intents and snapshots but no records — and
+ * until this function existed the overlay API hydrated nothing, an empty
+ * Studio over a fully-populated branch (found live 2026-08-11 against the
+ * kitchen-sink overlay: manifest revision 22, eight heads, zero documents
+ * served, while the CLI saw all eight). §14.4 step 6 requires the resolver to
+ * materialize from a directly-edited intent, and a fresh clone is exactly
+ * "every intent was just directly edited"; §29.7 step 4 requires the same for
+ * preview import.
+ *
+ * FIDELITY, DECLARED RATHER THAN PRETENDED:
+ *
+ *   - `mode: 'replace'` layers round-trip EXACTLY — the replacement embeds the
+ *     whole materialized document, system fields included.
+ *   - `mode: 'patch'` layers are rebuilt by replaying the intent's preserved
+ *     operations (keyed array inserts, then override sets, then unsets — the
+ *     order compaction resolved them into) against the snapshot's ancestor
+ *     document, through the SAME `applyOperations` engine every live commit
+ *     uses. Content fields round-trip exactly; `_rev`/`_updatedAt` are
+ *     transaction metadata that lived only in `.runtime/`, so the rebuild
+ *     mints a deterministic rehydration `_rev` from the intent checksum
+ *     (§34.17 — same input, same output) and stamps `updatedAt` from the
+ *     manifest head.
+ *   - per-layer `touchedPaths` cannot be split (the intent stores one combined
+ *     list), so each rebuilt layer carries the combined superset — biasing
+ *     later conflict detection CONSERVATIVE, never permissive.
+ *   - a patch layer with no usable ancestor, an unparseable shape, or a record
+ *     carrying UNRESOLVED conflicts returns `null`: the §14.3 rule — refuse
+ *     and report, never serve a guess. (Conflict payloads carry ancestor/base/
+ *     local values the intent's summaries deliberately exclude (§29.2), so an
+ *     unresolved conflict cannot be reconstructed honestly.)
+ */
+export function recordFromIntent(
+  intent: CheckpointDocumentIntent,
+  options: RecordFromIntentOptions,
+): OverlayDocumentRecord | null {
+  if (intent.conflicts.some((conflict) => !conflict.resolved)) return null
+
+  const base: OverlayRecordBaseBlock | null =
+    options.baseSnapshot === null
+      ? null
+      : (({formatVersion: _stamp, ...block}) => block)(options.baseSnapshot)
+
+  const rebuildLayer = (perspective: 'draft' | 'published'): LocalDocumentVersion | null | 'refuse' => {
+    const layer = intent[perspective]
+    if (layer === undefined) return null
+
+    let materialized: SanityDocument
+    let operations: OverlayOperation[]
+    let ancestorKind: LocalDocumentVersion['ancestorKind']
+    let ancestorRevision: string | undefined
+
+    if (layer.mode === 'replace') {
+      if (layer.replacement === undefined) return 'refuse'
+      materialized = deepClone(layer.replacement)
+      operations = [{type: 'replaceDocument', document: materialized}]
+      ancestorKind = base === null ? 'branch-created' : perspectiveAncestorKind(perspective, base)
+      ancestorRevision = base === null ? undefined : perspectiveAncestorRevision(perspective, base)
+    } else if (layer.mode === 'patch') {
+      const ancestor =
+        perspective === 'draft'
+          ? (base?.draft ?? base?.published ?? null)
+          : (base?.published ?? base?.draft ?? null)
+      if (ancestor === null) return 'refuse'
+
+      operations = [
+        ...(layer.arrayOperations ?? []),
+        ...(layer.overrides ?? []).map(
+          (override): OverlayOperation => ({type: 'set', path: override.path, value: override.value}),
+        ),
+        ...(layer.unsets ?? []).map((path): OverlayOperation => ({type: 'unset', path})),
+      ]
+      try {
+        materialized = applyOperations(deepClone(ancestor.snapshot), operations).document
+      } catch {
+        /* An operation the snapshot cannot satisfy (a moved anchor, a missing
+         * parent) means the committed surface disagrees with itself — refused,
+         * per §14.3, rather than served partially applied. */
+        return 'refuse'
+      }
+      materialized._id = perspective === 'draft' ? `drafts.${intent.logicalId}` : intent.logicalId
+      materialized._type = intent.type
+      /* Deterministic rehydration revision — the original lived in .runtime/. */
+      materialized._rev = `overlay.rehydrated.${intent.checksum.slice(0, 12)}`
+      materialized._updatedAt = options.updatedAt
+      ancestorKind = perspectiveAncestorKind(perspective, base!)
+      ancestorRevision = perspectiveAncestorRevision(perspective, base!)
+    } else {
+      return 'refuse'
+    }
+
+    return {
+      materialized,
+      touchedPaths: deepClone([...intent.touchedPaths]),
+      operations,
+      ancestorKind,
+      ...(ancestorRevision === undefined ? {} : {ancestorRevision}),
+      overlayRevision: options.runtimeRevision,
+      createdAt: options.createdAt,
+      updatedAt: options.updatedAt,
+    }
+  }
+
+  const draft = intent.tombstones.draft ? null : rebuildLayer('draft')
+  const published = intent.tombstones.published ? null : rebuildLayer('published')
+  if (draft === 'refuse' || published === 'refuse') return null
+
+  return {
+    formatVersion: OVERLAY_FORMAT_VERSION,
+    overlayId: options.overlayId,
+    logicalId: intent.logicalId,
+    schemaType: intent.type,
+    origin: base === null ? 'branch' : 'base',
+    base,
+    local: {
+      draft,
+      published,
+      draftTombstone: intent.tombstones.draft,
+      publishedTombstone: intent.tombstones.published,
+    },
+    /* Resolved-only summaries carry no payload to reconstruct, and unresolved
+     * ones refused above; an empty list is the only honest rebuild. */
+    conflicts: [],
+    runtimeRevision: options.runtimeRevision,
+    createdAt: options.createdAt,
+    updatedAt: options.updatedAt,
+  }
+}
+
+function perspectiveAncestorKind(
+  perspective: 'draft' | 'published',
+  base: OverlayRecordBaseBlock,
+): LocalDocumentVersion['ancestorKind'] {
+  if (perspective === 'draft') return base.draft !== null ? 'base-draft' : 'base-published'
+  return 'base-published'
+}
+
+function perspectiveAncestorRevision(
+  perspective: 'draft' | 'published',
+  base: OverlayRecordBaseBlock,
+): string | undefined {
+  if (perspective === 'draft') return (base.draft ?? base.published)?.revision
+  return (base.published ?? base.draft)?.revision
 }

@@ -43,6 +43,8 @@ import {
   overlayConflictSummary,
   overlayDocumentIds,
   publish,
+  recordFromIntent,
+  resolveRecordConflict,
   resolveDocumentBatch,
   resolveVersionBatch,
   restore,
@@ -299,7 +301,31 @@ async function hydrateState(
   const heads = await store.listChangedDocuments(manifest.overlayId, {includeUnchanged: true})
   for (const head of heads) {
     const read = await store.readDocumentByLogicalId(manifest.overlayId, head.logicalId)
-    if (read?.record) documents[read.record.logicalId] = read.record
+    if (read?.record) {
+      documents[read.record.logicalId] = read.record
+      continue
+    }
+    /*
+     * THE FRESH-CLONE PATH. `.runtime/` is gitignored, so a clone of a repo
+     * with a committed overlay has no records — only the committed surface,
+     * which §14.4 step 6 and §29.7 step 4 require to be materializable. Before
+     * this branch existed the server hydrated NOTHING from a committed overlay
+     * (found live 2026-08-11: kitchen-sink at revision 22, eight heads, zero
+     * documents served, while the CLI saw all eight). `recordFromIntent`
+     * refuses (`null`) anything it cannot rebuild honestly — a patch layer
+     * with no snapshot, an unresolved conflict — and those documents stay
+     * unserved and reported via `/events`, exactly as before.
+     */
+    if (read?.intent) {
+      const rebuilt = recordFromIntent(read.intent, {
+        overlayId: manifest.overlayId,
+        baseSnapshot: read.baseSnapshot,
+        runtimeRevision: read.head.runtimeRevision,
+        createdAt: read.head.updatedAt,
+        updatedAt: read.head.updatedAt,
+      })
+      if (rebuilt !== null) documents[rebuilt.logicalId] = rebuilt
+    }
   }
   return createOverlayState({
     overlayId: manifest.overlayId,
@@ -661,6 +687,93 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
         unrelatedDocumentIds: outside,
       },
     )
+  }
+
+  /**
+   * §28.1 / §28.3 — one conflict resolution, as its own overlay transaction.
+   *
+   * This branch is what makes the Studio's ALREADY-BUILT resolution UI work:
+   * `documentActions.ts` assembles a `ConflictResolutionCommand` and POSTs it
+   * here as `kind: 'conflictResolution'` — and until 2026-08-11 this
+   * dispatcher had no such branch, so the entire panel ended in a 400. The
+   * semantics live in core's `resolveRecordConflict`; this function owns only
+   * the §34.6 replay check and the store round trip, mirroring `commitRebase`
+   * (`mutations: []` — the post-state record IS the payload).
+   */
+  async function commitConflictResolution(body: Rec): Promise<Rec> {
+    const idempotencyKey = body.idempotencyKey as string
+    const payload = isRec(body.payload) ? body.payload : {}
+    const rawDocumentId = typeof payload.documentId === 'string' ? payload.documentId : ''
+    const conflictId = typeof payload.conflictId === 'string' ? payload.conflictId : ''
+    const action = typeof payload.action === 'string' ? payload.action : ''
+    if (rawDocumentId === '' || conflictId === '' || action === '') {
+      throw new OverlayApiError(
+        400,
+        'INVALID_REQUEST',
+        'conflictResolution requires `payload.documentId`, `payload.conflictId` and `payload.action` (PRD §28.3)',
+      )
+    }
+    const logicalId = toPublishedId(rawDocumentId)
+
+    const replayed = await store.getTransaction(overlayId, {idempotencyKey})
+    if (replayed !== null) {
+      assertReplayIsForTheseDocuments(idempotencyKey, replayed, [logicalId])
+      return replayEnvelope(replayed.transactionId, [])
+    }
+
+    const record = getRecord(state, logicalId)
+    if (record === null || record === undefined) {
+      throw new OverlayApiError(
+        404,
+        'OVERLAY_DOCUMENT_NOT_FOUND',
+        `the overlay holds no branch record for ${JSON.stringify(logicalId)}`,
+      )
+    }
+
+    const actor = normalizeActor(body.actor) ?? defaultActor
+    const base = createBaseSource(usableBaseDocuments(body.baseDocuments))
+    const currentBase =
+      base.getPublished(logicalId)?.document ?? base.getDraft(logicalId)?.document ?? null
+
+    const resolved = resolveRecordConflict({
+      record,
+      conflictId,
+      action: action as never,
+      now: now(),
+      transactionId: nextTransactionId(),
+      actor,
+      currentBase,
+      ...(payload.value === undefined ? {} : {value: payload.value}),
+      ...(typeof payload.newId === 'string' ? {newId: payload.newId} : {}),
+    })
+
+    const stored = await store.commitTransaction(overlayId, {
+      idempotencyKey,
+      actor,
+      /* Empty on purpose, like rebase: no mutation spells "a decision was
+       * recorded"; the post-state record is the whole payload. */
+      mutations: [],
+      records: [resolved.record],
+      expectedOverlayRevision: state.revision,
+    })
+
+    state = createOverlayState({
+      overlayId,
+      revision: stored.manifest.revision,
+      documents: {...state.documents, [resolved.record.logicalId]: resolved.record},
+    })
+
+    return {
+      ok: true,
+      committed: true,
+      replayed: stored.replayed,
+      overlayId,
+      revision: stored.manifest.revision,
+      transactionId: stored.transaction.transactionId,
+      affectedDocumentIds: [resolved.record.logicalId],
+      unsupported: [],
+      documents: hydrationDocuments(state),
+    }
   }
 
   async function commitMutations(body: Rec, kind: 'actions' | 'mutations'): Promise<Rec> {
@@ -1253,10 +1366,12 @@ export async function createOverlayApi(options: OverlayApiOptions): Promise<Over
     if (kind === 'actions' || kind === 'mutations') return commitMutations(body, kind)
     if (kind === 'checkpoint') return commitCheckpoint(body)
     if (kind === 'rebase') return commitRebase(body)
+    if (kind === 'conflictResolution') return commitConflictResolution(body)
     throw new OverlayApiError(
       400,
       'INVALID_REQUEST',
-      'commit requires kind "actions", "mutations", "documentActions", "checkpoint" or "rebase"',
+      'commit requires kind "actions", "mutations", "documentActions", "checkpoint", ' +
+        '"rebase" or "conflictResolution"',
     )
   }
 

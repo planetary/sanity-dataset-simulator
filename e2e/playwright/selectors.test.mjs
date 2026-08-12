@@ -95,7 +95,16 @@ const STUDIO_IDS = [
   'global-perspective-menu-button',
   'form-view',
   'string-input',
+  'number-input',
   'pt-editor',
+  'activate-overlay',
+  'pt-input-placeholder',
+  'add-single-object-button',
+  'add-multiple-object-button',
+  'array-item-menu-button',
+  'default-edit-object-dialog',
+  'edit-portal-dialog',
+  'nested-object-dialog',
   'default-preview__heading',
   'new-document-button',
   'action-menu-button',
@@ -127,6 +136,15 @@ describe('§ every Studio test id exists in the pinned dist', () => {
       )
     })
   }
+})
+
+describe('§ the per-field test id is built from the field PATH', () => {
+  it('the template is still `field-${PathUtils.toString(path)}`', () => {
+    assert.ok(
+      SANITY_DIST.includes('`field-${'),
+      'sanity no longer derives the field wrapper test id from the path — fieldTestId() is wrong',
+    )
+  })
 })
 
 describe('§ the document-action test id is built from the LABEL, not the action name', () => {

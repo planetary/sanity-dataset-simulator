@@ -152,8 +152,9 @@ export function checkBaseDeletionRecovery(
 ): InvariantViolation[] {
   const local = request.localMaterialized
   if (local === null || request.localTombstone === true) return []
-  const deleted =
-    request.currentBase === null && (request.baseStatus === 'deleted' || request.ancestor !== null)
+  /* Explicit signal only — mirrors `mergeDocument`. An omitted base is
+   * unobservable, not deleted (§16.1; see merge.ts for the full rationale). */
+  const deleted = request.currentBase === null && request.baseStatus === 'deleted'
   if (!deleted) return []
 
   if (result.document === null) {

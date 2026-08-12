@@ -157,7 +157,7 @@ describe('dispatch', () => {
     expect(undeclared).toEqual([])
   })
 
-  it('declares exactly the five mandated tasks the PRD gives no command name for', () => {
+  it('declares exactly the seven commands the PRD gives no name for, each with its mandate', () => {
     /* "Local runtime history" and "Local cleanup" are Phase 2 Filesystem store
      * tasks. "Build and run client-import codemod" and "Add lint rule for
      * direct client imports and unregistered queries" are Phase 5 Frontend
@@ -166,17 +166,27 @@ describe('dispatch', () => {
      * Phase 6 CI block, which is ten mandated tasks and no verb for any of
      * them. A mandated CI gate needs an invocation, and §14.5 names none.
      *
-     * All five ARE our deviation — a small one, and recorded here rather than
-     * discovered later in a diff. The guard is not the count: it is that each
-     * verb names the §37 task it exists to serve. */
+     * All of these ARE our deviation — a small one, and recorded here rather
+     * than discovered later in a diff. The guard is not the count: it is that
+     * each verb names the mandate it exists to serve. `dev` and `attach`
+     * (2026-08-11) are the OWNER-mandated pair rather than §37-mandated: one
+     * command to run the overlay, and its counterpart for the cold start where
+     * content begins before a Sanity project exists. */
     expect(Object.keys(COMMANDS_BEYOND_PRD).sort()).toEqual([
+      'attach',
       'ci',
       'cleanup',
       'codemod',
+      'dev',
       'history',
       'lint',
     ])
-    for (const rationale of Object.values(COMMANDS_BEYOND_PRD)) {
+    const OWNER_MANDATED = ['dev', 'attach']
+    for (const [command, rationale] of Object.entries(COMMANDS_BEYOND_PRD)) {
+      if (OWNER_MANDATED.includes(command)) {
+        expect(rationale).toMatch(/owner request, 2026-08-11/)
+        continue
+      }
       expect(rationale).toMatch(/§37 Phase \d/)
     }
     /* And the phase each one claims is the phase that actually names it. */
