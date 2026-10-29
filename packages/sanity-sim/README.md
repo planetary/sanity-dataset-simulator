@@ -32,7 +32,7 @@ Studio holds 8+ live connections per open document, which is more than browsers 
 npx sanity-sim trust
 ```
 
-On macOS this asks for your password through the system keychain dialog. The CA is **name-constrained to `localhost` names**, so trusting it cannot vouch for any other site. If you skip this step, open `https://localhost:3939` once and accept the certificate. That works in Chrome; Firefox needs the trust step. The dashboard is also available over plain `http://localhost:3939/` and needs no certificate.
+On macOS this asks for your password through the system keychain dialog. The CA is **name-constrained to `localhost` names**, so trusting it cannot vouch for any other site. If you skip this step, open `https://localhost:3939` once and accept the certificate. That works in Chrome; Firefox needs the trust step, then a full quit and reopen (it reads the system's certificates only at startup, and only while `security.enterprise_roots.enabled` is on, which is the default on macOS). The dashboard is also available over plain `http://localhost:3939/` and needs no certificate.
 
 ## Wiring
 

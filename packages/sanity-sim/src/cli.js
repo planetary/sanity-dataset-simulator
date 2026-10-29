@@ -296,7 +296,8 @@ function runTrust() {
   print(`running: ${command} ${args.join(' ')}`)
   try {
     execFileSync(command, args, {stdio: 'inherit'})
-    print('trusted. Restart your browser if it was open.')
+    print('trusted. Quit and reopen your browser if it was open (Firefox reads the system certificates only at startup).')
+    print('Firefox: if it still refuses, set security.enterprise_roots.enabled to true in about:config and restart it.')
   } catch (error) {
     print(`could not trust the certificate automatically (${error.message.split('\n')[0]}). Trust ${path.join(caDirectory(), 'ca.pem')} by hand, or open the dashboard and accept the certificate.`)
   }
