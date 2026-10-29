@@ -19,14 +19,20 @@ export async function handleAdmin(context, req, res, url) {
   if (area === 'requests' && method === 'GET') return send(res, sim.requests.slice(-Number(url.searchParams.get('limit') ?? 300)))
   if (area === 'events' && method === 'GET') return events(context, req, res)
 
+  if (area === 'links') {
+    if (name === undefined && method === 'GET') return send(res, sim.links())
+    if (name !== undefined && method === 'PUT') return send(res, sim.link(name, (await readBody(req)).target))
+    if (name !== undefined && method === 'DELETE') return send(res, sim.unlink(name))
+  }
+
   if (area === 'datasets') {
     if (name === undefined) {
-      if (method === 'GET') return send(res, sim.datasetNames().map((n) => summary(sim.dataset(n))))
+      if (method === 'GET') return send(res, sim.datasetNames().map((n) => summary(sim.dataset(n), sim)))
       if (method === 'POST') {
         const body = await readBody(req)
         const created = sim.dataset(String(body.name ?? ''))
         if (!created) throw badRequest('dataset names are lowercase letters, digits, "-" and "_" (max 64)')
-        return send(res, summary(created))
+        return send(res, summary(created, sim))
       }
     }
     const dataset = sim.dataset(name, {create: false})
@@ -101,7 +107,7 @@ export async function handleAdmin(context, req, res, url) {
         if (body.all) dataset.reset({keepRemote: false})
         else dataset.discardLocal()
         dataset.flush()
-        return send(res, summary(dataset))
+        return send(res, summary(dataset, sim))
       }
       case 'history':
         return send(res, dataset.transactionsFor(id ? [id] : [], {reverse: true, limit: Number(url.searchParams.get('limit') ?? 100)}).map(txSummary))
@@ -118,7 +124,8 @@ function status(context) {
     projectId: sim.projectId,
     root: sim.root,
     defaultDataset: sim.config.defaultDataset,
-    datasets: sim.datasetNames().map((name) => summary(sim.dataset(name))),
+    datasets: sim.datasetNames().map((name) => summary(sim.dataset(name), sim)),
+    links: sim.links(),
     server: {port: context.port, https: context.tls, publicBase: context.publicBase, httpBase: `http://localhost:${context.port}`},
     certificateTrusted: context.tls ? isCaTrusted() : null,
     listeners: sim.listen.count,
@@ -132,9 +139,10 @@ function status(context) {
   }
 }
 
-function summary(dataset) {
+function summary(dataset, sim) {
   return {
     name: dataset.name,
+    linkedFrom: sim.links().filter((link) => link.target === dataset.name).map((link) => link.name),
     documents: dataset.size,
     local: dataset.local.size,
     deletedLocally: dataset.tombstones.size,
@@ -302,11 +310,14 @@ function events(context, req, res) {
     const dataset = sim.dataset(name)
     const onTx = (tx) => {
       if (res.writableEnded) return
-      res.write(`event: transaction\ndata: ${JSON.stringify({dataset: name, id: tx.transactionId, timestamp: tx.timestamp, author: tx.author, documentIDs: tx.changes.map((change) => change.id)})}\n\n`)
+      res.write(`event: transaction\ndata: ${JSON.stringify({dataset: dataset.name, id: tx.transactionId, timestamp: tx.timestamp, author: tx.author, documentIDs: tx.changes.map((change) => change.id)})}\n\n`)
     }
     dataset.on('transaction', onTx)
     listeners.push(() => dataset.off('transaction', onTx))
   }
+  /* Links changed (from the dashboard or `sanity-sim link`): the dashboard reloads its view and reconnects. */
+  const onLinks = () => !res.writableEnded && res.write(`event: links\ndata: ${JSON.stringify(sim.links())}\n\n`)
+  sim.linkListeners.add(onLinks)
   const onRequest = (entry) => !res.writableEnded && res.write(`event: request\ndata: ${JSON.stringify(entry)}\n\n`)
   sim.requestListeners ??= new Set()
   sim.requestListeners.add(onRequest)
@@ -316,6 +327,7 @@ function events(context, req, res) {
     clearInterval(keepalive)
     for (const off of listeners) off()
     sim.requestListeners.delete(onRequest)
+    sim.linkListeners.delete(onLinks)
   })
 }
 

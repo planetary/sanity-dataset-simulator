@@ -37,7 +37,7 @@ export class ListenHub {
     })
   }
 
-  open({req, res, dataset, query, params, options, lastEventId}) {
+  open({req, res, dataset, via = dataset.name, query, params, options, lastEventId}) {
     const filter = compileFilter(query, params)
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -45,7 +45,7 @@ export class ListenHub {
       ...(req.httpVersionMajor === 1 ? {connection: 'keep-alive'} : {}),
       'x-accel-buffering': 'no',
     })
-    const listener = new Listener({res, dataset: dataset.name, filter, options})
+    const listener = new Listener({res, dataset: dataset.name, via, filter, options})
     this.listeners.add(listener)
     const close = () => {
       this.listeners.delete(listener)
@@ -71,15 +71,29 @@ export class ListenHub {
     return listener
   }
 
+  /**
+   * End every listener opened through `via` (a dataset name or link). Clients
+   * reconnect, get a fresh `welcome`, and refetch from whatever it names now.
+   */
+  disconnect(via) {
+    for (const listener of this.listeners) {
+      if (listener.via !== via) continue
+      this.listeners.delete(listener)
+      listener.close()
+      listener.res.end()
+    }
+  }
+
   get count() {
     return this.listeners.size
   }
 }
 
 class Listener {
-  constructor({res, dataset, filter, options}) {
+  constructor({res, dataset, via, filter, options}) {
     this.res = res
     this.dataset = dataset
+    this.via = via
     this.filter = filter
     this.options = options
     this.name = `sim-${randomUUID().slice(0, 12)}`
@@ -166,13 +180,13 @@ export class LiveHub {
     })
   }
 
-  open({req, res, dataset, includeDrafts}) {
+  open({req, res, dataset, via = dataset.name, includeDrafts}) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
       ...(req.httpVersionMajor === 1 ? {connection: 'keep-alive'} : {}),
     })
-    const client = {res, dataset: dataset.name, includeDrafts}
+    const client = {res, dataset: dataset.name, via, includeDrafts}
     this.clients.add(client)
     write(res, 'welcome', {})
     const keepalive = setInterval(() => !res.writableEnded && res.write(': keepalive\n\n'), 30_000)
@@ -181,6 +195,17 @@ export class LiveHub {
       clearInterval(keepalive)
       this.clients.delete(client)
     })
+  }
+
+  /** Invalidate `tags` for clients connected through `via`, then end their streams so they reconnect. */
+  disconnect(via, tags) {
+    const id = `${Date.now().toString(36)}-${(this.sequence += 1)}`
+    for (const client of this.clients) {
+      if (client.via !== via) continue
+      write(client.res, 'message', {id, tags: [...new Set(tags)]}, id)
+      this.clients.delete(client)
+      client.res.end()
+    }
   }
 
   get count() {

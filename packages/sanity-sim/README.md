@@ -32,7 +32,13 @@ Studio holds 8+ live connections per open document, which is more than browsers 
 npx sanity-sim trust
 ```
 
-On macOS this asks for your password through the system keychain dialog. The CA is **name-constrained to `localhost` names**, so trusting it cannot vouch for any other site. If you skip this step, open `https://localhost:3939` once and accept the certificate. That works in Chrome; Firefox needs the trust step, then a full quit and reopen (it reads the system's certificates only at startup, and only while `security.enterprise_roots.enabled` is on, which is the default on macOS). The dashboard is also available over plain `http://localhost:3939/` and needs no certificate.
+The first `npx sanity-sim` in a terminal starts this step for you. It trusts the CA for your user only (no admin rights), and your OS asks you to confirm: the keychain password dialog on macOS, a security prompt on Windows. Linux adds it to Chrome's NSS store. The CA is **name-constrained to `localhost` names**, so trusting it cannot vouch for any other site. Firefox reads the system's certificates only at startup, so quit and reopen it afterwards (`security.enterprise_roots.enabled` must be on, which is the default on macOS). The dashboard is also available over plain `http://localhost:3939/` and needs no certificate.
+
+**Cancelled, or on a managed machine?** If you cancel, or the OS refuses (some corporate policies block user-level trust), sanity-sim keeps running, prints the alternatives, and stops asking on later runs until you run `npx sanity-sim trust` again. The alternatives:
+
+- Open `https://<projectId>.localhost:3939/` once and accept the warning. This works in Chrome, Edge and Safari, unless a managed browser forbids certificate exceptions.
+- Ask IT to trust `~/.sanity-sim/ca/ca.pem`. Its name constraints limit it to `localhost`, `*.localhost` and loopback IPs, which is usually an easy approval.
+- Use `--http`. No certificate is needed, but browsers allow only 6 HTTP/1.1 connections per host, so Studio stalls once several documents are open.
 
 ## Wiring
 
@@ -58,8 +64,24 @@ Open `http://localhost:3939/`:
 - **Assets.** A gallery with upload and reference counts.
 - **Releases.** Create, publish now, schedule, archive and delete.
 - **Sync.** Pull a real dataset, follow it live, see local changes like a `git status`, and resolve stale documents (keep mine, take synced, or a three-way merge).
-- **Datasets.** Create and switch datasets, import and export, discard local changes, wipe.
+- **Datasets.** Create and switch datasets, link a name to one and hot-swap it, import and export, discard local changes, wipe.
 - **Connections.** Which clients are connected and which API versions they use, any endpoints they called that the simulator doesn't implement, certificate status, and snippets for wiring by hand.
+
+## Linked datasets (hot swap)
+
+Keep several datasets side by side and choose which one your Studio and app see, without touching their config:
+
+```bash
+npx sanity-sim import empty-state.ndjson --dataset test-1
+npx sanity-sim import big-catalog.ndjson --dataset test-2
+npx sanity-sim link production test-1   # Studio and the app now see test-1 as "production"
+npx sanity-sim link production test-2   # swap, while everything runs
+npx sanity-sim unlink production
+```
+
+A **link** is a name, here `production`, that resolves to a stored dataset. Every request through that name reads and writes the target, and Sanity's alias spelling `~production` works too. Re-pointing a link while the simulator runs disconnects the listeners and live connections that came in through that name. Studio and `@sanity/client` reconnect and refetch, so the swap shows up within a few seconds, with no restart or reload. Next.js apps using the Live Content API get a sync-tag invalidation for both datasets. A document open in Studio that doesn't exist in the new dataset shows as deleted.
+
+If the name you link already holds documents, they are kept as a stored dataset named `<name>-original`, so nothing is lost. The same controls are on the dashboard's **Datasets** page, and the dataset picker shows links as `production → test-1`. Links live in `.sanity-sim/config.json`.
 
 ## Syncing a real dataset
 
@@ -101,6 +123,8 @@ Everything is NDJSON in the same shape as `sanity dataset export`, so diffs stay
 | `npx sanity-sim status` | Project, datasets, local changes, certificate |
 | `npx sanity-sim import <file>` | NDJSON or a `sanity dataset export` `.tar.gz` (images and files included) |
 | `npx sanity-sim export <file>` | NDJSON (`.ndjson.gz` to compress) |
+| `npx sanity-sim link <name> <dataset>` | Point a name at a stored dataset; again to hot-swap |
+| `npx sanity-sim unlink <name>` | Remove a link |
 | `npx sanity-sim reset [--all]` | Discard local changes (or wipe everything) |
 | `npx sanity-sim trust` | Trust the local HTTPS certificate |
 | `npx sanity-sim eject` | Remove the wiring edits |

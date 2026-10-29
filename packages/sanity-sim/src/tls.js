@@ -131,20 +131,29 @@ export function isCaTrusted() {
   const caCert = path.join(caDirectory(), 'ca.pem')
   if (!fs.existsSync(caCert)) return false
   try {
-    if (process.platform === 'darwin') {
-      execFileSync('security', ['verify-cert', '-c', caCert, '-p', 'ssl'], {stdio: 'pipe'})
-      return true
-    }
+    if (process.platform === 'darwin') execFileSync('security', ['verify-cert', '-c', caCert, '-p', 'ssl'], {stdio: 'pipe'})
+    else if (process.platform === 'win32') execFileSync('certutil', ['-user', '-verifystore', 'Root', new X509Certificate(fs.readFileSync(caCert)).serialNumber], {stdio: 'pipe'})
+    else execFileSync('certutil', ['-d', `sql:${path.join(os.homedir(), '.pki/nssdb')}`, '-L', '-n', TRUST_NICKNAME], {stdio: 'pipe'})
+    return true
   } catch {
     return false
   }
-  return false
+}
+
+const TRUST_NICKNAME = 'sanity-sim local CA'
+
+/** Set when the user cancelled the OS trust dialog, or the OS refused (managed machines), so first runs stop re-asking. */
+const declinedFile = () => path.join(caDirectory(), 'trust-declined')
+export const trustDeclined = () => fs.existsSync(declinedFile())
+export function setTrustDeclined(declined) {
+  if (declined) fs.writeFileSync(declinedFile(), `${new Date().toISOString()}\n`)
+  else fs.rmSync(declinedFile(), {force: true})
 }
 
 /**
- * The command that trusts the CA for this user. Never run silently: changing
- * trust settings is the user's decision, so the CLI prints it or runs it only
- * from `sanity-sim trust` (which asks for confirmation through the OS).
+ * The command that trusts the CA for this user (no admin rights needed). The
+ * OS asks for confirmation itself: the keychain password dialog on macOS, a
+ * security warning on Windows. Linux trusts it for Chrome's NSS store.
  */
 export function trustCommand() {
   const caCert = path.join(caDirectory(), 'ca.pem')
@@ -152,5 +161,5 @@ export function trustCommand() {
     return ['security', ['add-trusted-cert', '-r', 'trustRoot', '-k', path.join(os.homedir(), 'Library/Keychains/login.keychain-db'), caCert]]
   }
   if (process.platform === 'win32') return ['certutil', ['-user', '-addstore', 'Root', caCert]]
-  return ['certutil', ['-d', `sql:${path.join(os.homedir(), '.pki/nssdb')}`, '-A', '-t', 'C,,', '-n', 'sanity-sim local CA', '-i', caCert]]
+  return ['certutil', ['-d', `sql:${path.join(os.homedir(), '.pki/nssdb')}`, '-A', '-t', 'C,,', '-n', TRUST_NICKNAME, '-i', caCert]]
 }

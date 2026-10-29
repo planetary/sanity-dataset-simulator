@@ -92,7 +92,7 @@ export async function syncDataset(sim, datasetName, {projectId, dataset, token, 
     types: types ?? null,
   }
   const changes = target.replaceRemote(documents, meta)
-  sim.config.sync = {...sim.config.sync, [datasetName]: {projectId, dataset, types: types ?? null}}
+  sim.config.sync = {...sim.config.sync, [target.name]: {projectId, dataset, types: types ?? null}}
   sim.saveConfig()
   return {meta, changed: changes.length, stale: target.staleEntries().length}
 }

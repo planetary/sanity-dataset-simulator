@@ -199,7 +199,7 @@ async function route(context, req, res, url) {
     case 'projects':
       return projects(context, req, res, url, rest, apiVersion)
     case 'datasets':
-      return json(res, 200, context.sim.datasetNames().map((name) => datasetDocument(context.sim, name)))
+      return json(res, 200, context.sim.visibleDatasetNames().map((name) => datasetDocument(context.sim, name)))
     case 'data':
       return data(context, req, res, url, rest, apiVersion)
     case 'assets':
@@ -266,7 +266,7 @@ async function projects(context, req, res, url, rest, apiVersion) {
         /* `?datasetProfile=comments&addonFor=<ds>` asks for add-on datasets; there are none. */
         const profile = url.searchParams.get('datasetProfile')
         if ((profile && profile !== 'content') || url.searchParams.get('addonFor')) return json(res, 200, [])
-        return json(res, 200, sim.datasetNames().map((name) => datasetDocument(sim, name)))
+        return json(res, 200, sim.visibleDatasetNames().map((name) => datasetDocument(sim, name)))
       }
       if (leaf === 'acl') return json(res, 200, DOCUMENT_GRANTS)
       if (leaf === 'live' && more[0] === 'events') return liveEvents(context, req, res, url, datasetName)
@@ -316,7 +316,7 @@ async function data(context, req, res, url, rest, apiVersion) {
     case 'actions':
       return actions(req, res, dataset)
     case 'listen':
-      return listen(context, req, res, url, dataset)
+      return listen(context, req, res, url, dataset, datasetName)
     case 'history':
       return history(res, url, dataset, tail)
     case 'export':
@@ -422,7 +422,7 @@ async function actions(req, res, dataset) {
   return json(res, 200, {transactionId: result.transactionId})
 }
 
-function listen(context, req, res, url, dataset) {
+function listen(context, req, res, url, dataset, requested) {
   const options = url.searchParams
   const text = options.get('query')
   if (!text) throw badRequest('a listener needs a `query`')
@@ -431,6 +431,7 @@ function listen(context, req, res, url, dataset) {
     req,
     res,
     dataset,
+    via: viaName(requested),
     query: text,
     params: paramsFromSearch(options),
     lastEventId: req.headers['last-event-id'] ?? options.get('lastEventId') ?? undefined,
@@ -450,8 +451,11 @@ function liveEvents(context, req, res, url, datasetName) {
   const dataset = context.sim.dataset(datasetName)
   if (!dataset) throw notFound(`Dataset "${datasetName}" not found`)
   const includeDrafts = url.searchParams.get('includeDrafts') === 'true' || url.searchParams.get('includeAllDocuments') === 'true'
-  context.sim.live.open({req, res, dataset, includeDrafts})
+  context.sim.live.open({req, res, dataset, via: viaName(datasetName), includeDrafts})
 }
+
+/** The name a client connected through (a link or a dataset), for hot swaps. */
+const viaName = (requested) => String(requested).replace(/^~/, '')
 
 function history(res, url, dataset, tail) {
   const [kind, ...rest] = tail
@@ -550,7 +554,7 @@ async function serveAsset(context, req, res, url) {
   let file = context.sim.assets.locate(sha1, extension)
   if (!file) {
     /* A synced dataset's asset: fetch it from Sanity's public CDN once, then serve from cache. */
-    const remote = context.sim.config.sync?.[datasetName]
+    const remote = context.sim.config.sync?.[context.sim.resolveName(datasetName)]
     if (remote?.projectId) {
       const name = url.pathname.split('/')[4]
       const cdnUrl = `https://cdn.sanity.io/${kind}/${remote.projectId}/${remote.dataset ?? datasetName}/${name}`

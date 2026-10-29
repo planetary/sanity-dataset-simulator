@@ -96,11 +96,17 @@ function go(page, params = {}) {
 
 async function refreshStatus() {
   state.status = await admin('/status')
-  if (!state.dataset || !state.status.datasets.some((d) => d.name === state.dataset)) {
+  if (!state.dataset || !knownName(state.dataset)) {
     const remembered = safeStorage('get', 'sanity-sim.dataset')
-    state.dataset = state.status.datasets.some((d) => d.name === remembered) ? remembered : state.status.defaultDataset
+    state.dataset = knownName(remembered) ? remembered : state.status.defaultDataset
   }
 }
+
+/* A name in the picker: a stored dataset, or a link to one. */
+const knownName = (name) => state.status.datasets.some((d) => d.name === name) || state.status.links.some((link) => link.name === name)
+const linkOf = (name) => state.status.links.find((link) => link.name === name)
+/* The stored dataset a name shows. */
+const resolved = (name) => linkOf(name)?.target ?? name
 
 function safeStorage(op, key, value) {
   try {
@@ -113,7 +119,7 @@ function safeStorage(op, key, value) {
 async function render() {
   const app = document.getElementById('app')
   const {page} = route()
-  const current = state.status?.datasets.find((d) => d.name === state.dataset)
+  const current = state.status?.datasets.find((d) => d.name === resolved(state.dataset))
   const datasetSelect = h(
     'select',
     {
@@ -124,7 +130,10 @@ async function render() {
         render()
       },
     },
-    state.status.datasets.map((d) => h('option', {value: d.name, selected: d.name === state.dataset}, d.name)),
+    state.status.links.length > 0
+      ? h('optgroup', {label: 'Links'}, state.status.links.map((link) => h('option', {value: link.name, selected: link.name === state.dataset}, `${link.name} → ${link.target}`)))
+      : null,
+    h('optgroup', {label: 'Datasets'}, state.status.datasets.map((d) => h('option', {value: d.name, selected: d.name === state.dataset}, d.name))),
   )
   const top = h(
     'header',
@@ -683,7 +692,83 @@ function staleCard(entry, resolve) {
 /* ------------------------------------------------------------------ Datasets */
 
 async function renderDatasets(main) {
-  const list = await admin('/datasets')
+  const [list, links] = await Promise.all([admin('/datasets'), admin('/links')])
+  const stored = list.map((d) => d.name)
+  const relink = async (name, target) => {
+    try {
+      const result = await admin(`/links/${encodeURIComponent(name)}`, {method: 'PUT', body: {target}})
+      toast(`${name} → ${target}${result.preserved ? `. Its previous documents are kept as “${result.preserved}”.` : '. Connected Studios and apps are reloading.'}`)
+      await refreshStatus()
+      render()
+    } catch (error) {
+      toast(error.message, true)
+    }
+  }
+  const linkName = h('input', {type: 'text', placeholder: state.status.defaultDataset, 'aria-label': 'Name to link', list: 'link-names'})
+  const linkTarget = h('select', {'aria-label': 'Dataset to link to'}, stored.map((n) => h('option', {value: n}, n)))
+  const linksCard = h(
+    'div',
+    {class: 'card'},
+    links.length === 0
+      ? h('p', {class: 'muted', style: 'margin:0 0 10px'}, 'No links yet.')
+      : h(
+          'table',
+          {},
+          h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Shows'), h('th', {}, ''))),
+          h(
+            'tbody',
+            {},
+            links.map((link) =>
+              h(
+                'tr',
+                {},
+                h('td', {}, h('strong', {}, link.name)),
+                h(
+                  'td',
+                  {},
+                  h(
+                    'select',
+                    {'aria-label': `Dataset ${link.name} shows`, onchange: (event) => relink(link.name, event.target.value)},
+                    stored.map((n) => h('option', {value: n, selected: n === link.target}, n)),
+                  ),
+                ),
+                h(
+                  'td',
+                  {},
+                  h(
+                    'button',
+                    {
+                      class: 'btn small',
+                      title: `Stop linking; "${link.name}" becomes an ordinary, empty dataset`,
+                      onclick: async () => {
+                        if (!confirm(`Unlink ${link.name}? It becomes an ordinary, empty dataset; ${link.target} is untouched.`)) return
+                        try {
+                          await admin(`/links/${encodeURIComponent(link.name)}`, {method: 'DELETE'})
+                          toast(`Unlinked ${link.name}`)
+                          await refreshStatus()
+                          render()
+                        } catch (error) {
+                          toast(error.message, true)
+                        }
+                      },
+                    },
+                    'Unlink',
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+    h(
+      'div',
+      {class: 'row', style: 'margin-top:10px'},
+      linkName,
+      h('span', {class: 'muted'}, '→'),
+      linkTarget,
+      h('button', {class: 'btn', onclick: () => relink(linkName.value.trim() || state.status.defaultDataset, linkTarget.value)}, 'Link'),
+    ),
+    h('datalist', {id: 'link-names'}, h('option', {value: state.status.defaultDataset})),
+  )
   const name = h('input', {type: 'text', placeholder: 'new-dataset', 'aria-label': 'New dataset name'})
   const fileInput = h('input', {type: 'file', accept: '.ndjson,.gz,.tar.gz,.json', style: 'display:none'})
   fileInput.addEventListener('change', async () => {
@@ -705,6 +790,14 @@ async function renderDatasets(main) {
       {class: 'page'},
       h('h1', {}, 'Datasets'),
       h('p', {class: 'sub'}, `Stored in ${state.status.root}/.sanity-sim/. Studio’s dataset switcher and your app can use any of these by name.`),
+      h('h2', {}, 'Links'),
+      h(
+        'p',
+        {class: 'sub'},
+        `A link makes a name your Studio and app already use (like “${state.status.defaultDataset}”) show another dataset. Switch what it shows at any time: connected Studios and apps reconnect and reload, with no restart. Linking a name that already holds documents keeps them as “<name>-original”.`,
+      ),
+      linksCard,
+      h('h2', {}, 'Stored datasets'),
       h(
         'div',
         {class: 'card'},
@@ -719,19 +812,25 @@ async function renderDatasets(main) {
               h(
                 'tr',
                 {},
-                h('td', {}, h('strong', {}, d.name), d.name === state.dataset ? h('span', {class: 'badge local', style: 'margin-left:6px'}, 'current') : null),
+                h(
+                  'td',
+                  {},
+                  h('strong', {}, d.name),
+                  d.name === resolved(state.dataset) ? h('span', {class: 'badge local', style: 'margin-left:6px'}, 'current') : null,
+                  ...d.linkedFrom.map((from) => h('span', {class: 'badge', style: 'margin-left:6px', title: `“${from}” shows this dataset`}, `← ${from}`)),
+                ),
                 h('td', {class: 'num'}, d.documents),
                 h('td', {class: 'num'}, d.local + d.deletedLocally),
                 h('td', {class: 'num'}, d.remote),
                 h('td', {class: 'num'}, d.transactions),
-                h('td', {}, d.name !== state.dataset ? h('button', {class: 'btn small', onclick: () => { state.dataset = d.name; safeStorage('set', 'sanity-sim.dataset', d.name); render() }}, 'Use') : null),
+                h('td', {}, d.name !== resolved(state.dataset) ? h('button', {class: 'btn small', onclick: () => { state.dataset = d.name; safeStorage('set', 'sanity-sim.dataset', d.name); render() }}, 'Use') : null),
               ),
             ),
           ),
         ),
       ),
       h('div', {class: 'row', style: 'margin-top:12px'}, name, h('button', {class: 'btn', onclick: async () => { try { await admin('/datasets', {method: 'POST', body: {name: name.value.trim()}}); await refreshStatus(); render() } catch (error) { toast(error.message, true) } }}, 'Create dataset')),
-      h('h2', {}, `This dataset: ${state.dataset}`),
+      h('h2', {}, `This dataset: ${linkOf(state.dataset) ? `${state.dataset} → ${resolved(state.dataset)}` : state.dataset}`),
       h(
         'div',
         {class: 'row'},
@@ -739,7 +838,7 @@ async function renderDatasets(main) {
         h('a', {class: 'btn', href: `/_sim/datasets/${ds()}/export`, download: `${state.dataset}.ndjson`}, 'Export NDJSON'),
         dangerous('Discard local changes', `Discard every local change in ${state.dataset}? Synced documents stay.`, () => admin(`/datasets/${ds()}/reset`, {method: 'POST', body: {}})),
         dangerous('Wipe dataset', `Wipe ${state.dataset} completely (local changes, history and synced snapshot)?`, () => admin(`/datasets/${ds()}/reset`, {method: 'POST', body: {all: true}})),
-        list.length > 1 ? dangerous('Delete dataset', `Delete dataset ${state.dataset} and its files?`, () => admin(`/datasets/${ds()}`, {method: 'DELETE'}).then(() => (state.dataset = null))) : null,
+        list.length > 1 && !linkOf(state.dataset) && list.find((d) => d.name === state.dataset)?.linkedFrom.length === 0 ? dangerous('Delete dataset', `Delete dataset ${state.dataset} and its files?`, () => admin(`/datasets/${ds()}`, {method: 'DELETE'}).then(() => (state.dataset = null))) : null,
       ),
     ),
   )
@@ -825,7 +924,14 @@ function connectEvents() {
   source.addEventListener('error', () => setLive(false))
   source.addEventListener('transaction', (event) => {
     const tx = JSON.parse(event.data)
-    if (tx.dataset === state.dataset && !tx.author.startsWith('dashboard')) refresh()
+    if (tx.dataset === resolved(state.dataset) && !tx.author.startsWith('dashboard')) refresh()
+  })
+  source.addEventListener('links', async () => {
+    /* A swap may have created a dataset this stream is not watching yet. */
+    source.close()
+    await refreshStatus()
+    render()
+    connectEvents()
   })
   source.addEventListener('request', () => {
     if (route().page === 'activity' || route().page === 'connections') refresh()

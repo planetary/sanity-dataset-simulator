@@ -9,7 +9,7 @@ import {runDevTargets} from './run.js'
 import {startServer} from './server.js'
 import {Simulator} from './simulator.js'
 import {findToken, followDataset, syncDataset} from './sync.js'
-import {caDirectory, ensureTls, isCaTrusted, trustCommand} from './tls.js'
+import {caDirectory, ensureTls, isCaTrusted, setTrustDeclined, trustCommand, trustDeclined} from './tls.js'
 import {exportFile, importFile} from './transfer.js'
 import {NEXT_ENV, STUDIO_ENV, VITE_ENVS, isStudioWired, unwireClients, unwireStudio, wireClients, wireStudio} from './wire.js'
 
@@ -25,7 +25,11 @@ Commands
   (none), dev     Start the simulator, wire this folder's Studio/app to it, and run your dev script
   serve           Start only the simulator (no dev scripts)
   sync            Pull the real dataset into the local snapshot (read-only), then exit
-  status          Show what is here: project, datasets, local changes
+  status          Show what is here: project, datasets, links, local changes
+  link <name> <dataset>
+                  Point a dataset name (e.g. production) at another stored dataset;
+                  re-run with a different dataset to hot-swap while Studio runs
+  unlink <name>   Remove a link
   import <file>   Import an NDJSON or \`sanity dataset export\` .tar.gz
   export <file>   Export the current dataset as NDJSON (.ndjson or .ndjson.gz)
   reset           Discard local changes (keeps the synced snapshot); --all wipes everything
@@ -48,6 +52,8 @@ Options
   --yes               Accept defaults without prompting
 `
 
+const DEFAULT_PORT = 3939
+
 export async function run(argv) {
   const {command, positional, flags} = parseArgs(argv)
   if (flags.help || command === 'help') return print(HELP)
@@ -68,6 +74,10 @@ export async function run(argv) {
       return importCommand(root, project, flags, positional[0])
     case 'export':
       return exportCommand(root, project, flags, positional[0])
+    case 'link':
+      return linkCommand(root, project, flags, positional)
+    case 'unlink':
+      return linkCommand(root, project, flags, [positional[0]], {unlink: true})
     case 'reset':
       return reset(root, project, flags)
     case 'trust':
@@ -107,7 +117,7 @@ async function dev(root, project, flags, {runDev}) {
   if (flags.follow && source) stops.push(followDataset(sim, datasetName, {...source, log}))
 
   /* TLS + server. */
-  const port = await freePort(Number(flags.port ?? 3939))
+  const port = await freePort(Number(flags.port ?? DEFAULT_PORT))
   let tls = null
   if (!flags.http) {
     try {
@@ -118,6 +128,12 @@ async function dev(root, project, flags, {runDev}) {
   }
   const server = await startServer(sim, {port, tls, extraOrigins: [].concat(flags.origin ?? []), project})
   sim.startScheduler()
+  /* Lets `sanity-sim link` (and other tools) find this server whatever port it landed on. */
+  const serverFile = path.join(sim.dir, 'server.json')
+  fs.writeFileSync(serverFile, JSON.stringify({pid: process.pid, port: server.port, startedAt: new Date().toISOString()}) + '\n')
+  stops.push(() => {
+    if (readJsonFile(serverFile)?.pid === process.pid) fs.rmSync(serverFile, {force: true})
+  })
 
   /* Wire the Studio and app clients (marked, reversible, inert without our env). */
   const wired = []
@@ -144,8 +160,14 @@ async function dev(root, project, flags, {runDev}) {
 
   banner({sim, project, root, server, tls, datasetName, wired, runDev})
 
-  if (tls && !isCaTrusted() && process.platform === 'darwin' && process.stdin.isTTY && !flags.yes) {
-    if (await confirm(flags, 'Trust sanity-sim\'s local HTTPS certificate now? (macOS will ask for your password)', true)) runTrust()
+  /*
+   * First run in a terminal: start the trust step right away. The OS asks for
+   * confirmation itself; a cancel or a refusal (managed machines) is
+   * remembered so later runs only print the reminder.
+   */
+  if (tls && !isCaTrusted() && !trustDeclined() && process.stdin.isTTY && !flags.yes) {
+    log('info', 'trusting the local HTTPS certificate for this user (one time; your OS will ask to confirm)…')
+    runTrust({server, projectId: sim.projectId})
   }
 
   if (runDev) {
@@ -179,7 +201,7 @@ function banner({sim, project, root, server, tls, datasetName, wired, runDev}) {
   const remote = dataset.remoteMeta ? `${dataset.remote.size} synced from ${dataset.remoteMeta.projectId}/${dataset.remoteMeta.dataset}, ` : ''
   const lines = [
     '',
-    `${bold('sanity-sim')} ${VERSION} ${dim(`· project ${sim.projectId} · dataset ${datasetName}`)}`,
+    `${bold('sanity-sim')} ${VERSION} ${dim(`· project ${sim.projectId} · dataset ${datasetName}${dataset.name !== datasetName ? ` → ${dataset.name}` : ''}`)}`,
     '',
     `  Dashboard  ${bold(server.httpOrigin + '/')}`,
     `  API        ${server.origin}${tls ? dim(`  (Node/curl: ${server.httpOrigin})`) : ''}`,
@@ -189,7 +211,7 @@ function banner({sim, project, root, server, tls, datasetName, wired, runDev}) {
   if (wired.length > 0) lines.push(`  Wired now  ${wired.join(', ')} ${dim('(undo: npx sanity-sim eject)')}`)
   if (tls && !isCaTrusted()) {
     lines.push('', `  ${bold('!')} The HTTPS certificate is not trusted by this machine yet. Browsers will refuse the API until it is.`)
-    lines.push(`    Run once: ${bold('npx sanity-sim trust')}   ${dim(`(or open ${server.origin}/ and accept it)`)}`)
+    lines.push(`    Run once: ${bold('npx sanity-sim trust')}   ${dim(`(or open ${server.origin.replace('://localhost', `://${sim.projectId}.localhost`)}/ and accept it)`)}`)
   }
   if (!runDev) lines.push('', dim(`  Point other tools at it: SANITY_SIM_URL=${server.httpOrigin} node --import sanity-sim/register …`))
   lines.push('')
@@ -214,7 +236,7 @@ async function pull(sim, datasetName, source, log) {
 }
 
 function syncSource(sim, project, datasetName) {
-  const configured = sim.config.sync?.[datasetName]
+  const configured = sim.config.sync?.[sim.resolveName(datasetName)]
   const projectId = configured?.projectId ?? project.projectId ?? sim.projectId
   if (!projectId || projectId === 'simlocal') return null
   return {projectId, dataset: configured?.dataset ?? project.dataset ?? datasetName, token: findToken(project), types: configured?.types ?? undefined}
@@ -235,6 +257,7 @@ function status(root, project, flags) {
     root,
     projectId: sim.projectId,
     detected: {studioConfig: project.studioConfig && rel(root, project.studioConfig), frameworks: project.frameworks, devTargets: project.devTargets.map((t) => `${rel(root, t.dir) || '.'}: ${t.command}`), token: project.token?.key ?? null},
+    links: sim.links(),
     datasets: sim.datasetNames().map((name) => {
       const ds = sim.dataset(name)
       return {name, documents: ds.size, local: ds.local.size, deletedLocally: ds.tombstones.size, synced: ds.remoteMeta, stale: ds.staleEntries().length, transactions: ds.transactions.length}
@@ -251,8 +274,57 @@ function formatStatus(out) {
   for (const ds of out.datasets) {
     lines.push(`dataset ${ds.name}: ${ds.documents} documents (${ds.local} local, ${ds.deletedLocally} deleted locally, ${ds.stale} stale)${ds.synced ? `, synced ${ds.synced.syncedAt} from ${ds.synced.projectId}/${ds.synced.dataset}` : ''}`)
   }
+  for (const link of out.links) lines.push(`link ${link.name} → ${link.target}`)
   lines.push(`certificate: ${out.certificate.trusted ? 'trusted' : 'not trusted (npx sanity-sim trust)'}`)
   return lines.join('\n')
+}
+
+/**
+ * Link or unlink. A simulator already running for this folder applies it live
+ * (connected clients reconnect and refetch); otherwise the config is edited.
+ */
+async function linkCommand(root, project, flags, [name, target], {unlink = false} = {}) {
+  if (!name || (!unlink && !target)) throw new UsageError(unlink ? 'usage: sanity-sim unlink <name>' : 'usage: sanity-sim link <name> <dataset>')
+  const running = await runningSimFor(root, flags)
+  let result
+  if (running) {
+    const response = await fetch(`${running}/_sim/links/${encodeURIComponent(name)}`, {
+      method: unlink ? 'DELETE' : 'PUT',
+      headers: {'content-type': 'application/json'},
+      body: unlink ? undefined : JSON.stringify({target}),
+    })
+    result = await response.json()
+    if (!response.ok) throw new UsageError(result.error?.description ?? `request failed (${response.status})`)
+  } else {
+    const sim = openSim(root, project, flags)
+    result = unlink ? sim.unlink(name) : sim.link(name, target)
+    sim.close()
+  }
+  if (unlink) return print(`unlinked ${name} (was → ${result.unlinked})`)
+  print(`${name} → ${result.target}${result.preserved ? ` (its previous documents are kept as "${result.preserved}")` : ''}${running ? '; connected clients are reloading' : ''}`)
+}
+
+/** The http origin of a simulator serving this folder, if one is running. */
+async function runningSimFor(root, flags) {
+  const recorded = readJsonFile(path.join(root, '.sanity-sim', 'server.json'))?.port
+  const ports = [...new Set([flags.port, recorded, DEFAULT_PORT].filter(Boolean).map(Number))]
+  for (const port of ports) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/_sim/status`, {signal: AbortSignal.timeout(500)})
+      if ((await response.json()).root === root) return `http://127.0.0.1:${port}`
+    } catch {
+      /* nothing there, or not a simulator */
+    }
+  }
+  return null
+}
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
 }
 
 async function importCommand(root, project, flags, file) {
@@ -287,20 +359,42 @@ async function reset(root, project, flags) {
 
 function trust(flags) {
   ensureTls({hostnames: []})
-  if (isCaTrusted()) return print('the sanity-sim certificate is already trusted')
-  runTrust()
+  if (isCaTrusted()) {
+    setTrustDeclined(false)
+    return print('the sanity-sim certificate is already trusted')
+  }
+  runTrust({})
 }
 
-function runTrust() {
+/** Run the OS trust command. Returns whether the CA is trusted afterwards; never throws. */
+function runTrust({server, projectId}) {
   const [command, args] = trustCommand()
   print(`running: ${command} ${args.join(' ')}`)
   try {
     execFileSync(command, args, {stdio: 'inherit'})
+  } catch (error) {
+    /* Missing tool, cancelled dialog, or blocked by policy: the verification below tells them apart from success. */
+    if (error.code === 'ENOENT') print(`${command} is not installed.`)
+  }
+  if (isCaTrusted()) {
+    setTrustDeclined(false)
     print('trusted. Quit and reopen your browser if it was open (Firefox reads the system certificates only at startup).')
     print('Firefox: if it still refuses, set security.enterprise_roots.enabled to true in about:config and restart it.')
-  } catch (error) {
-    print(`could not trust the certificate automatically (${error.message.split('\n')[0]}). Trust ${path.join(caDirectory(), 'ca.pem')} by hand, or open the dashboard and accept the certificate.`)
+    return true
   }
+  setTrustDeclined(true)
+  const apiOrigin = server ? server.origin.replace('://localhost', `://${projectId}.localhost`) : 'https://<projectId>.localhost:3939'
+  print(
+    [
+      'the certificate is not trusted (cancelled, or this machine does not allow it). sanity-sim keeps running; other ways in:',
+      `  - Chrome, Edge, Safari: open ${apiOrigin}/ once and accept the warning.`,
+      '    Managed browsers can forbid that; then ask IT to trust this CA, which only covers localhost names:',
+      `    ${path.join(caDirectory(), 'ca.pem')}`,
+      '  - --http serves plain HTTP: no certificate, but Studio stalls with several documents open (6 connections per host).',
+      'Run `npx sanity-sim trust` to try again; first runs will not ask again until then.',
+    ].join('\n'),
+  )
+  return false
 }
 
 function eject(root, project) {
@@ -313,7 +407,8 @@ function eject(root, project) {
 /* ------------------------------------------------------------------ helpers */
 
 function openSim(root, project, flags) {
-  return new Simulator({root, projectId: flags.project ?? project.projectId ?? undefined, dataset: flags.dataset ?? project.dataset ?? 'production', log: logger()})
+  /* The folder's default is the dataset its Studio/app uses; `--dataset` only picks what one command works on. */
+  return new Simulator({root, projectId: flags.project ?? project.projectId ?? undefined, dataset: project.dataset ?? 'production', log: logger()})
 }
 
 export class UsageError extends Error {}
