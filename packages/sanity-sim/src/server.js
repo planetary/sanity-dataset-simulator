@@ -250,6 +250,14 @@ async function route(context, req, res, url) {
       return uploadAsset(context, req, res, url, rest)
     case 'media-libraries':
       return mediaLibraries(context, req, res, url, rest, apiVersion)
+    case 'check':
+      /* Studio and @sanity/client probe this after a failed connection to tell CORS problems from network ones. */
+      if (rest[0] === 'cors') {
+        const origin = req.headers.origin
+        const allowed = !origin || context.allowedOrigins.has(origin) || isLoopbackOrigin(origin)
+        return json(res, 200, {result: {allowed, withCredentials: allowed}})
+      }
+      throw notImplemented(`${method} /check/${rest.join('/')}`)
     case 'agent':
       /* Studio watches the organization's Content Agent bundles once a project has an organization; there are none. */
       if (rest[1] === 'bundles' && rest[2] === 'mine' && rest[3] === 'listen') return emptyAgentBundles(req, res)

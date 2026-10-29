@@ -129,6 +129,13 @@ describe('media library', () => {
     assert.match(await response.text(), /assetSelection/)
   })
 
+  it('answers the CORS probe Studio and the client send after a failed connection', async () => {
+    const allowed = await (await fetch(`${sim.base}/vX/check/cors`, {headers: {origin: 'http://localhost:3000'}})).json()
+    assert.deepEqual(allowed, {result: {allowed: true, withCredentials: true}})
+    const refused = await (await fetch(`${sim.base}/vX/check/cors`, {headers: {origin: 'https://example.com'}})).json()
+    assert.deepEqual(refused, {result: {allowed: false, withCredentials: false}})
+  })
+
   it('answers Studio\'s agent bundles stream (asked once a project has an organization) with no bundles', async () => {
     const events = await readEvents(`${sim.base}/v2025-02-19/agent/osimlocal/bundles/mine/listen`, {until: (list) => list.length > 0})
     assert.deepEqual(events[0], {event: 'bundles', data: {bundles: []}})

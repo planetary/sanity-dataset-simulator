@@ -157,12 +157,20 @@ class Listener {
  * The Live Content API (`GET /data/live/events/<ds>`): sync-tag invalidation
  * messages, not documents. Clients without `includeDrafts` only hear about
  * changes that touched published documents.
+ *
+ * The first client per dataset after the simulator starts also gets one
+ * invalidation for that dataset, once for published clients and once for
+ * `includeDrafts` ones (next-sanity only revalidates its cache from a
+ * published client). Next.js keeps its fetch cache on disk across restarts,
+ * and a dataset reseeded, reset or imported while nothing was listening would
+ * otherwise stay stale until its next edit.
  */
 export class LiveHub {
   constructor() {
     this.clients = new Set()
     this.attached = new WeakSet()
     this.sequence = 0
+    this.refreshed = new Set()
   }
 
   attach(dataset) {
@@ -189,6 +197,12 @@ export class LiveHub {
     const client = {res, dataset: dataset.name, via, includeDrafts}
     this.clients.add(client)
     write(res, 'welcome', {})
+    const first = `${dataset.name}${includeDrafts ? ' (drafts)' : ''}`
+    if (!this.refreshed.has(first)) {
+      this.refreshed.add(first)
+      const id = `${Date.now().toString(36)}-${(this.sequence += 1)}`
+      write(res, 'message', {id, tags: [syncTagFor(dataset.name)]}, id)
+    }
     const keepalive = setInterval(() => !res.writableEnded && res.write(': keepalive\n\n'), 30_000)
     keepalive.unref?.()
     res.on('close', () => {

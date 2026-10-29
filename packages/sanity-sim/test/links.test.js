@@ -59,6 +59,7 @@ describe('linked datasets', () => {
     }
     const before = await tagsOf('production')
     const url = sim.api('/data/live/events/production')
+    await readEvents(url, {timeout: 300}) // the first client's startup invalidation
     const events = await readEvents(url, {timeout: 3000, onOpen: () => admin('/links/production', {method: 'PUT', body: {target: 'test-1'}})})
     const message = events.find((event) => event.event === 'message')
     assert.ok(message, 'a message announced the swap')

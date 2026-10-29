@@ -297,6 +297,16 @@ describe('listen and live events', () => {
     assert.equal(event.result, undefined)
   })
 
+  it('invalidates each dataset once for its first live client, for caches older than this run', async () => {
+    const url = sim.api('/data/live/events/production')
+    const first = await readEvents(url, {until: (list) => list.some((e) => e.event === 'message'), timeout: 1000})
+    assert.deepEqual(first.map((e) => e.event), ['welcome', 'message'])
+    const second = await readEvents(url, {timeout: 400})
+    assert.deepEqual(second.map((e) => e.event), ['welcome'], 'only the first client gets it')
+    const drafts = await readEvents(`${url}?includeDrafts=true`, {until: (list) => list.some((e) => e.event === 'message'), timeout: 1000})
+    assert.deepEqual(drafts.map((e) => e.event), ['welcome', 'message'], 'draft-mode clients count separately: they do not revalidate the cache')
+  })
+
   it('emits sync-tag messages on the live endpoint, drafts only with includeDrafts', async () => {
     const url = sim.api('/data/live/events/production')
     const events = await readEvents(url, {
