@@ -86,9 +86,17 @@ describe('linked datasets', () => {
     reopened.close()
   })
 
-  it('unlinks; the name becomes an ordinary empty dataset again', async () => {
-    assert.equal((await admin('/links/production', {method: 'DELETE'})).status, 200)
-    assert.deepEqual(await titles('production'), [])
+  it('unlinks; the documents the name held before the link come back', async () => {
+    const unlinked = await admin('/links/production', {method: 'DELETE'})
+    assert.deepEqual(unlinked.body, {name: 'production', unlinked: 'test-1', restored: 'production-original'})
+    assert.deepEqual(await titles('production'), ['from production'])
     assert.deepEqual(await titles('test-1'), ['from test-1', 'written via production'])
+    assert.ok(!(await admin('/status')).body.datasets.some((dataset) => dataset.name === 'production-original'))
+  })
+
+  it('unlinks a name that held nothing into an ordinary empty dataset', async () => {
+    await admin('/links/fresh', {method: 'PUT', body: {target: 'test-2'}})
+    assert.deepEqual((await admin('/links/fresh', {method: 'DELETE'})).body, {name: 'fresh', unlinked: 'test-2'})
+    assert.deepEqual(await titles('fresh'), [])
   })
 })

@@ -31,6 +31,7 @@ export class Simulator {
     if (!this.config.datasets.includes(dataset) && !this.config.links?.[dataset]) this.config.datasets.push(dataset)
     this.config.defaultDataset ??= dataset
     this.config.links ??= {}
+    this.config.preserved ??= {}
     this.datasets = new Map()
     this.listen = new ListenHub()
     this.live = new LiveHub()
@@ -116,8 +117,9 @@ export class Simulator {
   /**
    * Point `name` at the stored dataset `target`, or re-point it (hot swap).
    * If `name` is itself a stored dataset holding documents, they are kept
-   * under `<name>-original` (or the next free name). Clients connected
-   * through `name` are disconnected so they reconnect and refetch.
+   * under `<name>-original` (or the next free name) until `unlink` puts them
+   * back. Clients connected through `name` are disconnected so they reconnect
+   * and refetch.
    */
   link(name, target) {
     name = String(name ?? '').replace(/^~/, '')
@@ -133,6 +135,7 @@ export class Simulator {
       if (existing.size > 0 || existing.transactions.length > 0) {
         preserved = this.freeName(`${name}-original`)
         this.renameDataset(name, preserved)
+        this.config.preserved[name] = preserved
       } else {
         this.deleteDataset(name)
       }
@@ -151,11 +154,15 @@ export class Simulator {
     const target = this.config.links[name]
     if (!target) throw new SimError(404, 'notFound', `"${name}" is not a link`)
     delete this.config.links[name]
+    const preserved = this.config.preserved[name]
+    delete this.config.preserved[name]
+    const restore = preserved && this.config.datasets.includes(preserved) && !this.config.datasets.includes(name) && !Object.values(this.config.links).includes(preserved)
+    if (restore) this.renameDataset(preserved, name)
     this.saveConfig()
-    this.disconnect(name, [target, name])
+    this.disconnect(name, [target, name, ...(restore ? [preserved] : [])])
     for (const listener of this.linkListeners) listener()
-    this.log('info', `unlinked "${name}" (was → "${target}")`)
-    return {name, unlinked: target}
+    this.log('info', `unlinked "${name}" (was → "${target}")${restore ? ` and restored its data from "${preserved}"` : ''}`)
+    return {name, unlinked: target, ...(restore ? {restored: preserved} : {})}
   }
 
   /** End listener and live streams opened through `name`, invalidating every dataset it showed. */

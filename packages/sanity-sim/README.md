@@ -90,7 +90,7 @@ npx sanity-sim unlink production
 
 A **link** is a name, here `production`, that resolves to a stored dataset. Every request through that name reads and writes the target, and Sanity's alias spelling `~production` works too. Re-pointing a link while the simulator runs disconnects the listeners and live connections that came in through that name. Studio and `@sanity/client` reconnect and refetch, so the swap shows up within a few seconds, with no restart or reload. Next.js apps using the Live Content API get a sync-tag invalidation for both datasets. A document open in Studio that doesn't exist in the new dataset shows as deleted.
 
-If the name you link already holds documents, they are kept as a stored dataset named `<name>-original`, so nothing is lost. The same controls are on the dashboard's **Datasets** page, and the dataset picker shows links as `production → test-1`. Links live in `.sanity-sim/config.json`.
+If the name you link already holds documents, they are kept as a stored dataset named `<name>-original`, so nothing is lost, and `npx sanity-sim unlink <name>` puts them back under the name. The same controls are on the dashboard's **Datasets** page, and the dataset picker shows links as `production → test-1`. Links live in `.sanity-sim/config.json`.
 
 ## Syncing a real dataset
 

@@ -305,7 +305,7 @@ async function linkCommand(root, project, flags, [name, target], {unlink = false
     result = unlink ? sim.unlink(name) : sim.link(name, target)
     sim.close()
   }
-  if (unlink) return print(`unlinked ${name} (was → ${result.unlinked})`)
+  if (unlink) return print(`unlinked ${name} (was → ${result.unlinked})${result.restored ? `; its documents are back from "${result.restored}"` : ''}`)
   print(`${name} → ${result.target}${result.preserved ? ` (its previous documents are kept as "${result.preserved}")` : ''}${running ? '; connected clients are reloading' : ''}`)
 }
 
