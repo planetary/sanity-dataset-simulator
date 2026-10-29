@@ -5,3 +5,4 @@ packages:
   # keeps that version out of the shared dependency graph.
   - "!examples/sim-spike"
   - "!examples/sim-next"
+  - "!examples/test-studio"
