@@ -81,6 +81,61 @@ describe('queries and perspectives', () => {
   })
 })
 
+describe('hosted GROQ functions groq-js leaves out', () => {
+  let sim
+  before(async () => {
+    sim = await startSim()
+    await sim.mutate([
+      {create: {_id: 'build', _type: 'article', title: 'Building a compiler by hand'}},
+      {create: {_id: 'history', _type: 'article', title: 'A history of compilers', body: 'Engines, looms and the first programs.'}},
+      {create: {_id: 'garden', _type: 'article', title: 'Gardening for beginners'}},
+      {create: {_id: 'drafts.garden', _type: 'article', title: 'Gardening history for beginners'}},
+    ])
+  })
+  after(() => sim.close())
+
+  const ranked = '*[_type == "article"] | score(text::semanticSimilarity($q)) | order(_score desc) {_id, _score}'
+
+  it('ranks with text::semanticSimilarity inside score(), reporting the approximation', async () => {
+    const {status, body} = await sim.query(ranked, {params: {q: 'the history of compilers'}})
+    assert.equal(status, 200)
+    assert.deepEqual(body.result, [
+      {_id: 'history', _score: 1},
+      {_id: 'build', _score: 0.5},
+      {_id: 'garden', _score: 0},
+    ])
+    assert.equal(body.simApproximations[0].function, 'text::semanticSimilarity')
+    assert.equal(body.simApproximations[0].matched, 2)
+  })
+
+  it('scores what the perspective shows (the draft, in drafts)', async () => {
+    const {body} = await sim.query(ranked, {params: {q: 'history'}, perspective: 'drafts'})
+    assert.deepEqual(body.result.filter((doc) => doc._score > 0).map((doc) => doc._id).sort(), ['garden', 'history'])
+  })
+
+  it('combines with other score() terms and constant search text', async () => {
+    const {body} = await sim.query('*[_type == "article"] | score(text::semanticSimilarity("gardening"), title match "beginners") | order(_score desc)[0]._id')
+    assert.equal(body.result, 'garden')
+  })
+
+  it('refuses text::semanticSimilarity outside score(), where Sanity documents it', async () => {
+    const {status, body} = await sim.query('*[text::semanticSimilarity("x") > 0]')
+    assert.equal(status, 400)
+    assert.match(body.error.description, /only valid inside score\(\)/)
+  })
+
+  it('answers documents::incomingGlobalDocumentReferenceCount() with 0 and user::attributes() with {}', async () => {
+    const {body} = await sim.query('*[_id == "build"][0]{"globalRefs": documents::incomingGlobalDocumentReferenceCount(), "me": user::attributes()}')
+    assert.deepEqual(body.result, {globalRefs: 0, me: {}})
+  })
+
+  it('no longer refuses queries that merely mention a function name in a string', async () => {
+    const {status, body} = await sim.query('"user::attributes"')
+    assert.equal(status, 200)
+    assert.equal(body.result, 'user::attributes')
+  })
+})
+
 describe('mutations', () => {
   let sim
   before(async () => (sim = await startSim()))

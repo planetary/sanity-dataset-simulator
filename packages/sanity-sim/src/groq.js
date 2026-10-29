@@ -4,9 +4,6 @@ import {SimError} from './errors.js'
 import {resolvePerspective} from './perspective.js'
 import {buildSourceMap} from './sourcemap.js'
 
-/** GROQ functions groq-js 2.x does not implement; answered with a clear 400 instead of a crash. */
-const UNSUPPORTED_FUNCTIONS = ['text::semanticSimilarity', 'documents::incomingGlobalDocumentReferenceCount', 'user::attributes']
-
 export function parseGroq(query, params) {
   try {
     return parse(query, {params})
@@ -35,11 +32,6 @@ export function parseGroq(query, params) {
  * Returns the Content Lake response body (minus `query` when `returnQuery` is false).
  */
 export async function runQuery({dataset, query, params = {}, perspective, projectId, returnQuery = true, resultSourceMap = false}) {
-  for (const name of UNSUPPORTED_FUNCTIONS) {
-    if (query.includes(name)) {
-      throw new SimError(400, 'queryParseError', `${name}() is not supported by sanity-sim (groq-js does not implement it)`, {query})
-    }
-  }
   const parsed = parseGroq(query, params)
   const documents = resolvePerspective(dataset.documents(), perspective)
   const started = performance.now()
@@ -47,7 +39,7 @@ export async function runQuery({dataset, query, params = {}, perspective, projec
   let result
   let approximations = []
   try {
-    const prepared = await resolveTextQueries(parsed, params, documents, options)
+    const prepared = await resolveHostedFunctions(parsed, params, documents, options)
     approximations = prepared.approximations
     const value = await evaluate(prepared.tree, {...options, params: {...params, ...prepared.params}})
     result = await value.get()
@@ -160,6 +152,91 @@ async function resolveTextQueries(tree, params, documents, options) {
     if (!everything && !approximations.some((entry) => entry.term === pattern)) {
       approximations.push({function: 'text::query', term: pattern, matched: ids.length, reason: 'local prefix-token matching; no hosted stemming or relevance'})
     }
+  }
+  return {tree: replaceNodes(tree, replacements), params: generated, approximations}
+}
+
+/* ------------------------------------------------------- other hosted functions
+ *
+ * groq-js stubs these out ("not implemented"); Content Lake answers them from
+ * hosted services. Each is resolved before evaluation, like text::query:
+ *
+ * - `text::semanticSimilarity(<string>)`, valid only inside `score()`: Content
+ *   Lake ranks by embedding similarity. Locally a document scores the share of
+ *   the search words its text contains (case-insensitive, a word also matches
+ *   its longer or shorter forms, e.g. "compiler"/"compilers"). Reported in
+ *   `simApproximations`. The call becomes `boost(_id in $ids, s - 1) || …`, one
+ *   branch per distinct score, which groq-js's `score()` sums to exactly `s`.
+ * - `documents::incomingGlobalDocumentReferenceCount()`: references from other
+ *   Sanity resources (Media Library, other datasets). None exist locally: `0`.
+ * - `user::attributes()`: the one local user has no custom attributes: `{}`. */
+
+const isCall = (namespace, name) => (node) => isRecord(node) && node.type === 'FuncCall' && node.namespace === namespace && node.name === name
+const isSemanticCall = isCall('text', 'semanticSimilarity')
+const STOP_WORDS = new Set('a an and are as at be by for from has have how i in is it its of on or that the this to was what when where which who why will with'.split(' '))
+
+export function words(text) {
+  return [...new Set(String(text).toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])].filter((word) => !STOP_WORDS.has(word))
+}
+
+const sameWord = (a, b) => a === b || (Math.min(a.length, b.length) >= 4 && (a.startsWith(b) || b.startsWith(a)))
+
+async function resolveHostedFunctions(tree, params, documents, options) {
+  const text = await resolveTextQueries(tree, params, documents, options)
+  const semantic = resolveSemanticSimilarity(text.tree, params, documents)
+  const replacements = new Map()
+  for (const node of collect(semantic.tree, isCall('documents', 'incomingGlobalDocumentReferenceCount'))) replacements.set(node, {type: 'Value', value: 0})
+  for (const node of collect(semantic.tree, isCall('user', 'attributes'))) replacements.set(node, {type: 'Value', value: {}})
+  return {
+    tree: replacements.size > 0 ? replaceNodes(semantic.tree, replacements) : semantic.tree,
+    params: {...text.params, ...semantic.params},
+    approximations: [...text.approximations, ...semantic.approximations],
+  }
+}
+
+function resolveSemanticSimilarity(tree, params, documents) {
+  const calls = collect(tree, isSemanticCall)
+  if (calls.length === 0) return {tree, params: {}, approximations: []}
+  const scored = new Set(collect(tree, (node) => node.type === 'PipeFuncCall' && node.name === 'score').flatMap((node) => collect(node.args, isSemanticCall)))
+  if (calls.some((node) => !scored.has(node))) {
+    throw new SimError(400, 'queryExecutionError', 'text::semanticSimilarity() is only valid inside score()')
+  }
+  const replacements = new Map()
+  const generated = {}
+  const approximations = []
+  let index = 0
+  for (const node of calls) {
+    const arg = node.args?.[0]
+    const term = arg?.type === 'Parameter' ? params[arg.name] : arg?.type === 'Value' ? arg.value : undefined
+    if (typeof term !== 'string') {
+      throw new SimError(400, 'queryExecutionError', 'sanity-sim supports text::semanticSimilarity() only with a constant or parameter search text')
+    }
+    const wanted = words(term)
+    const buckets = new Map()
+    if (wanted.length > 0) {
+      for (const document of documents) {
+        const own = words(searchableStrings(document).join(' '))
+        const found = wanted.filter((word) => own.some((candidate) => sameWord(word, candidate))).length
+        if (found === 0) continue
+        const score = Math.round((found / wanted.length) * 1000) / 1000
+        if (!buckets.has(score)) buckets.set(score, [])
+        buckets.get(score).push(document._id)
+      }
+    }
+    index += 1
+    const branches = [...buckets].map(([score, ids], bucket) => {
+      const name = `__simSemantic${index}_${bucket}`
+      generated[name] = ids
+      const inIds = {type: 'OpCall', op: 'in', left: {type: 'AccessAttribute', name: '_id'}, right: {type: 'Parameter', name}}
+      return {type: 'FuncCall', namespace: 'global', name: 'boost', args: [inIds, {type: 'Value', value: score - 1}]}
+    })
+    replacements.set(node, branches.length === 0 ? {type: 'Value', value: false} : branches.reduce((left, right) => ({type: 'Or', left, right})))
+    approximations.push({
+      function: 'text::semanticSimilarity',
+      term,
+      matched: [...buckets.values()].reduce((sum, ids) => sum + ids.length, 0),
+      reason: 'local word-overlap scoring (share of the search words a document contains); no embeddings',
+    })
   }
   return {tree: replaceNodes(tree, replacements), params: generated, approximations}
 }

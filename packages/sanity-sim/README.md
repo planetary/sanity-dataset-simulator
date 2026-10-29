@@ -151,6 +151,8 @@ Verified against **Sanity Studio 6.20**, **@sanity/client 8.13**, **next-sanity 
 | Query API: GROQ, params, GET/POST | ✅ via groq-js 2 |
 | Perspectives: `published` (default from v2025-02-19), `drafts`, `raw`, release stacks, `_originalId` | ✅ |
 | `text::query` (Studio lists and search) | ✅ exact for unfiltered lists; prefix-token approximation for typed terms (reported in `simApproximations`) |
+| `text::semanticSimilarity` inside `score()` (semantic search) | ✅ approximation: a document scores the share of the search words its text contains (no embeddings; reported in `simApproximations`) |
+| `documents::incomingGlobalDocumentReferenceCount()`, `user::attributes()` | ✅ `0` (no other Sanity resources exist locally) and `{}` (the local user has no custom attributes) |
 | `syncTags`, Live Content API (`/data/live/events`) | ✅ one coarse tag per dataset (over-invalidates, never under-) |
 | `resultSourceMap` (Presentation, stega) | ✅ inferred conservatively for string values |
 | Presentation and Draft Mode (next-sanity `defineEnableDraftMode`, `defineLive`, `<VisualEditing>`) | ✅ preview secrets, drafts in the preview, click-to-edit overlays, live draft edits, published pages revalidated by `<SanityLive>` (see `examples/sim-next`) |
@@ -163,7 +165,6 @@ Verified against **Sanity Studio 6.20**, **@sanity/client 8.13**, **next-sanity 
 | Studio boot: users, projects, datasets, grants, ACL, features, release limits, key-value settings | ✅ one local user with every grant |
 | Presence (Bifur websocket) | ⚠️ accepted and answered; single-user, so no presence |
 | Comments and Tasks (add-on datasets) | ✗ features reported off |
-| `text::semanticSimilarity`, `documents::incomingGlobalDocumentReferenceCount`, `user::attributes` | ✗ clear 400 |
 | Agent Actions, Canvas, Media Library, Functions, embeddings | ✗ clear 501, listed on the Connections page |
 
 ## Known limitations
