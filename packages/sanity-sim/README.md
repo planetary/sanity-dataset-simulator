@@ -54,6 +54,8 @@ Undo everything with `npx sanity-sim eject`, which restores each file byte-for-b
 
 The register hook redirects TLS connections for Sanity's hostnames to the simulator. The simulator answers them with a certificate from a **second, Node-only CA**. That CA is handed to the dev processes through `NODE_EXTRA_CA_CERTS` and is never installed in your system trust store.
 
+**Draft Mode without a token.** next-sanity's draft-mode route and `defineLive` need a read token, and the simulator accepts any token. If your project has none (no `SANITY_API_READ_TOKEN`, `SANITY_API_TOKEN`, … in the environment or `.env` files), the dev processes get a placeholder `SANITY_API_READ_TOKEN`, so Presentation and Draft Mode work out of the box. A token you do have is left alone.
+
 ## Dashboard
 
 Open `http://localhost:3939/`:

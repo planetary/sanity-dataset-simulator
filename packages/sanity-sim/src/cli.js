@@ -53,6 +53,8 @@ Options
 `
 
 const DEFAULT_PORT = 3939
+/** What dev scripts get as SANITY_API_READ_TOKEN when the project has no token of its own. */
+export const PLACEHOLDER_TOKEN = 'sanity-sim-placeholder-read-token'
 
 export async function run(argv) {
   const {command, positional, flags} = parseArgs(argv)
@@ -159,7 +161,14 @@ async function dev(root, project, flags, {runDev}) {
     [NEXT_ENV]: browserBase,
     ...Object.fromEntries(VITE_ENVS.map((key) => [key, browserBase])),
     ...(tls ? {NODE_EXTRA_CA_CERTS: tls.nodeCaBundle} : {}),
+    /*
+     * Draft Mode (next-sanity's draft-mode route, defineLive) needs a read
+     * token. The simulator accepts any token, so a project without one gets a
+     * placeholder; a real token in the environment or .env files is left alone.
+     */
+    ...(project.token ? {} : {SANITY_API_READ_TOKEN: PLACEHOLDER_TOKEN}),
   }
+  if (runDev && !project.token) log('info', `no read token found; dev scripts get a placeholder SANITY_API_READ_TOKEN (the simulator accepts any token)`)
 
   banner({sim, project, root, server, tls, datasetName, wired, runDev})
 

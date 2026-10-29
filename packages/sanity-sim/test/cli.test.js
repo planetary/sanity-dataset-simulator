@@ -6,6 +6,7 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {promisify} from 'node:util'
 import {after, before, describe, it} from 'node:test'
+import {PLACEHOLDER_TOKEN} from '../src/cli.js'
 
 const BIN = fileURLToPath(new URL('../bin/sanity-sim.js', import.meta.url))
 const cli = async (root, ...args) => (await promisify(execFile)(process.execPath, [BIN, ...args, '--root', root, '--yes'], {cwd: root, env: {...process.env, SANITY_SIM_HOME: root}})).stdout
@@ -32,6 +33,32 @@ describe('cli', () => {
 
   it('refuses a bad link with a clear message', async () => {
     await assert.rejects(cli(root, 'link', 'production', 'production'), /cannot link to itself/)
+  })
+
+  describe('the read token dev scripts get (Draft Mode needs one)', () => {
+    /* Start the simulator with a dev script that records SANITY_API_READ_TOKEN, then stop it. */
+    const tokenSeen = async (envFile) => {
+      const dir = freshRoot()
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({name: 'app', private: true, scripts: {dev: `node -e "require('fs').writeFileSync('token.txt', process.env.SANITY_API_READ_TOKEN ?? 'none')"`}}))
+      if (envFile) fs.writeFileSync(path.join(dir, '.env'), envFile)
+      const {SANITY_API_READ_TOKEN: _ignored, ...env} = process.env
+      const child = spawn(process.execPath, [BIN, '--root', dir, '--port', String(39500 + Math.floor(Math.random() * 400)), '--http', '--yes'], {cwd: dir, env: {...env, SANITY_SIM_HOME: dir}, stdio: 'pipe'})
+      try {
+        const file = path.join(dir, 'token.txt')
+        for (let i = 0; i < 100 && !fs.existsSync(file); i++) await new Promise((resolve) => setTimeout(resolve, 100))
+        return fs.readFileSync(file, 'utf8')
+      } finally {
+        child.kill()
+      }
+    }
+
+    it('is a placeholder when the project has no token', async () => {
+      assert.equal(await tokenSeen(), PLACEHOLDER_TOKEN)
+    })
+
+    it('is left alone when the project has its own', async () => {
+      assert.equal(await tokenSeen('SANITY_API_READ_TOKEN=real-token\n'), 'none')
+    })
   })
 
   describe('with a simulator running for the folder', () => {
