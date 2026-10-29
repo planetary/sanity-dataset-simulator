@@ -214,7 +214,7 @@ async function pull(sim, datasetName, source, log) {
 
 function syncSource(sim, project, datasetName) {
   const configured = sim.config.sync?.[datasetName]
-  const projectId = configured?.projectId ?? project.projectId
+  const projectId = configured?.projectId ?? project.projectId ?? sim.projectId
   if (!projectId || projectId === 'simlocal') return null
   return {projectId, dataset: configured?.dataset ?? project.dataset ?? datasetName, token: findToken(project), types: configured?.types ?? undefined}
 }

@@ -15,10 +15,20 @@ const API_VERSION = 'v2025-02-19'
 
 export class ReadOnlyViolation extends Error {}
 
+/**
+ * `https://<project>.api.sanity.io`, or SANITY_SIM_UPSTREAM when set. The
+ * override exists so the test suite can sync from a second simulator instead
+ * of the network; it is not a user-facing option.
+ */
+export function upstreamBase(projectId) {
+  return process.env.SANITY_SIM_UPSTREAM ?? `https://${projectId}.api.sanity.io`
+}
+
 export function upstream(url, {method = 'GET', token, signal} = {}) {
   if (method !== 'GET') throw new ReadOnlyViolation(`sanity-sim never writes to Sanity (refused ${method} ${url})`)
   const headers = {accept: 'application/json, application/x-ndjson', 'user-agent': 'sanity-sim'}
-  if (token) headers.authorization = `Bearer ${token}`
+  /* A Sanity token only ever goes to Sanity's own hosts. */
+  if (token && /(^|\.)sanity\.io$/.test(new URL(url).hostname)) headers.authorization = `Bearer ${token}`
   return fetch(url, {method, headers, signal})
 }
 
@@ -49,7 +59,7 @@ export async function syncDataset(sim, datasetName, {projectId, dataset, token, 
   const target = sim.dataset(datasetName)
   const search = new URLSearchParams()
   if (types?.length) search.set('types', types.join(','))
-  const url = `https://${projectId}.api.sanity.io/${API_VERSION}/data/export/${dataset}${search.size ? `?${search}` : ''}`
+  const url = `${upstreamBase(projectId)}/${API_VERSION}/data/export/${dataset}${search.size ? `?${search}` : ''}`
   const response = await upstream(url, {token: token?.value})
   if (!response.ok) {
     const body = await response.text().catch(() => '')
@@ -95,7 +105,7 @@ export function followDataset(sim, datasetName, {projectId, dataset, token, log 
   const target = sim.dataset(datasetName)
   const controller = new AbortController()
   let attempt = 0
-  const url = `https://${projectId}.api.sanity.io/${API_VERSION}/data/listen/${dataset}?${new URLSearchParams({
+  const url = `${upstreamBase(projectId)}/${API_VERSION}/data/listen/${dataset}?${new URLSearchParams({
     query: '*',
     includeResult: 'true',
     includeAllVersions: 'true',
@@ -141,7 +151,7 @@ export function followDataset(sim, datasetName, {projectId, dataset, token, log 
 
 /** A remote document at an earlier revision (the merge ancestor). Read-only. */
 export async function fetchRemoteRevision({projectId, dataset, token}, id, revision) {
-  const url = `https://${projectId}.api.sanity.io/${API_VERSION}/data/history/${dataset}/documents/${encodeURIComponent(id)}?revision=${encodeURIComponent(revision)}`
+  const url = `${upstreamBase(projectId)}/${API_VERSION}/data/history/${dataset}/documents/${encodeURIComponent(id)}?revision=${encodeURIComponent(revision)}`
   const response = await upstream(url, {token: token?.value})
   if (!response.ok) return null
   const body = await response.json()

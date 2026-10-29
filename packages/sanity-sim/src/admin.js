@@ -234,7 +234,7 @@ function txSummary(tx) {
 
 function syncSourceFor(context, dataset) {
   const configured = context.sim.config.sync?.[dataset.name]
-  const projectId = configured?.projectId ?? context.project?.projectId ?? null
+  const projectId = configured?.projectId ?? context.project?.projectId ?? context.sim.projectId
   if (!projectId || projectId === 'simlocal') return null
   const token = findToken(context.project)
   return {projectId, dataset: configured?.dataset ?? context.project?.dataset ?? dataset.name, credentials: token?.source ?? null, types: configured?.types ?? null}
