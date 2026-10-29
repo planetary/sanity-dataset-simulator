@@ -769,9 +769,9 @@ async function renderDatasets(main) {
                     'button',
                     {
                       class: 'btn small',
-                      title: `Stop linking; "${link.name}" becomes an ordinary, empty dataset`,
+                      title: `Stop linking; "${link.name}" gets back the documents it held before the link, if any`,
                       onclick: async () => {
-                        if (!confirm(`Unlink ${link.name}? It becomes an ordinary, empty dataset; ${link.target} is untouched.`)) return
+                        if (!confirm(`Unlink ${link.name}? It gets back the documents it held before the link (if any); ${link.target} is untouched.`)) return
                         try {
                           await admin(`/links/${encodeURIComponent(link.name)}`, {method: 'DELETE'})
                           toast(`Unlinked ${link.name}`)

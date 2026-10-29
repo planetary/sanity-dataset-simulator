@@ -21,6 +21,10 @@ Then open the site at http://localhost:3000, the Studio at http://localhost:3000
 
 **Site.** Every type has a page; links resolve through references; images honor hotspot and crop; draft mode, `<SanityLive>` and `<VisualEditing>` drive Presentation; one list is fetched in the browser to show the client-side path too.
 
+## Recording the demo video
+
+With the demo running on its default ports, `node scripts/record-demo.mjs demo.webm` records a captioned tour (about four minutes) of the dashboard, the site, the Studio, Presentation, a dataset hot swap, Media Library and Vision, with Playwright. It creates the `winter-preview` dataset it swaps to if it is missing, and puts the data it edits back afterwards. `ffmpeg -i demo.webm -c:v libx264 -crf 18 -pix_fmt yuv420p demo.mp4` makes an MP4.
+
 ## The seed
 
 `seed.tar.gz` is a `sanity dataset export`-style tarball built by `scripts/build-seed.mjs` (edit the content there and run it again). Photos come from [Picsum](https://picsum.photos) ([Unsplash License](https://unsplash.com/license)); the embedded video is *Big Buck Bunny* by the Blender Foundation (CC BY 3.0).
