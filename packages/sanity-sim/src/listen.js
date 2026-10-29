@@ -144,7 +144,7 @@ class Listener {
         transactionTotalEvents: events.length,
         transactionCurrentEvent: index + 1,
       }
-      if (options.includeMutations !== false) payload.mutations = tx.mutations
+      if (options.includeMutations !== false) payload.mutations = mutationsFor(tx.mutations, change)
       if (options.includeResult !== false && change.after) payload.result = change.after
       if (options.includePreviousRevision && change.before) payload.previous = change.before
       if (options.effectFormat === 'mendoza') payload.effects = {apply: [0, change.after], revert: [0, change.before]}
@@ -216,4 +216,19 @@ export class LiveHub {
 function write(res, event, data, id) {
   if (res.writableEnded || res.destroyed) return
   res.write(`${id ? `id: ${id}\n` : ''}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+}
+
+/**
+ * An event carries only the mutations for its own document, as Content Lake
+ * sends them: clients (Studio's @sanity/mutator) apply them to that document
+ * without checking ids, so a publish's `delete` of the draft would otherwise
+ * null the published document.
+ */
+function mutationsFor(mutations, change) {
+  const own = mutations.filter((mutation) => {
+    const body = Object.values(mutation)[0]
+    return (body?._id ?? body?.id) === change.id
+  })
+  if (own.length > 0) return own
+  return [change.after === null ? {delete: {id: change.id}} : {createOrReplace: change.after}]
 }

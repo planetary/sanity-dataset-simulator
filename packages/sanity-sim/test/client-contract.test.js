@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url'
 import {after, before, describe, it} from 'node:test'
 import {promisify} from 'node:util'
 import {createClient} from '@sanity/client'
+import {Mutation} from '@sanity/mutator'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -97,6 +98,30 @@ describe('@sanity/client 8 contract', () => {
     assert.equal(event.documentId, 'm4')
     assert.equal(event.transition, 'appear')
     assert.equal(event.result.title, 'Prometheus')
+  })
+
+  it('sends each listener event only its own document\'s mutations, as Studio applies them blindly', async () => {
+    await client.createOrReplace({_id: 'm5', _type: 'movie', title: 'Alien'})
+    await client.createOrReplace({_id: 'drafts.m5', _type: 'movie', title: 'Alien (edited)'})
+    const published = await client.getDocument('m5')
+    const events = new Promise((resolve, reject) => {
+      const seen = []
+      const subscription = client.listen('*[_id in ["m5", "drafts.m5"]]').subscribe({
+        next: (event) => {
+          if (event.type !== 'mutation') return
+          seen.push(event)
+          if (seen.length === event.transactionTotalEvents) {
+            subscription.unsubscribe()
+            resolve(seen)
+          }
+        },
+        error: reject,
+      })
+      setTimeout(() => client.action({actionType: 'sanity.action.document.publish', draftId: 'drafts.m5', publishedId: 'm5'}), 200)
+    })
+    const publishEvent = (await events).find((event) => event.documentId === 'm5')
+    const result = new Mutation({mutations: publishEvent.mutations, previousRev: publishEvent.previousRev, resultRev: publishEvent.resultRev}).apply(published)
+    assert.equal(result?.title, 'Alien (edited)', 'the draft\'s delete must not reach the published document')
   })
 
   it('uploads assets and serves them back from the CDN path', async () => {
