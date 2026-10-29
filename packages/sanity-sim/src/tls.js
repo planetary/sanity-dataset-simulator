@@ -18,54 +18,90 @@ export function caDirectory() {
   return process.env.SANITY_SIM_HOME ? path.join(process.env.SANITY_SIM_HOME, 'ca') : path.join(os.homedir(), '.sanity-sim', 'ca')
 }
 
+/** Names the Node-side intercept certificate answers for (never trusted by the OS). */
+export const INTERCEPT_NAMES = ['api.sanity.io', '*.api.sanity.io', '*.apicdn.sanity.io', 'cdn.sanity.io']
+
+/**
+ * Two CAs, two jobs:
+ *
+ * - `ca.pem` — the browser CA. Name-constrained to localhost names, so even
+ *   once a user trusts it (`sanity-sim trust`) it can never vouch for any
+ *   other site. Signs the leaf for `localhost` / `<project>.localhost`.
+ * - `intercept-ca.pem` — handed ONLY to the dev processes sanity-sim starts
+ *   (via NODE_EXTRA_CA_CERTS), never installed anywhere. Signs a leaf for
+ *   Sanity's API hostnames, so `sanity-sim/register` can redirect a Node
+ *   client's TLS connection to the simulator without the client noticing.
+ */
 export function ensureTls({hostnames}) {
   const dir = caDirectory()
   fs.mkdirSync(dir, {recursive: true, mode: 0o700})
-  const caKey = path.join(dir, 'ca-key.pem')
-  const caCert = path.join(dir, 'ca.pem')
-  if (!fs.existsSync(caCert) || !fs.existsSync(caKey)) {
+  const browser = ensureCa(dir, 'ca', `sanity-sim local CA (${os.hostname().slice(0, 30)})`, [
+    'nameConstraints=critical,permitted;DNS:localhost,permitted;DNS:.localhost,permitted;IP:127.0.0.0/255.0.0.0,permitted;IP:0:0:0:0:0:0:0:1/FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF',
+  ])
+  const intercept = ensureCa(dir, 'intercept-ca', `sanity-sim Node-only CA (do not trust)`, [])
+  const names = [...new Set(['localhost', '*.localhost', ...hostnames])]
+  const leaf = ensureLeaf(dir, 'leaf', browser, names, ['IP:127.0.0.1', 'IP:::1'])
+  const interceptLeaf = ensureLeaf(dir, 'intercept-leaf', intercept, INTERCEPT_NAMES, [])
+  const bundle = path.join(dir, 'node-ca-bundle.pem')
+  fs.writeFileSync(bundle, Buffer.concat([fs.readFileSync(browser.cert), fs.readFileSync(intercept.cert)]))
+  return {
+    key: fs.readFileSync(leaf.key),
+    cert: Buffer.concat([fs.readFileSync(leaf.cert), fs.readFileSync(browser.cert)]),
+    intercept: {
+      key: fs.readFileSync(interceptLeaf.key),
+      cert: Buffer.concat([fs.readFileSync(interceptLeaf.cert), fs.readFileSync(intercept.cert)]),
+    },
+    caFile: browser.cert,
+    nodeCaBundle: bundle,
+  }
+}
+
+function ensureCa(dir, name, commonName, extraExtensions) {
+  const key = path.join(dir, `${name}-key.pem`)
+  const cert = path.join(dir, `${name}.pem`)
+  if (!fs.existsSync(cert) || !fs.existsSync(key)) {
     openssl([
       'req', '-x509', '-new', '-nodes',
       '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
-      '-keyout', caKey, '-out', caCert, '-days', '3650',
-      '-subj', `/CN=sanity-sim local CA (${os.hostname()})/O=sanity-sim`,
-      '-addext', 'basicConstraints=critical,CA:TRUE',
+      '-keyout', key, '-out', cert, '-days', '3650',
+      '-subj', `/CN=${commonName}/O=sanity-sim`,
+      '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0',
       '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+      ...extraExtensions.flatMap((extension) => ['-addext', extension]),
     ])
-    fs.chmodSync(caKey, 0o600)
+    fs.chmodSync(key, 0o600)
   }
+  return {key, cert}
+}
 
-  const names = [...new Set(['localhost', '*.localhost', ...hostnames])]
-  const leafKey = path.join(dir, 'leaf-key.pem')
-  const leafCert = path.join(dir, 'leaf.pem')
-  if (!leafCovers(leafCert, names)) {
-    const csr = path.join(dir, 'leaf.csr')
-    const ext = path.join(dir, 'leaf.ext')
-    openssl(['req', '-new', '-nodes', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-keyout', leafKey, '-out', csr, '-subj', '/CN=localhost'])
+function ensureLeaf(dir, name, ca, dnsNames, ipNames) {
+  const key = path.join(dir, `${name}-key.pem`)
+  const cert = path.join(dir, `${name}.pem`)
+  if (!leafCovers(cert, dnsNames, ca.cert)) {
+    const csr = path.join(dir, `${name}.csr`)
+    const ext = path.join(dir, `${name}.ext`)
+    openssl(['req', '-new', '-nodes', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-keyout', key, '-out', csr, '-subj', `/CN=${dnsNames[0]}`])
     fs.writeFileSync(
       ext,
       [
         'basicConstraints=CA:FALSE',
         'keyUsage=critical,digitalSignature,keyEncipherment',
         'extendedKeyUsage=serverAuth',
-        `subjectAltName=${[...names.map((name) => `DNS:${name}`), 'IP:127.0.0.1', 'IP:::1'].join(',')}`,
+        `subjectAltName=${[...dnsNames.map((dns) => `DNS:${dns}`), ...ipNames].join(',')}`,
       ].join('\n'),
     )
-    openssl(['x509', '-req', '-in', csr, '-CA', caCert, '-CAkey', caKey, '-CAcreateserial', '-out', leafCert, '-days', '397', '-sha256', '-extfile', ext])
-    fs.chmodSync(leafKey, 0o600)
+    openssl(['x509', '-req', '-in', csr, '-CA', ca.cert, '-CAkey', ca.key, '-CAcreateserial', '-out', cert, '-days', '397', '-sha256', '-extfile', ext])
+    fs.chmodSync(key, 0o600)
     fs.rmSync(csr, {force: true})
   }
-  return {
-    key: fs.readFileSync(leafKey),
-    cert: Buffer.concat([fs.readFileSync(leafCert), fs.readFileSync(caCert)]),
-    caFile: caCert,
-  }
+  return {key, cert}
 }
 
-function leafCovers(file, names) {
+function leafCovers(file, names, caFile) {
   if (!fs.existsSync(file)) return false
   try {
     const cert = new X509Certificate(fs.readFileSync(file))
+    if (!cert.checkIssued(new X509Certificate(fs.readFileSync(caFile)))) return false
     if (new Date(cert.validTo).getTime() < Date.now() + 7 * 864e5) return false
     const san = cert.subjectAltName ?? ''
     return names.every((name) => san.includes(`DNS:${name}`))

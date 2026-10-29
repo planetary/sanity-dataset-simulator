@@ -5,11 +5,11 @@ import {Simulator} from '../src/simulator.js'
 import {startServer} from '../src/server.js'
 
 /** A simulator on a random port over a fresh temp directory (plain HTTP). */
-export async function startSim({projectId = 'testproj', dataset = 'production', root} = {}) {
+export async function startSim({projectId = 'testproj', dataset = 'production', root, tls = null} = {}) {
   const dir = root ?? fs.mkdtempSync(path.join(os.tmpdir(), 'sanity-sim-test-'))
   const sim = new Simulator({root: dir, projectId, dataset})
   sim.dataset(dataset)
-  const server = await startServer(sim, {port: 0})
+  const server = await startServer(sim, {port: 0, tls})
   const base = `http://127.0.0.1:${server.port}`
   const api = (p) => `${base}/v2025-02-19${p}`
   return {

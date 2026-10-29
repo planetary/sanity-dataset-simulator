@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import http2 from 'node:http2'
 import net from 'node:net'
+import {createSecureContext} from 'node:tls'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {compileActions} from './actions.js'
@@ -44,7 +45,21 @@ export async function startServer(sim, {port = 3939, host = '127.0.0.1', tls = n
   const plain = http.createServer(handler)
   plain.keepAliveTimeout = 65_000
   plain.on('upgrade', (req, socket, head) => upgrade(context, req, socket, head))
-  const secure = tls ? http2.createSecureServer({key: tls.key, cert: tls.cert, allowHTTP1: true}, handler) : null
+  /* SNI picks the certificate: localhost names get the browser leaf; Sanity's
+   * API hostnames (reached only via sanity-sim/register's TLS redirect) get the
+   * Node-only intercept leaf. */
+  const interceptContext = tls?.intercept ? createSecureContext(tls.intercept) : null
+  const secure = tls
+    ? http2.createSecureServer(
+        {
+          key: tls.key,
+          cert: tls.cert,
+          allowHTTP1: true,
+          SNICallback: (servername, callback) => callback(null, interceptContext && /(^|\.)sanity\.io$/.test(servername) ? interceptContext : null),
+        },
+        handler,
+      )
+    : null
   secure?.on('upgrade', (req, socket, head) => upgrade(context, req, socket, head))
   secure?.on('sessionError', () => {})
 
