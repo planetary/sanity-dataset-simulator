@@ -39,7 +39,12 @@ export function ensureTls({hostnames}) {
     'nameConstraints=critical,permitted;DNS:localhost,permitted;DNS:.localhost,permitted;IP:127.0.0.0/255.0.0.0,permitted;IP:0:0:0:0:0:0:0:1/FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF',
   ])
   const intercept = ensureCa(dir, 'intercept-ca', `sanity-sim Node-only CA (do not trust)`, [])
-  const names = [...new Set(['localhost', '*.localhost', ...hostnames])]
+  /*
+   * Exact names only: Firefox (mozilla::pkix) rejects a wildcard over a single
+   * label such as `*.localhost` as malformed when the issuer has name
+   * constraints, failing the whole certificate with SEC_ERROR_BAD_DER.
+   */
+  const names = [...new Set(['localhost', ...hostnames])]
   const leaf = ensureLeaf(dir, 'leaf', browser, names, ['IP:127.0.0.1', 'IP:::1'])
   const interceptLeaf = ensureLeaf(dir, 'intercept-leaf', intercept, INTERCEPT_NAMES, [])
   const bundle = path.join(dir, 'node-ca-bundle.pem')
@@ -103,8 +108,10 @@ function leafCovers(file, names, caFile) {
     const cert = new X509Certificate(fs.readFileSync(file))
     if (!cert.checkIssued(new X509Certificate(fs.readFileSync(caFile)))) return false
     if (new Date(cert.validTo).getTime() < Date.now() + 7 * 864e5) return false
-    const san = cert.subjectAltName ?? ''
-    return names.every((name) => san.includes(`DNS:${name}`))
+    const dns = (cert.subjectAltName ?? '').split(', ').filter((entry) => entry.startsWith('DNS:')).map((entry) => entry.slice(4))
+    /* Leaves from earlier versions carried `*.localhost`, which Firefox refuses. */
+    if (dns.some((name) => name.startsWith('*.'))) return false
+    return names.every((name) => dns.includes(name))
   } catch {
     return false
   }
