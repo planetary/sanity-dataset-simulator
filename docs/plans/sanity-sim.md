@@ -240,14 +240,33 @@ The work goes in a new package, `packages/sanity-sim` (server + CLI + register h
 | Phase | Scope | Exit criterion |
 |---|---|---|
 | **0. Spike** ✅ 2026-10-28, [Phase 0](evidence/sanity-sim-phase-0/request-inventory.md) | Upgrade the example to `sanity@6.20` / `@sanity/client@8`, point it at the current origin with only `apiHost`, and record every request Studio 6.20 makes on boot, edit, publish and releases. Measure concurrent listeners. Check the Access API. Check groq-js on `releases::all`, `versionOf`, `text::query` | A request inventory, and an h1-vs-h2 decision |
-| **1. Core server** | Promote the origin into `sanity-sim` as a proper TS package. Perspectives (Q1, Q2), `syncTags`, mutate options (W1), `_rev` locking, filtered listen with mendoza effects (R1–R3), document + version actions (W2), Access API (S1), the apicdn host, multi-dataset, NDJSON store, import/export | Unmodified Studio 6.20 can create, edit, publish and unpublish with history; `@sanity/client@8` passes a contract suite run against both the sim and a real dataset (read-only) |
-| **2. One command** | Detection, init and seeding, the child-process runner, the `register` hook, the Studio wrapper codemod, and `eject` | `npx sanity-sim` in a fresh `npm create sanity@latest` + next-sanity template works with zero manual steps |
-| **3. Dashboard** | §4.5 | Every dashboard edit shows up live in Studio, and the other way round |
-| **3b. Sync** | §4.4: credential detection, Export pull into a remote snapshot, the layered corpus, `baseRev` stale detection, the dashboard sync and stale views, follow mode | Sync a real dataset (read-only, network monitor green), edit in Studio, re-sync after a remote change, see the doc flagged stale, resolve it all three ways |
-| **4. Fidelity** | Assets and image CDN (A1–A3), Live Content API (R4), history (D2), releases and the scheduler (W3, W4), the Bifur stub, the comments add-on dataset, `resultSourceMap` | Presentation tool + `<SanityLive>` work in the next-sanity template |
-| **5. Ship** | npm publish, browser e2e in CI against the template projects, and a compatibility matrix in the README tracking Studio and client versions | `npx sanity-sim@latest` from the registry |
+| **1. Core server** ✅ `a1d705b` | Promote the origin into `sanity-sim` as a proper package (built as plain ESM, no TS, so `npx` needs no build). Perspectives (Q1, Q2), `syncTags`, mutate options (W1), `_rev` locking, filtered listen with mendoza effects (R1–R3), document + version actions (W2), Access API (S1), the apicdn host, multi-dataset, NDJSON store, import/export | Unmodified Studio 6.20 can create, edit, publish and unpublish with history; `@sanity/client@8` passes a contract suite run against both the sim and a real dataset (read-only) |
+| **2. One command** ✅ `777dc00` | Detection, init and seeding, the child-process runner, the `register` hook, the Studio wrapper codemod, and `eject` | `npx sanity-sim` in a fresh `npm create sanity@latest` + next-sanity template works with zero manual steps |
+| **3. Dashboard** ✅ `9bc268c` | §4.5 | Every dashboard edit shows up live in Studio, and the other way round |
+| **3b. Sync** ✅ `d09f4d1` | §4.4: credential detection, Export pull into a remote snapshot, the layered corpus, `baseRev` stale detection, the dashboard sync and stale views, follow mode | Sync a real dataset (read-only, network monitor green), edit in Studio, re-sync after a remote change, see the doc flagged stale, resolve it all three ways |
+| **4. Fidelity** ✅ `2d102bf` (comments/tasks add-on datasets deferred) | Assets and image CDN (A1–A3), Live Content API (R4), history (D2), releases and the scheduler (W3, W4), the Bifur stub, the comments add-on dataset, `resultSourceMap` | Presentation tool + `<SanityLive>` work in the next-sanity template |
+| **5. Ship** ✅ except publishing (see §7) | npm publish, browser e2e in CI against the template projects, and a compatibility matrix in the README tracking Studio and client versions | `npx sanity-sim@latest` from the registry |
 
-## 6. Open decisions
+## 6. What building it taught us (Phases 1–5)
+
+Beyond the [Phase 0 inventory](evidence/sanity-sim-phase-0/request-inventory.md), each of these was found by driving a stock Studio 6.20 and a Next 16 app against the simulator:
+
+- **Studio's document lists use `text::query()`**, even unfiltered (groq2024 search, with `$__query = "*"`). groq-js can't evaluate it, so it is resolved ahead of evaluation (exact for `*`, prefix-token matching otherwise). It went from a "P1 GROQ function" to a hard requirement.
+- **Releases are gated on `/features`**, which must list `contentReleases` (and `singleDocRelease` for scheduled drafts). An empty list renders a blank Releases tool.
+- **New Studio endpoints** not in any doc: `/projects/{id}/new-content-release-allowed` (release limits, read as `data.*`) and `/subscriptions/project/{id}` (`plan.name`). `?datasetProfile=comments&addonFor=<ds>` must answer `[]`, or Studio takes the main dataset for its comments add-on.
+- **The history panel is built from `/data/history/{ds}/events/documents/{id}`**, with typed lifecycle events (`createDocumentVersion`, `publishDocumentVersion`, …); edits inside a version are synthesized client-side from the translog. With empty events, the inspector crashes.
+- **`@sanity/client` 8 doesn't go through global `fetch` or `http(s)` in Node**: get-it bundles npm `undici` with its own dispatcher. Zero-code interception therefore happens at `tls.connect`, with a Node-only CA for Sanity's hostnames. The browser CA is name-constrained to localhost names.
+- **Studio's Sentry feedback tunnel** (`https://api.sanity.io/vX/intake/feedback`) is hardcoded and ignores `apiHost`. It carries no document content, and it is documented as a known limitation.
+- **Tokens must be pinned to `*.sanity.io`.** The first version would have sent a `sanity login` token to whatever upstream it was pointed at.
+
+## 7. Not done
+
+- **Publishing to npm.** The package packs (73 kB, 31 files) and runs from the tarball via `npx --package=<tgz> sanity-sim`, but publishing needs two decisions from the owner: a **license** (the repo has none) and the npm account to publish from.
+- **Comments and Tasks.** They need add-on datasets; the features are reported off.
+- **Browser e2e in CI.** The Studio and Next checks in this phase were run locally with Playwright (`examples/sim-spike/drive.mjs`). The new `sanity-sim` CI job runs the node suite only, and the workflow is still manual-only by owner decision.
+- **Cursor stability.** One typing run into the embedded Next Studio landed text 5 characters early. Four targeted repeats against standalone Studio, at 10–60 ms per keystroke, were exact. It is recorded as unreproduced.
+
+## 8. Open decisions
 
 1. **What happens to the overlay?** **Decided 2026-10-28:** it is replaced by sync plus a document-level local layer inside the sim (§4.4). The overlay's Studio plugin, query registry, proxy mode and field-level intent are retired. `sanity-overlay-core` is kept for the mutation engine and for the three-way merge behind the "Merge" button.
 2. **Should `.sanity-sim/` be committed by default?** Committing it gives shared fixture content and reviewable diffs. Gitignoring it gives personal scratch data. **Recommendation: commit documents, gitignore assets over 1 MB and the cache, and ask on init.**

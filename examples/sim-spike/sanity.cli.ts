@@ -1,8 +1,4 @@
 import {defineCliConfig} from 'sanity/cli'
 
-export default defineCliConfig({
-  api: {
-    projectId: process.env.SANITY_STUDIO_PROJECT_ID ?? 'b1n03q3z',
-    dataset: process.env.SANITY_STUDIO_DATASET ?? 'parity',
-  },
-})
+/* Literal identity: this spike points at a simulator, never at a real project. */
+export default defineCliConfig({api: {projectId: 'b1n03q3z', dataset: 'parity'}})

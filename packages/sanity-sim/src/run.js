@@ -9,6 +9,7 @@ const RESET = '\x1b[0m'
  */
 export function runDevTargets(targets, {packageManager, env, color = process.stdout.isTTY}) {
   const children = []
+  let stopping = false
   targets.forEach((target, index) => {
     const label = targets.length > 1 ? `[${pathLabel(target.dir)}] ` : ''
     const prefix = color && label ? `${COLORS[index % COLORS.length]}${label}${RESET}` : label
@@ -24,18 +25,21 @@ export function runDevTargets(targets, {packageManager, env, color = process.std
         pending += chunk.toString()
         const lines = pending.split('\n')
         pending = lines.pop()
+        /* After Ctrl-C, the package manager's "command failed" epilogue is noise. */
+        if (stopping) return
         for (const line of lines) out.write(`${prefix}${line}\n`)
       })
-      stream.on('end', () => pending && out.write(`${prefix}${pending}\n`))
+      stream.on('end', () => pending && !stopping && out.write(`${prefix}${pending}\n`))
     }
     pipe(child.stdout, process.stdout)
     pipe(child.stderr, process.stderr)
     child.on('exit', (code, signal) => {
-      if (signal !== 'SIGTERM' && signal !== 'SIGINT') process.stdout.write(`${prefix}exited with ${signal ?? code}\n`)
+      if (!stopping) process.stdout.write(`${prefix}exited with ${signal ?? code}\n`)
     })
     children.push(child)
   })
   return () => {
+    stopping = true
     for (const child of children) if (child.exitCode === null) child.kill('SIGTERM')
   }
 }

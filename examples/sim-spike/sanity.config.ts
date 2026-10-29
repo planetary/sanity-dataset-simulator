@@ -14,8 +14,8 @@ const apiHost = process.env.SANITY_STUDIO_API_HOST
 export default defineConfig({
   name: 'default',
   title: 'sim-spike',
-  projectId: process.env.SANITY_STUDIO_PROJECT_ID ?? 'b1n03q3z',
-  dataset: process.env.SANITY_STUDIO_DATASET ?? 'parity',
+  projectId: 'b1n03q3z',
+  dataset: 'parity',
   ...(apiHost ? {apiHost} : {}),
   plugins: [structureTool(), visionTool()],
   schema: {types: schemaTypes},

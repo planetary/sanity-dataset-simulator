@@ -40,6 +40,7 @@ Options
   --no-wire           Do not edit sanity.config / createClient files
   --sync              Pull from the real dataset before starting
   --follow            Keep the synced snapshot live (read-only listener on the real dataset)
+  --types <a,b>       Only sync these document types (large datasets)
   --seed <file>       Import this file when the dataset is empty
   --http              Serve plain HTTP only (no TLS; Studio stalls past six listeners)
   --origin <url>      Allow a non-loopback browser origin
@@ -98,7 +99,7 @@ async function dev(root, project, flags, {runDev}) {
       flags.sync = true
     }
   }
-  const source = syncSource(sim, project, datasetName)
+  const source = withTypes(syncSource(sim, project, datasetName), flags)
   if (flags.sync) {
     if (!source) log('warn', 'no Sanity project detected to sync from; starting with local data only')
     else await pull(sim, datasetName, source, log)
@@ -200,7 +201,7 @@ function banner({sim, project, root, server, tls, datasetName, wired, runDev}) {
 async function syncOnce(root, project, flags) {
   const sim = openSim(root, project, flags)
   const datasetName = flags.dataset ?? sim.config.defaultDataset
-  const source = syncSource(sim, project, datasetName)
+  const source = withTypes(syncSource(sim, project, datasetName), flags)
   if (!source) throw new UsageError('No Sanity project found to sync from. Pass --project <id> (and --dataset), or run in a folder with a sanity.config / .env.')
   await pull(sim, datasetName, source, logger())
   sim.close()
@@ -217,6 +218,11 @@ function syncSource(sim, project, datasetName) {
   const projectId = configured?.projectId ?? project.projectId ?? sim.projectId
   if (!projectId || projectId === 'simlocal') return null
   return {projectId, dataset: configured?.dataset ?? project.dataset ?? datasetName, token: findToken(project), types: configured?.types ?? undefined}
+}
+
+function withTypes(source, flags) {
+  if (!source || !flags.types) return source
+  return {...source, types: String(flags.types).split(',').map((type) => type.trim()).filter(Boolean)}
 }
 
 function status(root, project, flags) {

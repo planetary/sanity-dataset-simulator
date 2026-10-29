@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "A local Sanity Content Lake simulator. Run `npx sanity-sim` in a project: Studio and your app work against local data, with a dashboard at the server root.",
   "type": "module",
-  "license": "MIT",
   "bin": {
     "sanity-sim": "./bin/sanity-sim.js"
   },
@@ -34,7 +33,7 @@
   ],
   "dependencies": {
     "@sanity/mutator": "6.20.0",
-    "groq-js": "2.0.1"
+    "groq-js": "2.0.0"
   },
   "optionalDependencies": {
     "sharp": "0.35.5"

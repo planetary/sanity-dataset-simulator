@@ -159,6 +159,32 @@ jobs:
           --allow-skip test/hosted-parity.test.ts
 
   # ---------------------------------------------------------------------------
+  # sanity-sim
+  #
+  # The local Content Lake simulator (packages/sanity-sim). Plain ESM with
+  # node:test, so it runs with the repo's pinned Node and nothing else. Its sync
+  # suite proves every upstream call is a GET by syncing from a second local
+  # simulator, so no network or credentials are needed here either.
+  sanity-sim:
+    name: sanity-sim (node ${{ matrix.node }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['22.22.2', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter sanity-sim test
+
+  # ---------------------------------------------------------------------------
   # repo-gates
   #
   # Repository-level invariants that no unit test can see, because each one is
@@ -513,6 +539,11 @@ jobs:
   #                            examples/kitchen-sink, plus the studio groq-js
   #                            error above reached through a relative import.
   #                            Add this project once those land.
+  #
+  #   sanity-sim               Plain ESM JavaScript by design (no build step, so
+  #                            `npx sanity-sim` runs the published files as-is).
+  #                            Nothing to typecheck; the `sanity-sim` job above
+  #                            runs its node:test suite instead.
   #
   # The exclusion list is not free-form: the set of packages named below is
   # pinned in test/repo-manifests.test.ts ("the typecheck gate covers every
