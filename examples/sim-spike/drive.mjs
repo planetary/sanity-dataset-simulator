@@ -85,7 +85,7 @@ await run('create-author', async () => {
 })
 
 await run('upload-image', async () => {
-  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP4z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==', 'base64')
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEklEQVQImWM4ISd3Qk6OAUIBAB8mBBGFRCvEAAAAAElFTkSuQmCC', 'base64')
   await page.locator('input[type="file"]').first().setInputFiles({name: 'tiny.png', mimeType: 'image/png', buffer: png}, {timeout: 10000})
   await page.waitForTimeout(5000)
 })

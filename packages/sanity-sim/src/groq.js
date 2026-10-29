@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto'
 import {evaluate, parse} from 'groq-js'
 import {SimError} from './errors.js'
 import {resolvePerspective} from './perspective.js'
+import {buildSourceMap} from './sourcemap.js'
 
 /** GROQ functions groq-js 2.x does not implement; answered with a clear 400 instead of a crash. */
 const UNSUPPORTED_FUNCTIONS = ['text::semanticSimilarity', 'documents::incomingGlobalDocumentReferenceCount', 'user::attributes']
@@ -33,7 +34,7 @@ export function parseGroq(query, params) {
  * Evaluate `query` against `dataset` as seen through `perspective`.
  * Returns the Content Lake response body (minus `query` when `returnQuery` is false).
  */
-export async function runQuery({dataset, query, params = {}, perspective, projectId, returnQuery = true}) {
+export async function runQuery({dataset, query, params = {}, perspective, projectId, returnQuery = true, resultSourceMap = false}) {
   for (const name of UNSUPPORTED_FUNCTIONS) {
     if (query.includes(name)) {
       throw new SimError(400, 'queryParseError', `${name}() is not supported by sanity-sim (groq-js does not implement it)`, {query})
@@ -57,6 +58,7 @@ export async function runQuery({dataset, query, params = {}, perspective, projec
   const body = {ms: Math.round(performance.now() - started), result, syncTags: [syncTagFor(dataset.name)]}
   if (returnQuery) body.query = query
   if (approximations.length > 0) body.simApproximations = approximations
+  if (resultSourceMap) body.resultSourceMap = buildSourceMap(result, documents)
   return body
 }
 

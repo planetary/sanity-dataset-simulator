@@ -59,6 +59,21 @@ describe('@sanity/client 8 contract', () => {
     assert.ok(response.syncTags.length > 0)
   })
 
+  it('returns content source maps that stega can encode', async () => {
+    await client.createOrReplace({_id: 'csm', _type: 'movie', title: 'Solaris', crew: [{_key: 'k1', name: 'Tarkovsky'}]})
+    const {result, resultSourceMap} = await client.fetch('*[_id == "csm"][0]{_id, title, "director": crew[0].name}', {}, {filterResponse: false, resultSourceMap: true})
+    assert.equal(result.title, 'Solaris')
+    const titleMapping = resultSourceMap.mappings["$['title']"]
+    assert.equal(resultSourceMap.paths[titleMapping.source.path], "$['title']")
+    assert.equal(resultSourceMap.documents[titleMapping.source.document]._id, 'csm')
+    const directorPath = resultSourceMap.paths[resultSourceMap.mappings["$['director']"].source.path]
+    assert.equal(directorPath, "$['crew'][?(@._key=='k1')]['name']")
+    const {stegaEncodeSourceMap} = await import('@sanity/client/stega')
+    const encoded = stegaEncodeSourceMap(result, resultSourceMap, {enabled: true, studioUrl: 'http://localhost:3333'})
+    assert.notEqual(encoded.title, 'Solaris', 'stega embedded invisible edit info into the string')
+    assert.ok(encoded.title.startsWith('Solaris'))
+  })
+
   it('publishes through the Actions API', async () => {
     await client.action({actionType: 'sanity.action.document.publish', draftId: 'drafts.m2', publishedId: 'm2'})
     assert.equal(await client.fetch('*[_id == "m2"][0].title'), 'Aliens (draft)')
@@ -85,12 +100,15 @@ describe('@sanity/client 8 contract', () => {
   })
 
   it('uploads assets and serves them back from the CDN path', async () => {
-    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP4z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==', 'base64')
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEklEQVQImWM4ISd3Qk6OAUIBAB8mBBGFRCvEAAAAAElFTkSuQmCC', 'base64')
     const asset = await client.assets.upload('image', png, {filename: 'tiny.png'})
     assert.match(asset._id, /^image-[a-f0-9]{40}-2x2-png$/)
     assert.equal(asset.metadata.dimensions.width, 2)
     const bytes = Buffer.from(await (await fetch(asset.url.replace(/^https?:\/\/[^/]+/, sim.base))).arrayBuffer())
     assert.deepEqual(bytes, png)
+    const resized = await fetch(`${asset.url.replace(/^https?:\/\/[^/]+/, sim.base)}?w=1&fm=webp`)
+    assert.equal(resized.headers.get('content-type'), 'image/webp', 'image URL parameters are applied (sharp)')
+    assert.ok(asset.metadata.lqip?.startsWith('data:image/jpeg;base64,'))
     const again = await client.assets.upload('image', png, {filename: 'other-name.png'})
     assert.equal(again._id, asset._id, 'identical bytes are deduplicated')
   })

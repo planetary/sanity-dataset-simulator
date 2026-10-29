@@ -189,7 +189,9 @@ export async function transformImage(file, searchParams, accept = '') {
     image = image.toFormat(meta.format, {quality})
   }
   const {data, info} = await image.toBuffer({resolveWithObject: true})
-  return {bytes: data, contentType: `image/${info.format === 'jpeg' ? 'jpeg' : info.format}`}
+  /* sharp names AVIF output by its container, `heif`. */
+  const outputFormat = info.format === 'heif' ? 'avif' : info.format
+  return {bytes: data, contentType: `image/${outputFormat}`}
 }
 
 async function lqipFor(bytes) {

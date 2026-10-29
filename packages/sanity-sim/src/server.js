@@ -332,7 +332,7 @@ async function query(context, req, res, url, dataset, apiVersion) {
   let options = url.searchParams
   if (req.method === 'POST') {
     const body = await readJsonBody(req)
-    const allowed = new Set(['query', 'params', 'returnQuery', 'perspective'])
+    const allowed = new Set(['query', 'params', 'returnQuery', 'perspective', 'resultSourceMap'])
     const unknown = Object.keys(body ?? {}).filter((key) => !allowed.has(key))
     if (unknown.length > 0) throw badRequest(`Unknown body field(s): ${unknown.join(', ')}`)
     text = body.query
@@ -361,6 +361,7 @@ async function query(context, req, res, url, dataset, apiVersion) {
     perspective,
     projectId: context.sim.projectId,
     returnQuery: options.get('returnQuery') !== 'false',
+    resultSourceMap: ['true', 'withKeyArraySelector'].includes(options.get('resultSourceMap') ?? ''),
   })
   res.setHeader('x-sanity-shard', 'sanity-sim')
   return json(res, 200, body)
