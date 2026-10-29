@@ -11,7 +11,7 @@ npx sanity-sim trust    # once: trust the local HTTPS certificate
 
 - **Package:** [`packages/sanity-sim`](packages/sanity-sim/README.md), which covers how wiring works, the dashboard, syncing, commands, the compatibility table and known limitations.
 - **Verified against:** a stock Sanity Studio 6.20 (standalone and embedded in Next.js 16), `@sanity/client` 8.13 and `next-sanity` 13.4. Covered: editing, publishing, history and review changes, uploads, search, Vision, and the full content release flow.
-- **Examples:** [`examples/sim-next`](examples/sim-next) (Next + embedded Studio) and [`examples/sim-spike`](examples/sim-spike) (standalone Studio plus the browser driver used to verify it).
+- **Examples:** [`examples/sim-next`](examples/sim-next) (Meridian: Next.js with an embedded Studio, exercising every field type) and [`examples/test-studio`](examples/test-studio) (a stock standalone Studio).
 - **Design and evidence:** [`docs/plans/sanity-sim.md`](docs/plans/sanity-sim.md) (gap analysis, design and phases) and [`docs/plans/evidence/sanity-sim-phase-0/request-inventory.md`](docs/plans/evidence/sanity-sim-phase-0/request-inventory.md) (what Studio 6.20 actually calls).
 
 `sanity-sim` never writes to Sanity. Syncing goes through a single GET-only function, and a token is only ever sent to `*.sanity.io`.
