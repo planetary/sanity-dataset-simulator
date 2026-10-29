@@ -1,0 +1,45 @@
+{
+  "name": "sanity-sim",
+  "version": "0.1.0",
+  "description": "A local Sanity Content Lake simulator. Run `npx sanity-sim` in a project: Studio and your app work against local data, with a dashboard at the server root.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "sanity-sim": "./bin/sanity-sim.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./register": "./src/register.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "src",
+    "dashboard",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
+  },
+  "keywords": [
+    "sanity",
+    "content-lake",
+    "emulator",
+    "simulator",
+    "local-development",
+    "groq"
+  ],
+  "dependencies": {
+    "@sanity/mutator": "6.20.0",
+    "groq-js": "2.0.1"
+  },
+  "optionalDependencies": {
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "@sanity/client": "8.13.0"
+  }
+}

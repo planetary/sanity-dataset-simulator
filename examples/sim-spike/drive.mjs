@@ -86,7 +86,7 @@ await run('create-author', async () => {
 
 await run('upload-image', async () => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP4z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==', 'base64')
-  await page.locator('[data-testid="field-portrait"] input[type="file"]').setInputFiles({name: 'tiny.png', mimeType: 'image/png', buffer: png}, {timeout: 10000})
+  await page.locator('input[type="file"]').first().setInputFiles({name: 'tiny.png', mimeType: 'image/png', buffer: png}, {timeout: 10000})
   await page.waitForTimeout(5000)
 })
 
@@ -106,12 +106,10 @@ await run('releases', async () => {
 })
 
 await run('create-release', async () => {
-  await page.getByRole('button', {name: /drafts/i}).first().click({timeout: 8000})
-  await page.waitForTimeout(1000)
-  await page.getByText(/new release/i).first().click({timeout: 8000})
+  await page.getByRole('button', {name: /new release|create release/i}).first().click({timeout: 8000})
   await page.waitForTimeout(1500)
   await page.keyboard.type('Phase 0 release')
-  await page.getByRole('button', {name: /create release/i}).last().click({timeout: 8000})
+  await page.getByRole('button', {name: /^create release$/i}).last().click({timeout: 8000})
   await page.waitForTimeout(5000)
 })
 
