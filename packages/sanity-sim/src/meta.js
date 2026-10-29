@@ -4,6 +4,8 @@
  * There is one local user with every grant: the simulator only listens on loopback.
  */
 
+import {ORGANIZATION_ID} from './media-library.js'
+
 export const LOCAL_USER = Object.freeze({
   id: 'local-dev',
   name: 'Local Developer',
@@ -40,7 +42,7 @@ export function projectDocument(sim) {
     id: sim.projectId,
     displayName: `${sim.projectId} (sanity-sim)`,
     studioHost: null,
-    organizationId: null,
+    organizationId: ORGANIZATION_ID,
     isBlocked: false,
     isDisabled: false,
     isDisabledByUser: false,

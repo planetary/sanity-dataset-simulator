@@ -211,7 +211,7 @@ function extensionFor(mime, filename) {
   return fromName && fromName !== filename ? fromName.toLowerCase() : 'bin'
 }
 
-function sniffMime(bytes) {
+export function sniffMime(bytes) {
   if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png'
   if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
   if (bytes.slice(0, 3).toString() === 'GIF') return 'image/gif'

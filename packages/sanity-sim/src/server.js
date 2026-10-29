@@ -15,6 +15,7 @@ import {handleAdmin} from './admin.js'
 import {documentEvents} from './events.js'
 import {LOCAL_USER, DOCUMENT_GRANTS, journeyAnswer, projectDocument, datasetDocument, roleGrants} from './meta.js'
 import {acceptWebSocket} from './websocket.js'
+import {ORGANIZATION_ID, referencesTo} from './media-library.js'
 
 const DASHBOARD_DIR = fileURLToPath(new URL('../dashboard/', import.meta.url))
 const MAX_JSON_BODY = 32 * 1024 * 1024
@@ -218,8 +219,10 @@ export function isLoopbackOrigin(origin) {
 
 async function route(context, req, res, url) {
   const {pathname} = url
+  if (pathname.startsWith('/_sim/media-library/')) return serveMediaLibraryApp(res)
   if (pathname.startsWith('/_sim/')) return handleAdmin(context, req, res, url)
   if (pathname.startsWith('/images/') || pathname.startsWith('/files/')) return serveAsset(context, req, res, url)
+  if (pathname.startsWith('/media-libraries/')) return serveLibraryAsset(context, req, res, url)
   const versioned = pathname.match(VERSIONED)
   if (!versioned) return serveDashboard(res, pathname)
 
@@ -243,7 +246,14 @@ async function route(context, req, res, url) {
       return data(context, req, res, url, rest, apiVersion)
     case 'assets':
       if (method !== 'POST') throw notImplemented(`${method} /assets`)
+      if (rest[0] === 'media-library-link') return linkLibraryAsset(context, req, res, rest[1])
       return uploadAsset(context, req, res, url, rest)
+    case 'media-libraries':
+      return mediaLibraries(context, req, res, url, rest, apiVersion)
+    case 'agent':
+      /* Studio watches the organization's Content Agent bundles once a project has an organization; there are none. */
+      if (rest[1] === 'bundles' && rest[2] === 'mine' && rest[3] === 'listen') return emptyAgentBundles(req, res)
+      throw notImplemented(`${method} /agent/{organizationId}/${rest.slice(1).join('/')}`)
     case 'socket':
       throw notImplemented('the realtime socket without a WebSocket upgrade')
     case 'journey':
@@ -461,12 +471,12 @@ async function actions(req, res, dataset) {
   return json(res, 200, {transactionId: result.transactionId})
 }
 
-function listen(context, req, res, url, dataset, requested) {
+function listen(context, req, res, url, dataset, requested, hub = context.sim.listen) {
   const options = url.searchParams
   const text = options.get('query')
   if (!text) throw badRequest('a listener needs a `query`')
   const bool = (name, fallback) => (options.has(name) ? options.get(name) === 'true' : fallback)
-  context.sim.listen.open({
+  hub.open({
     req,
     res,
     dataset,
@@ -602,7 +612,10 @@ async function serveAsset(context, req, res, url) {
     }
   }
   if (!file) throw notFound(`asset ${sha1}.${extension} is not stored locally (project ${projectId})`)
+  return sendAssetFile(req, res, url, {kind, file, sha1, extension})
+}
 
+async function sendAssetFile(req, res, url, {kind, file, sha1, extension}) {
   const headers = {'cache-control': 'public, max-age=31536000, immutable', 'access-control-allow-origin': '*'}
   if (url.searchParams.has('dl')) {
     headers['content-disposition'] = `attachment; filename="${url.searchParams.get('dl') || `${sha1}.${extension}`}"`
@@ -618,6 +631,108 @@ async function serveAsset(context, req, res, url) {
   }
   res.writeHead(200, {...headers, 'content-type': mimeForExtension(extension)})
   fs.createReadStream(file).pipe(res)
+}
+
+/* ================================================================ media library */
+
+/**
+ * Media Library API: the library list and lookup Studio uses to find its
+ * library, the library's own document store (query, doc, mutate, actions,
+ * listen), uploads, video playback info and reverse references. Libraries are
+ * shared by every project here, as they are by an organization's projects.
+ */
+async function mediaLibraries(context, req, res, url, rest, apiVersion) {
+  const registry = context.sim.mediaLibraries
+  const [libraryId, operation, ...tail] = rest
+  if (libraryId === undefined) {
+    const organizationId = url.searchParams.get('organizationId')
+    if (organizationId && organizationId !== ORGANIZATION_ID) return json(res, 200, {data: []})
+    return json(res, 200, {data: registry.all().map((library) => library.describe())})
+  }
+  const library = registry.get(libraryId)
+  if (!library) throw notFound(`Media library "${libraryId}" not found (library ids start with "ml")`)
+  const {store} = library
+  switch (operation) {
+    case undefined:
+      return json(res, 200, library.describe())
+    case 'query':
+      return query(context, req, res, url, store, apiVersion)
+    case 'doc':
+      return doc(res, url, store, tail)
+    case 'mutate':
+      return mutate(context, req, res, url, store)
+    case 'actions':
+      return actions(req, res, store)
+    case 'listen':
+      return listen(context, req, res, url, store, store.name, registry.listen)
+    case 'upload': {
+      if (req.method !== 'POST') throw notImplemented(`${req.method} /media-libraries/{id}/upload`)
+      const result = await library.upload({
+        bytes: await readBody(req, MAX_ASSET_BODY),
+        contentType: req.headers['content-type'],
+        filename: url.searchParams.get('filename') ?? undefined,
+        title: url.searchParams.get('title') ?? undefined,
+        publicBase: context.publicBase,
+      })
+      const uploadSession = {id: result.assetInstance._id, status: result.alreadyExists ? 'alreadyExists' : 'complete'}
+      return json(res, 200, {asset: result.asset, assetInstance: result.assetInstance, uploadSession})
+    }
+    case 'video':
+      if (tail[1] === 'playback-info') return json(res, 200, library.playbackInfo(tail[0]))
+      break
+    case 'references':
+      if (tail[0] === 'documents' && tail[2] === 'to') {
+        const container = store.get(tail[1])
+        const ids = [tail[1], ...(container?.versions ?? []).map((version) => version.instance?._ref).filter(Boolean)]
+        return json(res, 200, referencesTo(context.sim.projects.all(), libraryId, ids))
+      }
+      break
+  }
+  throw notImplemented(`${req.method} /media-libraries/{id}/${[operation, ...tail].join('/')}`)
+}
+
+/** An open SSE stream reporting no agent bundles (event `bundles`), with keep-alive comments. */
+function emptyAgentBundles(req, res) {
+  res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive'})
+  res.write(`event: bundles\ndata: ${JSON.stringify({bundles: []})}\n\n`)
+  const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15_000)
+  req.on('close', () => clearInterval(keepAlive))
+}
+
+/** `POST /assets/media-library-link/<dataset>`: put a library asset into a dataset. */
+async function linkLibraryAsset(context, req, res, datasetName) {
+  const dataset = context.sim.dataset(datasetName)
+  if (!dataset) throw notFound(`Dataset "${datasetName}" not found`)
+  const body = await readJsonBody(req)
+  const library = context.sim.mediaLibraries.get(body?.mediaLibraryId, {create: false})
+  if (!library) throw notFound(`Media library "${body?.mediaLibraryId}" not found`)
+  const document = await library.linkInto(dataset, {
+    assetInstanceId: body.assetInstanceId,
+    assetId: body.assetId,
+    projectId: context.sim.projectId,
+    publicBase: context.publicBase,
+  })
+  return json(res, 200, {document})
+}
+
+const LIBRARY_ASSET_PATH = /^\/media-libraries\/([^/]+)\/(images|files)\/([a-f0-9]{40})(?:-(\d+)x(\d+))?\.([a-z0-9]+)(?:\/.*)?$/i
+
+/** The library's CDN path, which `@sanity/image-url` builds for a Media Library client. */
+async function serveLibraryAsset(context, req, res, url) {
+  const match = url.pathname.match(LIBRARY_ASSET_PATH)
+  if (!match) throw notFound('unknown media library asset path')
+  const [, , kind, sha1, , , extension] = match
+  const file = context.sim.assets.locate(sha1, extension)
+  if (!file) throw notFound(`asset ${sha1}.${extension} is not stored locally`)
+  return sendAssetFile(req, res, url, {kind, file, sha1, extension})
+}
+
+const MEDIA_LIBRARY_APP = path.join(DASHBOARD_DIR, 'media-library.html')
+
+/** The local stand-in for media.sanity.io that Studio frames as its picker and uploader. */
+function serveMediaLibraryApp(res) {
+  res.writeHead(200, {'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store'})
+  fs.createReadStream(MEDIA_LIBRARY_APP).pipe(res)
 }
 
 /* ================================================================ dashboard */

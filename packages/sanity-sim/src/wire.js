@@ -19,22 +19,39 @@ const CONST_NAME = '__sanitySimConfig'
 
 /* ------------------------------------------------------------------ Studio */
 
+/** Where Studio frames its Media Library picker: sanity-sim's local stand-in for media.sanity.io. */
+export const MEDIA_LIBRARY_APP_PATH = '/_sim/media-library'
+
 function studioHelper(typescript) {
   const signature = typescript ? 'function withSanitySim<T>(config: T): T' : 'function withSanitySim(config)'
   const host = `process.env.${STUDIO_ENV} ?? process.env.${NEXT_ENV}`
-  const spread = typescript ? '{...(config as object), apiHost}' : '{...config, apiHost}'
+  const param = typescript ? '(workspace: any)' : '(workspace)'
   const cast = typescript ? ' as T' : ''
-  return [
+  const lines = [
     `// ${STUDIO_MARK} Points this Studio at a local sanity-sim while \`npx sanity-sim\` runs; inert otherwise.`,
     '// Remove with `npx sanity-sim eject`.',
     `${signature} {`,
     `  const apiHost = ${host}`,
     '  if (!apiHost) return config',
-    `  return (Array.isArray(config) ? config.map((workspace) => ({...workspace, apiHost})) : ${spread})${cast}`,
+    '  // Media Library: frame sanity-sim\'s local picker instead of media.sanity.io.',
+  ]
+  if (typescript) lines.push('  // eslint-disable-next-line @typescript-eslint/no-explicit-any')
+  lines.push(
+    `  const point = ${param} => ({`,
+    '    ...workspace,',
+    '    apiHost,',
+    '    ...(workspace?.mediaLibrary?.enabled',
+    `      ? {mediaLibrary: {...workspace.mediaLibrary, __internal: {...workspace.mediaLibrary.__internal, frontendHost: \`\${apiHost}${MEDIA_LIBRARY_APP_PATH}\`}}}`,
+    '      : {}),',
+    '  })',
+    `  return (Array.isArray(config) ? config.map(point) : point(config))${cast}`,
     '}',
     `// </sanity-sim>`,
-  ].join('\n')
+  )
+  return lines.join('\n')
 }
+
+const HELPER_BLOCK = /\/\/ <sanity-sim> Points this Studio[\s\S]*?\/\/ <\/sanity-sim>/
 
 export function isStudioWired(file) {
   return fs.readFileSync(file, 'utf8').includes(STUDIO_MARK)
@@ -43,7 +60,17 @@ export function isStudioWired(file) {
 /** Wrap the config's default export. Returns a description of the change, or why not. */
 export function wireStudio(file) {
   const text = fs.readFileSync(file, 'utf8')
-  if (text.includes(STUDIO_MARK)) return {changed: false, reason: 'already wired'}
+  if (text.includes(STUDIO_MARK)) {
+    /* Wired by an earlier sanity-sim: bring the helper up to date in place. */
+    const typescript = /\.tsx?$/.test(file)
+    const current = studioHelper(typescript)
+    const existing = text.match(HELPER_BLOCK)?.[0]
+    if (existing && existing !== current) {
+      fs.writeFileSync(file, text.replace(HELPER_BLOCK, () => current))
+      return {changed: true, updated: true}
+    }
+    return {changed: false, reason: 'already wired'}
+  }
   const match = text.match(/^export default (?!function\b|class\b|async\b)/m)
   if (!match) return {changed: false, reason: 'no `export default <expression>` found; add `apiHost: process.env.SANITY_STUDIO_SIM_API_HOST` to your config by hand'}
   const typescript = /\.tsx?$/.test(file)

@@ -94,6 +94,17 @@ A **link** is a name, here `production`, that resolves to a stored dataset. Ever
 
 If the name you link already holds documents, they are kept as a stored dataset named `<name>-original`, so nothing is lost, and `npx sanity-sim unlink <name>` puts them back under the name. The same controls are on the dashboard's **Datasets** page, and the dataset picker shows links as `production → test-1`. Links live in `.sanity-sim/config.json`.
 
+## Media Library
+
+Studios with `mediaLibrary: {enabled: true}` work against a local **Media Library**: an asset library shared by every project in the folder, as a real one is shared by an organization's projects. Pick images and files from it in Studio, upload to it (from the picker or by dropping files on a field), and open an asset in it from the field's menu.
+
+- **The picker.** Studio normally frames the hosted app at media.sanity.io. While `npx sanity-sim` runs, the Studio wiring points `mediaLibrary.__internal.frontendHost` at a small local picker served by the simulator, which speaks the same messages. Workspaces without Media Library are left alone.
+- **Linking.** Choosing an asset links it into the dataset, as Content Lake does: an ordinary `sanity.imageAsset`/`sanity.fileAsset` document is created with `source.name: "sanity-media-library"` and a `media` reference back to the library, and the field gets Studio's usual `asset` reference plus a weak `media` global document reference. Front-ends resolve it with plain GROQ, and the image is served from the dataset's usual path.
+- **The API.** Library lookup and listing, the library's own `query`/`doc`/`mutate`/`actions`/`listen`, `upload`, usage (`references/documents/<id>/to`), video `playback-info`, and the library CDN path `@sanity/image-url` builds for a Media Library client. The default library is `mlsimlocal`; a `libraryId` set in your Studio config is created locally on first use, so references keep their ids.
+- **Not simulated.** Video playback (Studio plays through Mux on a fixed host, so stored videos have no working player), aspects and asset editing in the picker, private-asset signed URLs, and syncing a real Media Library's contents.
+
+Libraries live in `.sanity-sim/media-libraries/<id>/`, in the same files as a dataset.
+
 ## Syncing a real dataset
 
 ```bash
@@ -119,6 +130,7 @@ When the real dataset changes under a document you've edited, the document is fl
   datasets/<name>/remote.ndjson       synced snapshot (gitignored)
   datasets/<name>/transactions.ndjson local history with mendoza effects (gitignored)
   assets/                             uploaded files by sha1
+  media-libraries/<id>/               the local Media Library's containers and versions (commit)
   .cache/                             synced assets fetched from Sanity's CDN (gitignored)
 ```
 
@@ -165,7 +177,8 @@ Verified against **Sanity Studio 6.20**, **@sanity/client 8.13**, **next-sanity 
 | Studio boot: users, projects, datasets, grants, ACL, features, release limits, key-value settings | ✅ one local user with every grant |
 | Presence (Bifur websocket) | ⚠️ accepted and answered; single-user, so no presence |
 | Comments and Tasks (add-on datasets) | ✗ features reported off |
-| Agent Actions, Canvas, Media Library, Functions, embeddings | ✗ clear 501, listed on the Connections page |
+| Media Library: library lookup, picker and uploads in Studio, linking into datasets, library GROQ/doc/mutate/listen, usage, CDN path | ✅ local picker in place of media.sanity.io; video stored but not playable (see [Media Library](#media-library)) |
+| Agent Actions, Canvas, Functions, embeddings | ✗ clear 501, listed on the Connections page |
 
 ## Known limitations
 

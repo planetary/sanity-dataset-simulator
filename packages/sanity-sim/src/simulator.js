@@ -8,8 +8,10 @@ import {RELEASES_PREFIX} from './ids.js'
 import {SimError, badRequest} from './errors.js'
 import {syncTagFor} from './groq.js'
 import {ListenHub, LiveHub} from './listen.js'
+import {MediaLibraries} from './media-library.js'
 
 const DATASET_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const GITIGNORED = ['.cache/', 'datasets/*/remote.ndjson', 'datasets/*/remote.json', 'datasets/*/transactions.ndjson', 'media-libraries/*/transactions.ndjson', 'keyvalue.json', 'server.json']
 export const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 /**
@@ -49,6 +51,13 @@ export class Simulator {
     return this.config.projectId
   }
 
+  /** Media Libraries belong to the organization, so every project here shares the main project's. */
+  get mediaLibraries() {
+    if (this.primary) return this.primary.mediaLibraries
+    this.libraryRegistry ??= new MediaLibraries({dir: path.join(this.dir, 'media-libraries'), assets: this.assets, persist: this.persist, log: (...args) => this.log(...args)})
+    return this.libraryRegistry
+  }
+
   /** Every project in this folder, created on first use like datasets. */
   get projects() {
     if (this.primary) return this.primary.projects
@@ -62,12 +71,12 @@ export class Simulator {
     writeJsonAtomic(path.join(this.dir, 'config.json'), this.config)
     const gitignore = path.join(this.dir, '.gitignore')
     if (!fs.existsSync(gitignore)) {
-      fs.writeFileSync(
-        gitignore,
-        '# sanity-sim: commit your local content, not caches.\n.cache/\ndatasets/*/remote.ndjson\ndatasets/*/remote.json\ndatasets/*/transactions.ndjson\nkeyvalue.json\nserver.json\n',
-      )
-    } else if (!fs.readFileSync(gitignore, 'utf8').includes('server.json')) {
-      fs.appendFileSync(gitignore, 'server.json\n')
+      fs.writeFileSync(gitignore, `# sanity-sim: commit your local content, not caches.\n${GITIGNORED.join('\n')}\n`)
+    } else {
+      /* Folders made by an earlier sanity-sim get the patterns added since. */
+      const present = new Set(fs.readFileSync(gitignore, 'utf8').split('\n'))
+      const missing = GITIGNORED.filter((pattern) => !present.has(pattern))
+      if (missing.length > 0) fs.appendFileSync(gitignore, `${missing.join('\n')}\n`)
     }
   }
 
@@ -255,6 +264,7 @@ export class Simulator {
   close() {
     if (this.scheduler) clearInterval(this.scheduler)
     for (const dataset of this.datasets.values()) dataset.flush()
+    this.libraryRegistry?.flush()
     this.registry?.closeOthers()
   }
 }
