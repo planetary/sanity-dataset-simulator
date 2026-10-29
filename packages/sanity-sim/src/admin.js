@@ -122,6 +122,8 @@ function status(context) {
   const {sim} = context
   return {
     projectId: sim.projectId,
+    /* Every project in the folder; the dashboard scopes its calls with ?project=. */
+    projects: sim.projects.all().map((project) => ({projectId: project.projectId, main: !project.primary, datasets: project.datasetNames().length})),
     root: sim.root,
     defaultDataset: sim.config.defaultDataset,
     datasets: sim.datasetNames().map((name) => summary(sim.dataset(name), sim)),

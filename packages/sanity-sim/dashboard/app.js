@@ -1,7 +1,7 @@
 /* sanity-sim dashboard. No build step: plain ES modules, DOM built with h(). */
 
 const API_VERSION = 'v2025-02-19'
-const state = {status: null, dataset: null, live: false}
+const state = {status: null, project: null, dataset: null, live: false}
 
 /* ------------------------------------------------------------------ tiny DOM helpers */
 
@@ -47,10 +47,10 @@ const ago = (iso) => {
 
 /* ------------------------------------------------------------------ API */
 
-async function call(path, {method = 'GET', body, raw} = {}) {
+async function call(path, {method = 'GET', body, raw, headers = {}} = {}) {
   const response = await fetch(path, {
     method,
-    headers: raw ? {} : body !== undefined ? {'content-type': 'application/json'} : {},
+    headers: {...headers, ...(raw ? {} : body !== undefined ? {'content-type': 'application/json'} : {})},
     body: raw ?? (body !== undefined ? JSON.stringify(body) : undefined),
   })
   const text = await response.text()
@@ -59,9 +59,11 @@ async function call(path, {method = 'GET', body, raw} = {}) {
   return data
 }
 
-const admin = (path, options) => call(`/_sim${path}`, options)
+/* Dashboard calls are for the chosen project; the main project needs no parameter. */
+const withProject = (path) => (state.project ? `${path}${path.includes('?') ? '&' : '?'}project=${encodeURIComponent(state.project)}` : path)
+const admin = (path, options) => call(withProject(`/_sim${path}`), options)
 const ds = () => encodeURIComponent(state.dataset)
-const api = (path, options) => call(`/${API_VERSION}${path}`, options)
+const api = (path, options) => call(`/${API_VERSION}${path}`, {...options, headers: state.project ? {'x-sanity-sim-project': state.project} : {}})
 
 async function query(groq, {perspective = 'raw', params = {}} = {}) {
   const search = new URLSearchParams({query: groq, perspective, tag: 'sanity-sim.dashboard'})
@@ -95,7 +97,14 @@ function go(page, params = {}) {
 }
 
 async function refreshStatus() {
-  state.status = await admin('/status')
+  try {
+    state.status = await admin('/status')
+  } catch (error) {
+    /* A remembered project that no longer exists: fall back to the main one. */
+    if (!state.project) throw error
+    state.project = null
+    state.status = await admin('/status')
+  }
   if (!state.dataset || !knownName(state.dataset)) {
     const remembered = safeStorage('get', 'sanity-sim.dataset')
     state.dataset = knownName(remembered) ? remembered : state.status.defaultDataset
@@ -135,11 +144,32 @@ async function render() {
       : null,
     h('optgroup', {label: 'Datasets'}, state.status.datasets.map((d) => h('option', {value: d.name, selected: d.name === state.dataset}, d.name))),
   )
+  const projects = state.status.projects ?? []
+  const projectPicker =
+    projects.length > 1
+      ? h(
+          'select',
+          {
+            'aria-label': 'Project',
+            class: 'mono',
+            onchange: async (event) => {
+              const main = projects.find((p) => p.main)?.projectId
+              state.project = event.target.value === main ? null : event.target.value
+              safeStorage('set', 'sanity-sim.project', state.project ?? '')
+              state.dataset = null
+              await refreshStatus()
+              render()
+              connectEvents()
+            },
+          },
+          projects.map((p) => h('option', {value: p.projectId, selected: p.projectId === state.status.projectId}, p.main ? `${p.projectId} (main)` : p.projectId)),
+        )
+      : h('span', {class: 'pill mono'}, state.status.projectId)
   const top = h(
     'header',
     {class: 'topbar'},
     h('div', {class: 'brand'}, h('span', {class: 'brand-mark', 'aria-hidden': 'true'}, 's'), 'sanity-sim'),
-    h('span', {class: 'pill mono'}, state.status.projectId),
+    projectPicker,
     datasetSelect,
     current?.synced ? h('span', {class: 'pill'}, `synced from ${current.synced.projectId}/${current.synced.dataset} · ${ago(current.synced.syncedAt)}`) : null,
     h('div', {class: 'spacer'}),
@@ -835,7 +865,7 @@ async function renderDatasets(main) {
         'div',
         {class: 'row'},
         h('label', {class: 'btn'}, 'Import NDJSON / export tarball…', fileInput),
-        h('a', {class: 'btn', href: `/_sim/datasets/${ds()}/export`, download: `${state.dataset}.ndjson`}, 'Export NDJSON'),
+        h('a', {class: 'btn', href: withProject(`/_sim/datasets/${ds()}/export`), download: `${state.dataset}.ndjson`}, 'Export NDJSON'),
         dangerous('Discard local changes', `Discard every local change in ${state.dataset}? Synced documents stay.`, () => admin(`/datasets/${ds()}/reset`, {method: 'POST', body: {}})),
         dangerous('Wipe dataset', `Wipe ${state.dataset} completely (local changes, history and synced snapshot)?`, () => admin(`/datasets/${ds()}/reset`, {method: 'POST', body: {all: true}})),
         list.length > 1 && !linkOf(state.dataset) && list.find((d) => d.name === state.dataset)?.linkedFrom.length === 0 ? dangerous('Delete dataset', `Delete dataset ${state.dataset} and its files?`, () => admin(`/datasets/${ds()}`, {method: 'DELETE'}).then(() => (state.dataset = null))) : null,
@@ -904,7 +934,9 @@ function stat(label, value) {
 /* ------------------------------------------------------------------ live updates */
 
 function connectEvents() {
-  const source = new EventSource('/_sim/events')
+  state.events?.close()
+  const source = new EventSource(withProject('/_sim/events'))
+  state.events = source
   let pending = null
   const refresh = () => {
     clearTimeout(pending)
@@ -939,6 +971,7 @@ function connectEvents() {
 }
 
 window.addEventListener('hashchange', render)
+state.project = safeStorage('get', 'sanity-sim.project') || null
 await refreshStatus()
 await render()
 connectEvents()

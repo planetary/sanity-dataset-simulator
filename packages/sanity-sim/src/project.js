@@ -34,9 +34,20 @@ export function detectProject(root) {
     const envRef = text.match(new RegExp(`${field}\\s*:\\s*(?:process\\.env|import\\.meta\\.env)\\.([A-Z0-9_]+)(?:\\s*(?:\\?\\?|\\|\\|)\\s*['"\`]([a-z0-9-_]+)['"\`])?`, 'i'))
     return envRef ? (lookup(envRef[1]) ?? envRef[2] ?? null) : null
   }
+  /* Every value of `field` in the file: a Studio config with workspaces names several projects. */
+  const allFromSource = (file, field) => {
+    if (!file) return []
+    const text = fs.readFileSync(file, 'utf8')
+    const pattern = new RegExp(
+      `${field}\\s*:\\s*(?:['"\`]([a-z0-9-_]+)['"\`]|(?:process\\.env|import\\.meta\\.env)\\.([A-Z0-9_]+)(?:\\s*(?:\\?\\?|\\|\\|)\\s*['"\`]([a-z0-9-_]+)['"\`])?)`,
+      'gi',
+    )
+    return [...text.matchAll(pattern)].map((match) => match[1] ?? lookup(match[2]) ?? match[3]).filter(Boolean)
+  }
   const firstEnv = (keys) => keys.map(lookup).find((value) => typeof value === 'string' && value.trim() !== '') ?? null
 
   const projectId = fromSource(cliConfig, 'projectId') ?? fromSource(studioConfig, 'projectId') ?? firstEnv(PROJECT_ID_KEYS)
+  const projectIds = [...new Set([projectId, ...allFromSource(studioConfig, 'projectId')].filter(Boolean))]
   const dataset = fromSource(cliConfig, 'dataset') ?? fromSource(studioConfig, 'dataset') ?? firstEnv(DATASET_KEYS)
   const tokenKey = TOKEN_KEYS.find((key) => lookup(key))
 
@@ -50,6 +61,7 @@ export function detectProject(root) {
     studioDir,
     cliConfig,
     projectId,
+    projectIds,
     dataset,
     token: tokenKey ? {key: tokenKey, value: lookup(tokenKey)} : null,
     frameworks,

@@ -49,13 +49,26 @@ export async function startServer(sim, {port = 3939, host = '127.0.0.1', tls = n
    * API hostnames (reached only via sanity-sim/register's TLS redirect) get the
    * Node-only intercept leaf. */
   const interceptContext = tls?.intercept ? createSecureContext(tls.intercept) : null
+  /* A `<projectId>.localhost` the leaf does not name yet gets a re-minted leaf naming it (and every earlier name). */
+  let browserContext = null
+  const sni = (servername, callback) => {
+    if (interceptContext && /(^|\.)sanity\.io$/.test(servername)) return callback(null, interceptContext)
+    if (tls.withHostname && /^[a-z0-9][a-z0-9-]*\.localhost$/.test(servername ?? '') && !tls.covers(servername)) {
+      try {
+        browserContext = createSecureContext(tls.withHostname(servername))
+      } catch (error) {
+        sim.log('warn', `could not add ${servername} to the certificate: ${error.message}`)
+      }
+    }
+    callback(null, browserContext)
+  }
   const secure = tls
     ? http2.createSecureServer(
         {
           key: tls.key,
           cert: tls.cert,
           allowHTTP1: true,
-          SNICallback: (servername, callback) => callback(null, interceptContext && /(^|\.)sanity\.io$/.test(servername) ? interceptContext : null),
+          SNICallback: sni,
         },
         handler,
       )
@@ -108,9 +121,35 @@ export async function startServer(sim, {port = 3939, host = '127.0.0.1', tls = n
 
 /* ================================================================ request handling */
 
-async function handle(context, req, res) {
+/**
+ * Which project a request is for. Browsers reach `<projectId>.localhost`; the
+ * Node register hook sends `x-sanity-sim-project`; Sanity's own hostnames
+ * (`<projectId>.api.sanity.io`, via the hook's TLS redirect) carry it too;
+ * otherwise the path may (`/projects/<id>`, `/images/<id>/…`). Anything else
+ * is the main project.
+ */
+const PROJECT_HOST = /^([a-z0-9][a-z0-9-]*)\.(?:localhost|api\.sanity\.io|apicdn\.sanity\.io)$/
+const PROJECT_PATH = /^(?:\/v[^/]+)?\/(?:projects|schedules|access\/project|journey\/projects)\/([a-z0-9][a-z0-9-]*)(?:\/|$)|^\/(?:images|files)\/([a-z0-9][a-z0-9-]*)\//
+
+function projectOf(req, url) {
+  if (url.pathname.startsWith('/_sim/')) return url.searchParams.get('project') || null
+  const header = req.headers['x-sanity-sim-project']
+  if (typeof header === 'string' && header) return header
+  const host = String(req.headers[':authority'] ?? req.headers.host ?? '').replace(/:\d+$/, '')
+  const fromHost = host.match(PROJECT_HOST)?.[1]
+  if (fromHost) return fromHost
+  const fromPath = url.pathname.match(PROJECT_PATH)
+  return fromPath?.[1] ?? fromPath?.[2] ?? null
+}
+
+async function handle(rootContext, req, res) {
   const started = performance.now()
   const url = new URL(req.url, 'http://localhost')
+  const projectId = projectOf(req, url)
+  /* The dashboard only reads projects that exist; API clients create them on first use, like datasets. */
+  const sim = projectId ? rootContext.sim.projects.get(projectId, {create: !url.pathname.startsWith('/_sim/')}) : rootContext.sim
+  if (!sim) return sendError(res, notFound(`no project "${projectId}" in this simulator`), rootContext.sim)
+  const context = sim === rootContext.sim ? rootContext : {...rootContext, sim}
   const entry = {
     at: new Date().toISOString(),
     method: req.method,
@@ -247,7 +286,7 @@ async function users(context, req, res, rest) {
 async function projects(context, req, res, url, rest, apiVersion) {
   const {sim} = context
   const [projectId, sub, datasetName, leaf, ...more] = rest
-  if (projectId === undefined) return json(res, 200, [projectDocument(sim)])
+  if (projectId === undefined) return json(res, 200, sim.projects.all().map((project) => projectDocument(project)))
   if (sub === undefined) return json(res, 200, projectDocument(sim))
   switch (sub) {
     case 'grants':

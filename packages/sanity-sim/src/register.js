@@ -17,6 +17,9 @@ import tls from 'node:tls'
 
 const target = process.env.SANITY_SIM_URL
 const SANITY_HOST = /(^|\.)(api|apicdn)\.sanity\.io$|^cdn\.sanity\.io$/
+const PROJECT_HOST = /^([a-z0-9][a-z0-9-]*)\.(?:api|apicdn)\.sanity\.io$/
+/* The project subdomain is how Content Lake tells projects apart; the sim reads it from this header. */
+const PROJECT_HEADER = 'x-sanity-sim-project'
 
 if (target && !globalThis.__sanitySimRegistered) {
   globalThis.__sanitySimRegistered = true
@@ -30,9 +33,7 @@ if (target && !globalThis.__sanitySimRegistered) {
       return null
     }
     if (!SANITY_HOST.test(url.hostname)) return null
-    const next = new URL(url.pathname + url.search, sim)
-    /* The project subdomain is how Content Lake tells projects apart; keep it visible to the sim. */
-    return next
+    return {url: new URL(url.pathname + url.search, sim), projectId: url.hostname.match(PROJECT_HOST)?.[1]}
   }
 
   const originalFetch = globalThis.fetch
@@ -40,8 +41,14 @@ if (target && !globalThis.__sanitySimRegistered) {
     const href = typeof input === 'string' || input instanceof URL ? String(input) : input?.url
     const rewritten = href ? rewrite(href) : null
     if (!rewritten) return originalFetch.call(this, input, init)
-    if (typeof input === 'string' || input instanceof URL) return originalFetch.call(this, rewritten, init)
-    return originalFetch.call(this, new Request(rewritten, input), init)
+    if (typeof input === 'string' || input instanceof URL) {
+      const headers = new Headers(init?.headers)
+      if (rewritten.projectId) headers.set(PROJECT_HEADER, rewritten.projectId)
+      return originalFetch.call(this, rewritten.url, {...init, headers})
+    }
+    const request = new Request(rewritten.url, input)
+    if (rewritten.projectId) request.headers.set(PROJECT_HEADER, rewritten.projectId)
+    return originalFetch.call(this, request, init)
   }
 
   const patch = (module, defaultProtocol) => {
@@ -80,7 +87,7 @@ if (target && !globalThis.__sanitySimRegistered) {
       hostname: sim.hostname,
       host: undefined,
       port: sim.port || (protocol === 'https:' ? 443 : 80),
-      headers: {...options.headers, host: sim.host},
+      headers: {...options.headers, host: sim.host, ...(hostname.match(PROJECT_HOST) ? {[PROJECT_HEADER]: hostname.match(PROJECT_HOST)[1]} : {})},
       agent: undefined,
     }
     return {protocol, args: callback ? [rewritten, callback] : [rewritten]}

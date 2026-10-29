@@ -44,7 +44,7 @@ export function ensureTls({hostnames}) {
    * label such as `*.localhost` as malformed when the issuer has name
    * constraints, failing the whole certificate with SEC_ERROR_BAD_DER.
    */
-  const names = [...new Set(['localhost', ...hostnames])]
+  let names = [...new Set(['localhost', ...hostnames])]
   const leaf = ensureLeaf(dir, 'leaf', browser, names, ['IP:127.0.0.1', 'IP:::1'])
   const interceptLeaf = ensureLeaf(dir, 'intercept-leaf', intercept, INTERCEPT_NAMES, [])
   const bundle = path.join(dir, 'node-ca-bundle.pem')
@@ -58,6 +58,17 @@ export function ensureTls({hostnames}) {
     },
     caFile: browser.cert,
     nodeCaBundle: bundle,
+    covers: (hostname) => names.includes(hostname),
+    /**
+     * Re-mint the browser leaf to also name `hostname` (a project the server
+     * had not been told about, e.g. a workspace added while it runs).
+     * Returns the new key and chain, which cover every earlier name too.
+     */
+    withHostname(hostname) {
+      names = [...new Set([...names, hostname])]
+      const next = ensureLeaf(dir, 'leaf', browser, names, ['IP:127.0.0.1', 'IP:::1'])
+      return {key: fs.readFileSync(next.key), cert: Buffer.concat([fs.readFileSync(next.cert), fs.readFileSync(browser.cert)])}
+    },
   }
 }
 

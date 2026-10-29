@@ -118,10 +118,13 @@ async function dev(root, project, flags, {runDev}) {
 
   /* TLS + server. */
   const port = await freePort(Number(flags.port ?? DEFAULT_PORT))
+  /* Every workspace's project up front (shown on the dashboard); others are created on first request. */
+  for (const id of project.projectIds ?? []) sim.projects.get(id)
   let tls = null
   if (!flags.http) {
     try {
-      tls = ensureTls({hostnames: [`${sim.projectId}.localhost`]})
+      /* Any project not named here gets its name added on first connection. */
+      tls = ensureTls({hostnames: sim.projects.all().map((p) => `${p.projectId}.localhost`)})
     } catch (error) {
       log('warn', `${error.message}\nfalling back to plain HTTP`)
     }
@@ -207,6 +210,8 @@ function banner({sim, project, root, server, tls, datasetName, wired, runDev}) {
     `  API        ${server.origin}${tls ? dim(`  (Node/curl: ${server.httpOrigin})`) : ''}`,
     `  Data       ${rel(root, sim.dir)}/ ${dim(`(${remote}${dataset.local.size} local, ${dataset.tombstones.size} deleted locally)`)}`,
   ]
+  const others = sim.projects.all().slice(1)
+  if (others.length > 0) lines.push(`  Projects   ${sim.projectId} ${dim('(main)')}, ${others.map((p) => p.projectId).join(', ')} ${dim('(each with its own datasets)')}`)
   if (project.studioConfig) lines.push(`  Studio     ${isStudioWired(project.studioConfig) ? 'wired' : 'not wired'} ${dim(rel(root, project.studioConfig))}`)
   if (wired.length > 0) lines.push(`  Wired now  ${wired.join(', ')} ${dim('(undo: npx sanity-sim eject)')}`)
   if (tls && !isCaTrusted()) {

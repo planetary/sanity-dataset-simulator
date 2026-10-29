@@ -67,6 +67,15 @@ Open `http://localhost:3939/`:
 - **Datasets.** Create and switch datasets, link a name to one and hot-swap it, import and export, discard local changes, wipe.
 - **Connections.** Which clients are connected and which API versions they use, any endpoints they called that the simulator doesn't implement, certificate status, and snippets for wiring by hand.
 
+## Workspaces and multiple projects
+
+A Studio with several workspaces works as-is, including workspaces on **different projects**. The wiring sets `apiHost` on every workspace, and each project has its own datasets, links, releases and history:
+
+- **Main project.** The one in `sanity.cli.*`, or else the first one found. It lives where it always has, in `.sanity-sim/`.
+- **Other projects.** Each one lives in `.sanity-sim/projects/<projectId>/`. They are created on first use, just as datasets are. Asset files are content-addressed and shared between projects.
+
+Requests are matched to a project the way Content Lake does it, by hostname (`<projectId>.localhost`, or `<projectId>.api.sanity.io` through the register hook). Paths like `/projects/<projectId>/…` are matched too. Every project id found in your Studio config is put on the certificate at startup. A project the simulator hasn't seen before gets its name added during its first TLS connection, so no restart is needed. When there is more than one project, the dashboard shows a project picker.
+
 ## Linked datasets (hot swap)
 
 Keep several datasets side by side and choose which one your Studio and app see, without touching their config:
@@ -158,6 +167,7 @@ Verified against **Sanity Studio 6.20**, **@sanity/client 8.13**, **next-sanity 
 
 - **Studio's feedback tunnel.** Studio sends Sentry error reports and feedback to a hardcoded `https://api.sanity.io/vX/intake/feedback` that ignores `apiHost`. No document content is involved, but those requests do leave your machine.
 - **One local user.** No roles, no access control, and no real presence.
+- **`--project` renames the main project.** To work with another project's data from the CLI, use the dashboard's project picker or the API (`x-sanity-sim-project` header) instead.
 - **Loopback only.** The server binds to `127.0.0.1`/`::1` and accepts writes only from loopback browser origins (`--origin` adds one). It's a development tool, not a server to expose.
 - **Search ranking.** Typed searches match by prefix tokens; there's no stemming and no hosted relevance scoring.
 - **Large datasets.** Everything is held in memory. Sync a subset with `--types post,author` when the dataset is very large.
