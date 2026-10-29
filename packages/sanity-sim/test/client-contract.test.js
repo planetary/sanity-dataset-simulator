@@ -5,6 +5,8 @@ import {after, before, describe, it} from 'node:test'
 import {promisify} from 'node:util'
 import {createClient} from '@sanity/client'
 import {Mutation} from '@sanity/mutator'
+import {validatePreviewUrl} from '@sanity/preview-url-secret'
+import {createPreviewSecret} from '@sanity/preview-url-secret/create-secret'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -122,6 +124,15 @@ describe('@sanity/client 8 contract', () => {
     const publishEvent = (await events).find((event) => event.documentId === 'm5')
     const result = new Mutation({mutations: publishEvent.mutations, previousRev: publishEvent.previousRev, resultRev: publishEvent.resultRev}).apply(published)
     assert.equal(result?.title, 'Alien (edited)', 'the draft\'s delete must not reach the published document')
+  })
+
+  it('validates Presentation preview secrets (Studio creates one, the app\'s draft-mode route checks it)', async () => {
+    const {secret} = await createPreviewSecret(client, 'contract-test', '/studio')
+    const preview = (value) => `http://localhost:3000/api/draft-mode/enable?sanity-preview-secret=${value}&sanity-preview-pathname=%2Fposts%2Fa`
+    const valid = await validatePreviewUrl(client, preview(secret))
+    assert.equal(valid.isValid, true)
+    assert.equal(valid.redirectTo, '/posts/a')
+    assert.equal((await validatePreviewUrl(client, preview('not-the-secret'))).isValid, false)
   })
 
   it('uploads assets and serves them back from the CDN path', async () => {

@@ -1,6 +1,6 @@
 'use client'
 import {useEffect, useState} from 'react'
-import {client} from '../../sanity/client'
+import {client} from '../../../sanity/client'
 
 export function ClientPosts() {
   const [titles, setTitles] = useState<string[] | null>(null)

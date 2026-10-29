@@ -151,6 +151,7 @@ Verified against **Sanity Studio 6.20**, **@sanity/client 8.13**, **next-sanity 
 | `text::query` (Studio lists and search) | ✅ exact for unfiltered lists; prefix-token approximation for typed terms (reported in `simApproximations`) |
 | `syncTags`, Live Content API (`/data/live/events`) | ✅ one coarse tag per dataset (over-invalidates, never under-) |
 | `resultSourceMap` (Presentation, stega) | ✅ inferred conservatively for string values |
+| Presentation and Draft Mode (next-sanity `defineEnableDraftMode`, `defineLive`, `<VisualEditing>`) | ✅ preview secrets, drafts in the preview, click-to-edit overlays, live draft edits, published pages revalidated by `<SanityLive>` (see `examples/sim-next`) |
 | Mutate API: create/createOrReplace/createIfNotExists/patch/delete, query-based patch/delete, `ifRevisionID`, `returnIds`/`returnDocuments`/`dryRun`/`autoGenerateArrayKeys`/`transactionId`, atomic | ✅ patches applied by `@sanity/mutator` |
 | Actions API: document, version and release actions; release scheduling | ✅ |
 | Listen API: filters, transitions, `mutations`, `previousRev`/`resultRev`, mendoza `effects`, `includeResult`/`includePreviousRevision`/`includeAllVersions`, resume | ✅ |
