@@ -94,7 +94,89 @@ export async function syncDataset(sim, datasetName, {projectId, dataset, token, 
   const changes = target.replaceRemote(documents, meta)
   sim.config.sync = {...sim.config.sync, [target.name]: {projectId, dataset, types: types ?? null}}
   sim.saveConfig()
-  return {meta, changed: changes.length, stale: target.staleEntries().length}
+  const mediaLibraries = await syncMediaLibraries(sim, documents, {projectId, token})
+  return {meta, changed: changes.length, stale: target.staleEntries().length, mediaLibraries}
+}
+
+/* ------------------------------------------------------------------ Media Library */
+
+const LIBRARY_REF = /^media-library:(ml[^:]+):([^:]+)$/
+const LIBRARY_BATCH = 40
+
+/**
+ * The Media Library documents a dataset points at, by library id: what its
+ * `media-library:<lib>:<id>` references name (asset containers from fields'
+ * `media`, instances from linked asset documents and video fields), plus the
+ * container of every linked asset (`source.id`).
+ */
+export function mediaLibraryRefs(documents) {
+  const refs = new Map()
+  const add = (library, id) => {
+    if (!refs.has(library)) refs.set(library, new Set())
+    refs.get(library).add(id)
+  }
+  const walk = (value, depth = 0) => {
+    if (depth > 40 || value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) return value.forEach((item) => walk(item, depth + 1))
+    const match = typeof value._ref === 'string' && LIBRARY_REF.exec(value._ref)
+    if (match) add(match[1], match[2])
+    for (const item of Object.values(value)) walk(item, depth + 1)
+  }
+  for (const document of documents) {
+    walk(document)
+    const library = LIBRARY_REF.exec(document.media?._ref ?? '')?.[1]
+    if (library && document.source?.name === 'sanity-media-library' && document.source.id) add(library, document.source.id)
+  }
+  return refs
+}
+
+/**
+ * Pull the referenced Media Library documents, read-only, into the local
+ * libraries' remote layer: references resolve, the picker lists them, and
+ * "Open in Media Library" finds them. Bytes are fetched lazily from each
+ * instance's own URL when first served. A library the token cannot read is
+ * reported, not fatal: the dataset sync has already succeeded.
+ */
+export async function syncMediaLibraries(sim, documents, {projectId, token}) {
+  const results = []
+  for (const [libraryId, wanted] of mediaLibraryRefs(documents)) {
+    const library = sim.mediaLibraries.get(libraryId)
+    if (!library) continue
+    try {
+      const fetched = new Map()
+      const requested = new Set(wanted)
+      let pending = [...wanted]
+      while (pending.length > 0) {
+        for (const document of await fetchLibraryDocuments({projectId, libraryId, token, ids: pending})) fetched.set(document._id, document)
+        /* A container's versions come along, so every version can be opened and linked. */
+        pending = [...new Set([...fetched.values()]
+          .filter((document) => document._type === 'sanity.asset')
+          .flatMap((container) => [container.currentVersion?._ref, ...(container.versions ?? []).map((version) => version.instance?._ref)])
+          .filter((id) => id && !requested.has(id)))]
+        for (const id of pending) requested.add(id)
+      }
+      for (const document of fetched.values()) library.store.applyRemoteChange(document._id, document)
+      results.push({libraryId, documents: fetched.size, missing: [...wanted].filter((id) => !fetched.has(id)).length})
+    } catch (error) {
+      results.push({libraryId, error: error.message})
+    }
+  }
+  return results
+}
+
+async function fetchLibraryDocuments({projectId, libraryId, token, ids}) {
+  const out = []
+  for (let i = 0; i < ids.length; i += LIBRARY_BATCH) {
+    const batch = ids.slice(i, i + LIBRARY_BATCH).map(encodeURIComponent).join(',')
+    const url = `${upstreamBase(projectId)}/vX/media-libraries/${libraryId}/doc/${batch}`
+    const response = await upstream(url, {token: token?.value})
+    if (!response.ok) {
+      const body = await response.text().catch(() => '')
+      throw new Error(`reading media library ${libraryId} failed: ${response.status} ${body.slice(0, 200)}`)
+    }
+    out.push(...((await response.json()).documents ?? []))
+  }
+  return out
 }
 
 /**
@@ -135,6 +217,7 @@ export function followDataset(sim, datasetName, {projectId, dataset, token, log 
             const payload = JSON.parse(data)
             const gone = payload.transition === 'disappear' || !payload.result
             target.applyRemoteChange(payload.documentId, gone ? null : payload.result)
+            if (!gone) pullNewLibraryRefs(sim, payload.result, {projectId, token, log})
           }
         }
       } catch (error) {
@@ -147,6 +230,18 @@ export function followDataset(sim, datasetName, {projectId, dataset, token, log 
   }
   connect()
   return () => controller.abort()
+}
+
+/** Follow mode: a remote change that references Media Library documents not here yet pulls them. */
+function pullNewLibraryRefs(sim, document, {projectId, token, log}) {
+  const unknown = [...mediaLibraryRefs([document])].some(([libraryId, ids]) => {
+    const library = sim.mediaLibraries.get(libraryId)
+    return library && [...ids].some((id) => !library.store.get(id))
+  })
+  if (!unknown) return
+  syncMediaLibraries(sim, [document], {projectId, token}).then((results) => {
+    for (const result of results) if (result.error) log('warn', result.error)
+  })
 }
 
 /** A remote document at an earlier revision (the merge ancestor). Read-only. */

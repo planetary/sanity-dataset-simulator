@@ -65,6 +65,22 @@ export class MediaLibraries {
     return this.ids.map((id) => this.get(id))
   }
 
+  /**
+   * Where to fetch bytes this machine doesn't have: a library instance synced
+   * from a real Media Library keeps its real URL. `self` (this server's
+   * origin) is skipped, so a lookup never loops back here.
+   */
+  remoteUrlFor(sha1, extension, self) {
+    for (const id of this.ids) {
+      for (const document of this.get(id).store.documents()) {
+        if (document.sha1hash !== sha1 || document.extension !== extension || typeof document.url !== 'string') continue
+        if (!/^https?:\/\//.test(document.url) || (self && document.url.startsWith(self))) continue
+        return document.url
+      }
+    }
+    return null
+  }
+
   flush() {
     for (const library of this.libraries.values()) library.store.flush()
   }
@@ -173,7 +189,8 @@ export class MediaLibrary {
     if (instance._type === INSTANCE_TYPES.videos) throw badRequest('videos are not linked into datasets; reference them with a sanity.video field')
     const {_rev, _createdAt, _updatedAt, state: _state, path: _path, url: _url, ...fields} = instance
     const kind = instance._type === INSTANCE_TYPES.images ? 'images' : 'files'
-    const name = kind === 'images' ? instance.path.split('/').pop() : `${instance.sha1hash}.${instance.extension}`
+    const dimensions = instance.metadata?.dimensions
+    const name = kind === 'images' && dimensions ? `${instance.sha1hash}-${dimensions.width}x${dimensions.height}.${instance.extension}` : `${instance.sha1hash}.${instance.extension}`
     const media = {_type: 'globalDocumentReference', _ref: `media-library:${this.id}:${instance._id}`, _weak: true}
     const source = {name: SOURCE_NAME, id: container._id}
     const document = {

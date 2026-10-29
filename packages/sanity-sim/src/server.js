@@ -607,10 +607,11 @@ async function serveAsset(context, req, res, url) {
     if (remote?.projectId) {
       const name = url.pathname.split('/')[4]
       const cdnUrl = `https://cdn.sanity.io/${kind}/${remote.projectId}/${remote.dataset ?? datasetName}/${name}`
-      const response = await fetch(cdnUrl)
-      if (response.ok) file = context.sim.assets.cache(sha1, extension, Buffer.from(await response.arrayBuffer()))
+      const response = await fetch(cdnUrl).catch(() => null)
+      if (response?.ok) file = context.sim.assets.cache(sha1, extension, Buffer.from(await response.arrayBuffer()))
     }
   }
+  file ??= await fetchFromLibrary(context, sha1, extension)
   if (!file) throw notFound(`asset ${sha1}.${extension} is not stored locally (project ${projectId})`)
   return sendAssetFile(req, res, url, {kind, file, sha1, extension})
 }
@@ -722,9 +723,18 @@ async function serveLibraryAsset(context, req, res, url) {
   const match = url.pathname.match(LIBRARY_ASSET_PATH)
   if (!match) throw notFound('unknown media library asset path')
   const [, , kind, sha1, , , extension] = match
-  const file = context.sim.assets.locate(sha1, extension)
+  const file = context.sim.assets.locate(sha1, extension) ?? (await fetchFromLibrary(context, sha1, extension))
   if (!file) throw notFound(`asset ${sha1}.${extension} is not stored locally`)
   return sendAssetFile(req, res, url, {kind, file, sha1, extension})
+}
+
+/** Bytes of an instance synced from a real Media Library: fetched once from its real URL, then served from cache. */
+async function fetchFromLibrary(context, sha1, extension) {
+  const remote = context.sim.mediaLibraries.remoteUrlFor(sha1, extension, context.publicBase)
+  if (!remote) return null
+  const response = await fetch(remote).catch(() => null)
+  if (!response?.ok) return null
+  return context.sim.assets.cache(sha1, extension, Buffer.from(await response.arrayBuffer()))
 }
 
 const MEDIA_LIBRARY_APP = path.join(DASHBOARD_DIR, 'media-library.html')

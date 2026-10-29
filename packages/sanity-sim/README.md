@@ -101,7 +101,8 @@ Studios with `mediaLibrary: {enabled: true}` work against a local **Media Librar
 - **The picker.** Studio normally frames the hosted app at media.sanity.io. While `npx sanity-sim` runs, the Studio wiring points `mediaLibrary.__internal.frontendHost` at a small local picker served by the simulator, which speaks the same messages. Workspaces without Media Library are left alone.
 - **Linking.** Choosing an asset links it into the dataset, as Content Lake does: an ordinary `sanity.imageAsset`/`sanity.fileAsset` document is created with `source.name: "sanity-media-library"` and a `media` reference back to the library, and the field gets Studio's usual `asset` reference plus a weak `media` global document reference. Front-ends resolve it with plain GROQ, and the image is served from the dataset's usual path.
 - **The API.** Library lookup and listing, the library's own `query`/`doc`/`mutate`/`actions`/`listen`, `upload`, usage (`references/documents/<id>/to`), video `playback-info`, and the library CDN path `@sanity/image-url` builds for a Media Library client. The default library is `mlsimlocal`; a `libraryId` set in your Studio config is created locally on first use, so references keep their ids.
-- **Not simulated.** Video playback (Studio plays through Mux on a fixed host, so stored videos have no working player), aspects and asset editing in the picker, private-asset signed URLs, and syncing a real Media Library's contents.
+- **Synced from a real library.** When you sync a dataset whose assets came from a Media Library, the library assets it references come along, read-only (see [Syncing a real dataset](#syncing-a-real-dataset)).
+- **Not simulated.** Video playback (Studio plays through Mux on a fixed host, so stored videos have no working player), aspects and asset editing in the picker, and private-asset signed URLs (a private synced asset's bytes can't be fetched without them).
 
 Libraries live in `.sanity-sim/media-libraries/<id>/`, in the same files as a dataset.
 
@@ -114,6 +115,8 @@ npx sanity-sim sync              # pull, then exit
 ```
 
 A dataset in the simulator has two layers. The **synced snapshot** sits underneath; it's a cache and is gitignored. **Your local documents and deletions** sit on top and are committed. The layers combine per document id: a local copy wins, and a local deletion hides the synced document. Writes from Studio, your app or the dashboard always land in the local layer.
+
+**Media Library assets come along.** If the dataset references a Media Library (images and files picked from one, `sanity.video` fields), sync also reads those library documents: each referenced asset with all its versions, through the same read-only path. They go into the local library's synced layer, so the picker lists them, "Open in Media Library" finds them, and you can pick them into other datasets. Their bytes are fetched from the asset's own URL the first time they're served, then cached. `--follow` pulls library assets that newly synced changes reference. A library your token can't read is reported, and the dataset sync still succeeds.
 
 When the real dataset changes under a document you've edited, the document is flagged **stale** on the Sync page. Resolve it there by keeping yours, taking the synced version, or merging (field-level, three-way, with the ancestor read from Sanity's history API).
 
@@ -130,7 +133,7 @@ When the real dataset changes under a document you've edited, the document is fl
   datasets/<name>/remote.ndjson       synced snapshot (gitignored)
   datasets/<name>/transactions.ndjson local history with mendoza effects (gitignored)
   assets/                             uploaded files by sha1
-  media-libraries/<id>/               the local Media Library's containers and versions (commit)
+  media-libraries/<id>/               the local Media Library: your uploads (commit), synced assets (gitignored)
   .cache/                             synced assets fetched from Sanity's CDN (gitignored)
 ```
 

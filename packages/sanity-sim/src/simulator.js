@@ -11,7 +11,7 @@ import {ListenHub, LiveHub} from './listen.js'
 import {MediaLibraries} from './media-library.js'
 
 const DATASET_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/
-const GITIGNORED = ['.cache/', 'datasets/*/remote.ndjson', 'datasets/*/remote.json', 'datasets/*/transactions.ndjson', 'media-libraries/*/transactions.ndjson', 'keyvalue.json', 'server.json']
+const GITIGNORED = ['.cache/', 'datasets/*/remote.ndjson', 'datasets/*/remote.json', 'datasets/*/transactions.ndjson', 'media-libraries/*/transactions.ndjson', 'media-libraries/*/remote.ndjson', 'media-libraries/*/remote.json', 'keyvalue.json', 'server.json']
 export const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 /**

@@ -135,6 +135,83 @@ describe('media library', () => {
   })
 })
 
+describe('syncing a dataset that uses a real Media Library', () => {
+  let remote
+  let local
+  let uploaded
+  let syncResult
+  let requestsBefore
+  const name = () => `${uploaded.assetInstance.sha1hash}-2x2.png`
+
+  before(async () => {
+    remote = await startSim({projectId: 'realproj'})
+    const response = await fetch(`${remote.base}/vX/media-libraries/mlreal/upload?filename=tiny.png`, {method: 'POST', headers: {'content-type': 'image/png'}, body: PNG})
+    uploaded = await response.json()
+    await fetch(`${remote.base}/vX/assets/media-library-link/production`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({mediaLibraryId: 'mlreal', assetInstanceId: uploaded.assetInstance._id, assetId: uploaded.asset._id})})
+    await remote.mutate([{create: {_id: 'post-1', _type: 'post', cover: {_type: 'image', asset: {_type: 'reference', _ref: uploaded.assetInstance._id}, media: {_type: 'globalDocumentReference', _ref: `media-library:mlreal:${uploaded.asset._id}`, _weak: true}}}}])
+    process.env.SANITY_SIM_UPSTREAM = remote.base
+    local = await startSim({projectId: 'realproj'})
+    requestsBefore = remote.sim.requests.length
+    const sync = await fetch(`${local.base}/_sim/datasets/production/sync`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({projectId: 'realproj', dataset: 'production'})})
+    syncResult = await sync.json()
+  })
+  after(async () => {
+    delete process.env.SANITY_SIM_UPSTREAM
+    await local.close()
+    await remote.close()
+  })
+
+  it('pulls the containers and instances the dataset references into the local library', () => {
+    assert.deepEqual(syncResult.mediaLibraries, [{libraryId: 'mlreal', documents: 2, missing: 0}])
+    const store = local.sim.mediaLibraries.get('mlreal').store
+    assert.equal(store.get(uploaded.asset._id)._type, 'sanity.asset')
+    assert.equal(store.get(uploaded.assetInstance._id)._type, 'sanity.imageAsset')
+    assert.equal(store.layerOf(uploaded.asset._id), 'remote', 'synced, under any local changes')
+  })
+
+  it('reads Sanity only with GETs', () => {
+    const methods = new Set(remote.sim.requests.slice(requestsBefore).map((entry) => entry.method))
+    assert.deepEqual([...methods], ['GET'])
+  })
+
+  it('lets the picker list them and "open in library" find them', async () => {
+    const search = new URLSearchParams({query: '*[_type == "sanity.asset"]._id'})
+    const listed = await (await fetch(`${local.base}/vX/media-libraries/mlreal/query?${search}`)).json()
+    assert.deepEqual(listed.result, [uploaded.asset._id])
+  })
+
+  it('serves their bytes, fetched once from the instance\'s real URL', async () => {
+    const bytes = Buffer.from(await (await fetch(`${local.base}/media-libraries/mlreal/images/${name()}`)).arrayBuffer())
+    assert.deepEqual(bytes, PNG)
+  })
+
+  it('follow mode pulls the library documents a newly synced change references', async () => {
+    const admin = (body) => fetch(`${local.base}/_sim/datasets/production/follow`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body)})
+    await admin({enabled: true})
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      const text = Buffer.from('a brief from the real library')
+      const response = await fetch(`${remote.base}/vX/media-libraries/mlreal/upload?filename=brief.txt`, {method: 'POST', headers: {'content-type': 'text/plain'}, body: text})
+      const brief = await response.json()
+      await remote.mutate([{create: {_id: 'post-2', _type: 'post', brief: {_type: 'file', media: {_type: 'globalDocumentReference', _ref: `media-library:mlreal:${brief.asset._id}`, _weak: true}}}}])
+      const store = local.sim.mediaLibraries.get('mlreal').store
+      for (let i = 0; i < 50 && !store.get(brief.assetInstance._id); i++) await new Promise((resolve) => setTimeout(resolve, 100))
+      assert.equal(store.get(brief.asset._id)?._type, 'sanity.asset')
+      assert.equal(store.get(brief.assetInstance._id)?._type, 'sanity.fileAsset', 'the container\'s versions come along')
+    } finally {
+      await admin({enabled: false})
+    }
+  })
+
+  it('links a synced asset into another local dataset, as picking it in Studio does', async () => {
+    const response = await fetch(`${local.base}/vX/assets/media-library-link/staging`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({mediaLibraryId: 'mlreal', assetInstanceId: uploaded.assetInstance._id, assetId: uploaded.asset._id})})
+    const {document} = await response.json()
+    assert.match(document.url, new RegExp(`/images/realproj/staging/${name()}$`))
+    const bytes = Buffer.from(await (await fetch(document.url.replace(/^https?:\/\/[^/]+/, local.base))).arrayBuffer())
+    assert.deepEqual(bytes, PNG)
+  })
+})
+
 describe('Studio wiring for Media Library', () => {
   const studio = (source) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sanity-sim-ml-wire-'))

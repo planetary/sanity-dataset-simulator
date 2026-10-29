@@ -247,6 +247,10 @@ async function pull(sim, datasetName, source, log) {
   log('info', `syncing ${source.projectId}/${source.dataset} (read-only, credentials: ${source.token?.source ?? 'none'})…`)
   const result = await syncDataset(sim, datasetName, {...source, onProgress: (n) => log('info', `  ${n} documents…`)})
   log('info', `synced ${result.meta.count} documents (${result.meta.drafts} drafts)${result.stale ? `; ${result.stale} local change(s) now stale — see the dashboard` : ''}`)
+  for (const library of result.mediaLibraries ?? []) {
+    if (library.error) log('warn', `media library ${library.libraryId}: ${library.error} (its assets still show; opening them in the library won't find them)`)
+    else log('info', `synced ${library.documents} media library document(s) from ${library.libraryId}${library.missing ? `; ${library.missing} referenced id(s) not found there` : ''}`)
+  }
 }
 
 function syncSource(sim, project, datasetName) {
