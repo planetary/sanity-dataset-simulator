@@ -138,3 +138,7 @@ Verified against **Sanity Studio 6.20**, **@sanity/client 8.13**, **next-sanity 
 - **Search ranking.** Typed searches match by prefix tokens; there's no stemming and no hosted relevance scoring.
 - **Large datasets.** Everything is held in memory. Sync a subset with `--types post,author` when the dataset is very large.
 - **Requirements.** Node 22.12+ and `openssl` on PATH (for the certificate; without it, `--http`).
+
+## License
+
+MIT
