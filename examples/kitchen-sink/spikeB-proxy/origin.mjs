@@ -298,9 +298,14 @@ function assertWriteIsNotForged(request, allowed) {
       {origin: origin ?? null},
     )
 
+  /* A granted Origin decides first. Page JS cannot forge `Origin`, and a stock
+   * Studio on `http://localhost` writing to `https://<project>.localhost` is
+   * always labelled `cross-site` (scheme and site both differ), so checking the
+   * label first refused every legitimate write. `cross-site` still refuses
+   * whenever no granted Origin vouches for the request. */
+  if (typeof origin === 'string' && origin !== '' && isGrantedOrigin(origin, allowed)) return
   if (site === 'cross-site') throw forbidden()
   if (typeof origin !== 'string' || origin === '') return
-  if (isGrantedOrigin(origin, allowed)) return
   throw forbidden()
 }
 
