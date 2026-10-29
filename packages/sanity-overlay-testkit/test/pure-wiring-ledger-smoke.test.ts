@@ -116,6 +116,7 @@ const PURE_LOGIC: readonly string[] = [
   'core-prototype-writes.test.ts',
   'core-r5-supersession.test.ts',
   'core-read-batch.test.ts',
+  'core-record-from-intent.test.ts',
   'core-serializer-golden.test.ts',
   'core-w1.test.ts',
   'core-w2-merge-integration.test.ts',

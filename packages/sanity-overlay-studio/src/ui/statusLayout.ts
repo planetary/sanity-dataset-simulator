@@ -19,7 +19,7 @@ import type {ConflictPanelModel} from '../conflicts'
 import {conflictPanelModel} from '../conflicts'
 import type {OverlayRuntime} from '../runtime'
 import {getOverlayRuntime} from '../runtime'
-import type {OverlaySeverity, OverlayStatus} from '../status'
+import type {OverlaySeverity, OverlayStatus, OverlayStatusLine} from '../status'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -54,10 +54,19 @@ function bannerStyle(severity: OverlaySeverity): Record<string, string> {
     font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace',
     padding: '6px 12px',
     display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+    borderBottom: '1px solid rgba(255,255,255,0.2)',
+  }
+}
+
+/** Shared by both tiers: one wrapping row of baseline-aligned fields. */
+function bannerRowStyle(): Record<string, string> {
+  return {
+    display: 'flex',
     flexWrap: 'wrap',
     gap: '4px 16px',
     alignItems: 'baseline',
-    borderBottom: '1px solid rgba(255,255,255,0.2)',
   }
 }
 
@@ -66,6 +75,10 @@ export interface OverlayBannerViewModel {
   conflicts: ConflictPanelModel[]
   conflictNote?: string
   messages: readonly string[]
+  /** Tier 1: the one line that survives collapse — see the module comment. */
+  summaryLines: OverlayStatusLine[]
+  /** Tier 2: every other status line, shown only when Details is expanded. */
+  detailLines: OverlayStatusLine[]
 }
 
 /**
@@ -76,12 +89,26 @@ export function overlayBannerViewModel(runtime: OverlayRuntime): OverlayBannerVi
   const report = runtime.conflicts()
   const conflicts = Object.values(report.byDocument)
     .flat()
+    /* The banner is "what needs you". A RESOLVED conflict is history — the
+     * panel shows it; a ⛔ row with zero action labels and a dangling "—" is
+     * how it rendered here before this filter (seen live 2026-08-11, minutes
+     * after resolution first worked: summary said zero, rows said danger). */
+    .filter((conflict) => conflict.resolution === undefined)
     .map((conflict) => conflictPanelModel(conflict))
+  const status = runtime.status()
+  /* Every line except "Overlay revision" moves to Tier 2 (2026-08-11 redesign):
+   * identity, storage, base, checkpoint and the API endpoint are context, not
+   * something that needs you the way a blocking conflict does. Revision is the
+   * one number worth a glance at all times. */
+  const summaryLines = status.lines.filter((line) => line.label === 'Overlay revision')
+  const detailLines = status.lines.filter((line) => line.label !== 'Overlay revision')
   return {
-    status: runtime.status(),
+    status,
     conflicts,
     conflictNote: report.note,
     messages: runtime.messages(),
+    summaryLines,
+    detailLines,
   }
 }
 
@@ -101,6 +128,7 @@ export function createOverlayStatusLayout(
   return function OverlayStatusLayout(props: OverlayLayoutProps): unknown {
     const runtime = getOverlayRuntime(props.name ?? '*')
     const [, setTick] = react.useState(0)
+    const [expanded, setExpanded] = react.useState(false)
 
     react.useEffect(() => {
       if (runtime === undefined) return undefined
@@ -119,14 +147,17 @@ export function createOverlayStatusLayout(
     const model = overlayBannerViewModel(runtime)
     const {status} = model
 
-    const children: unknown[] = [
+    /* Tier 1: always visible. Identity, revision and blocking facts only — see
+     * the module comment and the 2026-08-11 redesign note in the test suite for
+     * why the rest moved to Tier 2. */
+    const summary: unknown[] = [
       react.createElement(
         'strong',
         {key: 'title', style: {letterSpacing: '0.08em'}},
         'BRANCH OVERLAY',
       ),
       react.createElement('span', {key: 'headline'}, status.headline),
-      ...status.lines.map((line) =>
+      ...model.summaryLines.map((line) =>
         react.createElement(
           'span',
           {key: line.label, style: {opacity: '0.75'}},
@@ -136,18 +167,56 @@ export function createOverlayStatusLayout(
     ]
 
     if (model.conflictNote !== undefined) {
-      children.push(
+      summary.push(
         react.createElement('span', {key: 'conflict-note', style: {opacity: '0.75'}}, model.conflictNote),
       )
     }
 
     for (const conflict of model.conflicts) {
-      children.push(
+      summary.push(
         react.createElement(
           'span',
           {key: `conflict-${conflict.id}`, style: {opacity: '0.9'}},
           `${conflict.severity === 'hard' ? '⛔' : '⚠'} ${conflict.documentId} ` +
             `${conflict.pathLabel} — ${conflict.actions.map((action) => action.label).join(' / ')}`,
+        ),
+      )
+    }
+
+    summary.push(
+      react.createElement(
+        'button',
+        {
+          key: 'details-toggle',
+          'data-testid': 'overlay-banner-details-toggle',
+          onClick: () => setExpanded((current) => !current),
+        },
+        expanded ? 'Hide details' : 'Details',
+      ),
+    )
+
+    const rows: unknown[] = [react.createElement('div', {key: 'summary', style: bannerRowStyle()}, ...summary)]
+
+    /* Tier 2: everything else, rendered only when expanded — the fake `react`
+     * in the test suite that starts `useState(false)` at `true` is how DOM
+     * coverage is exercised, since a fake `useState` cannot be flipped by a
+     * click with no renderer behind it. */
+    if (expanded) {
+      const details: unknown[] = model.detailLines.map((line) =>
+        react.createElement(
+          'span',
+          {key: line.label, style: {opacity: '0.75'}},
+          `${line.label}: ${line.value}`,
+        ),
+      )
+      for (const [index, message] of model.messages.entries()) {
+        details.push(react.createElement('span', {key: `message-${index}`, style: {opacity: '0.75'}}, message))
+      }
+      rows.push(
+        react.createElement(
+          'div',
+          {key: 'details', 'data-testid': 'overlay-banner-details', style: bannerRowStyle()},
+          ...details,
         ),
       )
     }
@@ -160,7 +229,7 @@ export function createOverlayStatusLayout(
         'data-overlay-severity': status.severity,
         'data-testid': 'overlay-status-banner',
       },
-      ...children,
+      ...rows,
     )
 
     /* A fatal state replaces the Studio entirely: §21.3 says "Fatal screen. No

@@ -380,3 +380,130 @@ describe('GET /state carries the rest of the §28.2 per-document facts', () => {
     expect(entry.draft.title).toBe('Branch title')
   })
 })
+
+/* ------------------------------------------------------------------ *
+ * POST /commit kind "conflictResolution" — the missing branch (§28.1, §28.3)
+ * ------------------------------------------------------------------ *
+ *
+ * The Studio's resolution UI was FULLY BUILT — panel, controller, labels,
+ * transport — and POSTed `{kind: 'conflictResolution'}` to `/commit`, where the
+ * dispatcher had no such branch and answered 400 INVALID_REQUEST. Found live
+ * 2026-08-11: two hard conflicts in the banner, resolution options rendered as
+ * text, and no wired way anywhere to invoke them.
+ */
+
+async function conflictedApi(): Promise<{api: OverlayApi; conflictId: string; root: string}> {
+  const {api, root} = await boot()
+  await commit(api, {
+    idempotencyKey: 'k1',
+    kind: 'actions',
+    payload: edit('Branch title'),
+    baseDocuments: [BASE_V1],
+  })
+  await commit(api, {
+    idempotencyKey: 'k2',
+    kind: 'actions',
+    payload: edit('Branch title, again'),
+    baseDocuments: [BASE_TITLE_MOVED],
+  })
+  const body = await state(api)
+  const conflictId = body.documents[0].conflicts[0].id as string
+  return {api, conflictId, root}
+}
+
+describe('POST /commit kind "conflictResolution"', () => {
+  it('resolves a conflict, persists the decision, and clears the unresolved summary', async () => {
+    const {api, conflictId} = await conflictedApi()
+
+    const resolved = await commit(api, {
+      idempotencyKey: 'k3',
+      kind: 'conflictResolution',
+      payload: {
+        kind: 'conflictResolution',
+        documentId: 'article-1',
+        conflictId,
+        action: 'keep-branch-value',
+        resolution: 'keep-local',
+      },
+    })
+    expect(resolved.ok).toBe(true)
+    expect(resolved.committed).toBe(true)
+    expect(resolved.affectedDocumentIds).toEqual(['article-1'])
+
+    const body = await state(api)
+    /* The summary counts UNRESOLVED conflicts — a resolved one must leave it. */
+    expect(body.conflictSummary).toEqual({total: 0, hard: 0, soft: 0})
+    const conflict = body.documents[0].conflicts.find((c: Rec) => c.id === conflictId)
+    expect(conflict.resolution?.type).toBe('keep-local')
+    /* The branch value survived the keep-local action. */
+    expect(body.documents[0].draft.title).toBe('Branch title, again')
+  })
+
+  it('replays a retried resolution instead of double-resolving', async () => {
+    const {api, conflictId} = await conflictedApi()
+    const body = {
+      idempotencyKey: 'k3',
+      kind: 'conflictResolution',
+      payload: {
+        kind: 'conflictResolution',
+        documentId: 'article-1',
+        conflictId,
+        action: 'keep-branch-value',
+        resolution: 'keep-local',
+      },
+    }
+    const first = await commit(api, body)
+    const retry = await commit(api, body)
+
+    expect(retry.replayed).toBe(true)
+    expect(retry.committed).toBe(false)
+    expect(retry.revision).toBe(first.revision)
+  })
+
+  it('refuses an unknown conflict id as a request error, not a crash', async () => {
+    const {api} = await conflictedApi()
+    const result = await commit(api, {
+      idempotencyKey: 'k3',
+      kind: 'conflictResolution',
+      payload: {
+        kind: 'conflictResolution',
+        documentId: 'article-1',
+        conflictId: 'no-such-conflict',
+        action: 'keep-branch-value',
+        resolution: 'keep-local',
+      },
+    })
+    expect(result.ok).toBe(false)
+    expect(String(result.error?.message ?? '')).toContain('no-such-conflict')
+  })
+
+  it('the resolution survives a restart — it is on disk, not in the process', async () => {
+    const {api, conflictId, root} = await conflictedApi()
+    await commit(api, {
+      idempotencyKey: 'k3',
+      kind: 'conflictResolution',
+      payload: {
+        kind: 'conflictResolution',
+        documentId: 'article-1',
+        conflictId,
+        action: 'keep-branch-value',
+        resolution: 'keep-local',
+      },
+    })
+    await api.close()
+    apis.splice(apis.indexOf(api), 1)
+
+    const second = await createOverlayApi({
+      store: new FsOverlayStore({root, now: makeClock()}),
+      overlayId: OVERLAY_ID,
+      origins: [STUDIO_ORIGIN],
+      now: makeClock(),
+    })
+    apis.push(second)
+    const body = await state(second)
+    expect(body.conflictSummary).toEqual({total: 0, hard: 0, soft: 0})
+    expect(
+      body.documents[0].conflicts.find((c: Rec) => c.id === conflictId)?.resolution?.type,
+    ).toBe('keep-local')
+  })
+})

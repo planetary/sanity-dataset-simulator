@@ -284,8 +284,21 @@ export function mergeDocument(request: MergeRequest): MergeResult {
   const base = request.currentBase
   const ancestor = request.ancestor
   const origin = request.origin ?? 'base'
-  const baseDeleted =
-    base === null && (request.baseStatus === 'deleted' || ancestor !== null)
+  /*
+   * DELETION IS AN OBSERVATION, NOT AN INFERENCE. §16.1 makes direct base
+   * reads the source of truth, so only an explicit `baseStatus: 'deleted'` —
+   * set by a caller that actually observed the base gone — may flag deletion.
+   * This used to also fire on `ancestor !== null`, i.e. on ANY commit that
+   * omitted `baseDocuments` while the record had a merge ancestor. Nothing in
+   * production ever sets 'deleted', so that heuristic was the only live
+   * detector — and in Mode 2 (no base plane exists) it manufactured hard
+   * BASE_DOCUMENT_DELETED conflicts on every edit of a base-ancestored
+   * document, blocking publish over a deletion nobody saw (found live
+   * 2026-08-11). An unobservable base merges as "nothing new observed": the
+   * local document is preserved without conflict, and genuine upstream
+   * deletions are the §16.6 drift scan's job to assert.
+   */
+  const baseDeleted = base === null && request.baseStatus === 'deleted'
 
   const classification = classifyBaseDeletion({
     touched: local !== null,

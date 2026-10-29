@@ -20,9 +20,35 @@ export interface ArticleSummary {
   readonly slug: string | null
 }
 
+/** One Portable Text span or inline object, as loosely as the site needs it. */
+export interface PortableTextChild {
+  readonly _type: string
+  readonly text?: string
+  readonly label?: string
+  readonly value?: number
+}
+
+export interface PortableTextBlock {
+  readonly _type: string
+  readonly _key: string
+  readonly style?: string
+  readonly children?: readonly PortableTextChild[]
+}
+
+export interface ArticleSection {
+  readonly _type: string
+  readonly _key: string
+  readonly quote?: string
+  readonly attribution?: string
+  readonly heading?: string
+  readonly count?: number
+}
+
 export interface ArticleDetail extends ArticleSummary {
   readonly publishedAt: string | null
   readonly tags: readonly string[] | null
+  readonly body: readonly PortableTextBlock[] | null
+  readonly sections: readonly ArticleSection[] | null
   readonly author: {readonly name: string | null} | null
 }
 

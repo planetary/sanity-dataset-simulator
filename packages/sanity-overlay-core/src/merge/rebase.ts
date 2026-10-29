@@ -290,10 +290,20 @@ function checkOperationMeaning(request: AutoRebaseRequest): AutoRebasePreconditi
 /** Precondition 4 — no base deletion and no parent shape change. */
 function checkStructure(request: AutoRebaseRequest, preview: MergeResult): AutoRebasePrecondition {
   const id = 'no-base-deletion-or-parent-shape-change'
-  const baseDeleted =
-    request.currentBase === null &&
-    (request.baseStatus === 'deleted' || request.ancestor !== null)
-  if (baseDeleted) return {id, satisfied: false, detail: 'The base document was deleted'}
+  /* A rebase needs a current base to rebase ONTO, so a null base always
+   * blocks — but "deleted" is an observation only an explicit
+   * `baseStatus: 'deleted'` may claim (§16.1; see merge.ts). An unobservable
+   * base blocks with the true reason instead. */
+  if (request.currentBase === null) {
+    return {
+      id,
+      satisfied: false,
+      detail:
+        request.baseStatus === 'deleted'
+          ? 'The base document was deleted'
+          : 'No current base was supplied to rebase onto',
+    }
+  }
 
   const structural = preview.conflicts.filter(
     (conflict) =>

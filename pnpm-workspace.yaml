@@ -1,3 +1,8 @@
 packages:
   - "packages/*"
   - "examples/*"
+  # Phase 0 spike runs a newer Studio than the rest of the repo; its own lockfile
+  # keeps that version out of the shared dependency graph.
+  - "!examples/sim-spike"
+  - "!examples/sim-next"
+  - "!examples/test-studio"

@@ -58,8 +58,12 @@ const SITE_ONLY_QUERIES: readonly OverlayQueryDefinition[] = [
   defineOverlayQuery({
     id: ARTICLE_BY_SLUG_QUERY,
     description: 'One article by slug, with its author dereferenced — the detail route.',
-    query: `*[_type == "article" && slug.current == $slug][0]{_id, title, "slug": slug.current, publishedAt, tags, author->{name}}`,
-    queryChecksum: '76f50c0f85d6c8508559f77a32defa623edfc45b3e01558e26de319c3e4ab1b3',
+    /* `body` and `sections` are plain field selections — no new candidate-plan
+     * shape, no traversal — added 2026-08-11 when the detail page was found
+     * rendering title/byline/tags and silently dropping the article's whole
+     * Portable Text body: the exact fields the branch workflow edits. */
+    query: `*[_type == "article" && slug.current == $slug][0]{_id, title, "slug": slug.current, publishedAt, tags, body, sections, author->{name}}`,
+    queryChecksum: '6cb22258ad716ee310b4cb95e848335450a7f9889a1d5f5bf0593073c52b59a7',
     allowedCallers: [...CALLERS],
     perspectives: [...PERSPECTIVES],
     candidatePlan: {

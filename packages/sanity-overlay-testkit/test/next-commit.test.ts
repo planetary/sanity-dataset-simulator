@@ -611,4 +611,101 @@ describe('a restarted server rebuilds its projection from disk', () => {
     const document = state.documents.find((d: any) => d.logicalId === 'article-1')
     expect(document.draft.title).toBe('Survives a restart')
   })
+
+  /**
+   * THE FRESH-CLONE CASE — `.runtime/` is gitignored, so a clone of a repo
+   * with a committed overlay has intents and snapshots but NO records. Found
+   * live 2026-08-11: the committed kitchen-sink overlay (revision 22, eight
+   * documentHeads) served zero documents from `/state` and the Mode 2 origin,
+   * while the CLI saw all eight. §14.4 step 6 and §29.7 step 4 both require
+   * materialization from the committed surface.
+   */
+  it('serves a base-ancestored edit after .runtime/ is deleted (fresh clone, patch + snapshot)', async () => {
+    const root = await makeRoot()
+    const first = await boot(root)
+
+    await post(first, '/commit', {
+      idempotencyKey: 'k1',
+      kind: 'actions',
+      payload: editAction('Survives a fresh clone'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+    await first.close()
+    running.splice(running.indexOf(first), 1)
+
+    await rm(join(root, '.sanity-overlay', '.runtime'), {recursive: true, force: true})
+
+    const second = await boot(root)
+    const state = await getJson(second, '/state')
+    const document = state.documents.find((d: any) => d.logicalId === 'article-1')
+    expect(document, 'the committed intent + snapshot must be enough to serve').toBeDefined()
+    expect(document.draft.title).toBe('Survives a fresh clone')
+    /* The base fields the branch never touched come from the SNAPSHOT. */
+    expect(document.draft.views).toBe(1)
+  })
+
+  /**
+   * A COMMIT THAT OMITS `baseDocuments` MUST NOT INVENT A BASE DELETION.
+   *
+   * The live reproduction (2026-08-11, Mode 2): Studio committed edits to a
+   * base-ancestored record; Mode 2 has no base plane, so `baseDocuments` was
+   * empty on every commit — and the server recorded BASE_DOCUMENT_DELETED
+   * hard conflicts for a deletion nobody observed, blocking branch publish.
+   * §16.1: deletion comes from direct base reads, not from one request's
+   * omission.
+   */
+  it('a follow-up commit without baseDocuments does not invent a base deletion', async () => {
+    const root = await makeRoot()
+    const server = await boot(root)
+
+    /* First touch WITH the base — captures the ancestor, records `modified`. */
+    await post(server, '/commit', {
+      idempotencyKey: 'k1',
+      kind: 'actions',
+      payload: editAction('First edit, base observed'),
+      baseDocuments: [BASE_ARTICLE],
+    })
+
+    /* Second edit with NO baseDocuments — the Mode 2 shape. */
+    const second = await post(server, '/commit', {
+      idempotencyKey: 'k2',
+      kind: 'actions',
+      payload: editAction('Second edit, base unobservable'),
+    })
+    expect(second.status).toBe(200)
+    expect(second.json.committed).toBe(true)
+
+    const state = await getJson(server, '/state')
+    const document = state.documents.find((d: any) => d.logicalId === 'article-1')
+    expect(document.draft.title).toBe('Second edit, base unobservable')
+    expect(document.conflicts ?? []).toEqual([])
+    expect(state.conflictSummary ?? {hard: 0}).toMatchObject({hard: 0})
+  })
+
+  it('serves a branch-created document after .runtime/ is deleted (fresh clone, replace)', async () => {
+    const root = await makeRoot()
+    const first = await boot(root)
+
+    await post(first, '/commit', {
+      idempotencyKey: 'k1',
+      kind: 'actions',
+      payload: [
+        {
+          actionType: 'sanity.action.document.create',
+          publishedId: 'note-9',
+          attributes: {_id: 'drafts.note-9', _type: 'note', title: 'Born on the branch'},
+        },
+      ],
+    })
+    await first.close()
+    running.splice(running.indexOf(first), 1)
+
+    await rm(join(root, '.sanity-overlay', '.runtime'), {recursive: true, force: true})
+
+    const second = await boot(root)
+    const state = await getJson(second, '/state')
+    const document = state.documents.find((d: any) => d.logicalId === 'note-9')
+    expect(document).toBeDefined()
+    expect(document.draft.title).toBe('Born on the branch')
+  })
 })

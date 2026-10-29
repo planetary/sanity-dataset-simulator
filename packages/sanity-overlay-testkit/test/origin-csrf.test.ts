@@ -240,6 +240,25 @@ describe('the Mode 2 write routes still accept every legitimate caller', () => {
     })
   }
 
+  /* What a real browser actually sends. A Studio on `http://localhost:<port>`
+   * talking to the origin at `https://<projectId>.localhost:<port>` differs in
+   * scheme AND site, so Chrome labels every write `Sec-Fetch-Site: cross-site`.
+   * The cases above omit the header and so never saw it; with a stock Studio
+   * 6.20 pointed here by `apiHost` alone, every edit was refused (Phase 0,
+   * docs/plans/sanity-sim.md). A granted Origin is the stronger, unforgeable
+   * fact, so it decides; `cross-site` only refuses when no granted Origin
+   * vouches for the request. */
+  for (const site of ['cross-site', 'same-site']) {
+    it(`accepts the loopback Studio origin when the browser labels it ${site}`, async () => {
+      const {status} = await send(
+        WRITE_ROUTES[0]!,
+        {'content-type': 'application/json', origin: STUDIO_ORIGIN, 'sec-fetch-site': site},
+        creation(),
+      )
+      expect(status).toBe(200)
+    })
+  }
+
   it('accepts a non-browser caller with no Origin at all', async () => {
     const {status} = await send(
       WRITE_ROUTES[0]!,

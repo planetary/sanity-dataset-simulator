@@ -55,6 +55,8 @@ const BASE_TITLE_02 = baseDoc('article-02').title as string
  * the wrong reason.
  */
 const BRANCH_TITLE_01 = 'Branch edit ✅ 日本語 — the first piece'
+/** A Portable Text edit — the site must render the branch BODY, not just titles. */
+const BRANCH_BODY_TEXT = 'Branch body paragraph — typed on the branch'
 const BRANCH_CREATED_SLUG = 'branch-article'
 const BRANCH_CREATED_TITLE = 'Branch-created piece'
 /** A branch title that would break the page if it were interpolated raw. */
@@ -77,7 +79,27 @@ beforeAll(async () => {
       {
         kind: 'edit',
         id: 'article-01',
-        operations: [{type: 'set', path: ['title'], value: BRANCH_TITLE_01}],
+        operations: [
+          {type: 'set', path: ['title'], value: BRANCH_TITLE_01},
+          /* Exactly the shape Studio's PT editor commits: a keyed block
+           * appended to the existing body. */
+          {
+            type: 'insert',
+            path: ['body', -1],
+            position: 'after',
+            items: [
+              {
+                _type: 'block',
+                _key: 'branch-b1',
+                style: 'normal',
+                markDefs: [],
+                children: [
+                  {_type: 'span', _key: 'branch-s1', text: BRANCH_BODY_TEXT, marks: []},
+                ],
+              },
+            ],
+          },
+        ],
       },
       {
         kind: 'edit',
@@ -144,6 +166,30 @@ describe('the local site renders the branch overlay', () => {
 
     expect(response.body).toContain(BRANCH_TITLE_01)
     expect(response.body).not.toContain(BASE_TITLE_01)
+  })
+
+  /**
+   * THE CONTENT, NOT JUST THE TITLE. Found live 2026-08-11: the detail page
+   * rendered title, byline and tags and silently dropped the article's whole
+   * Portable Text body and its sections — the exact field types the branch
+   * workflow exists to edit. Base body, branch-added body, and both section
+   * shapes must all be visible in the HTML a reader sees.
+   */
+  it('renders the Portable Text body — the base paragraph AND the branch-added one', async () => {
+    const response = await get(overlayClient(), '/articles/article-1')
+
+    expect(response.status).toBe(200)
+    /* The base block's spans, joined ("Body of article 1 with a " + "link"). */
+    expect(response.body).toContain('Body of article 1 with a')
+    expect(response.body).toContain(BRANCH_BODY_TEXT)
+  })
+
+  it('renders the keyed object sections — quote and stats', async () => {
+    const response = await get(overlayClient(), '/articles/article-1')
+
+    expect(response.body).toContain('Quote in article 1')
+    expect(response.body).toContain('Author 2')
+    expect(response.body).toContain('Stats')
   })
 
   it('shows the BRANCH title on the article detail page', async () => {

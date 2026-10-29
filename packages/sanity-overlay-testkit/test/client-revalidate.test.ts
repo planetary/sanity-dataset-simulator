@@ -68,6 +68,28 @@ const titleOf = (client: {fetch: (id: string, params?: Record<string, unknown>) 
     .then((value) => (value as {title: string}).title)
 
 describe('overlay change detection', () => {
+  /**
+   * THE FRESH-CLONE CASE — `.runtime/` is gitignored, so a clone of a repo
+   * with a committed overlay has intents and snapshots but no records. The
+   * fs loader used to skip such documents entirely, so the SITE rendered the
+   * BASE value of a document the branch had edited — observed live 2026-08-11
+   * against the committed kitchen-sink overlay: `/` showed "Article 1" while
+   * `intent.json` plainly carried the branch title. §14.4 step 6 / §29.7
+   * step 4 require the committed surface to be materializable.
+   */
+  it('serves the branch value from a fresh clone (.runtime/ deleted)', async () => {
+    await rm(join(root, '.sanity-overlay', '.runtime'), {recursive: true, force: true})
+
+    const client = createOverlayClient({
+      mode: 'fs',
+      base: createDocumentBaseSource(BASE),
+      overlay: createFsOverlayStateLoader({root}),
+      perspective: 'drafts',
+    })
+
+    expect(await titleOf(client)).toBe(FIRST_TITLE)
+  })
+
   it('reflects a later on-disk commit on the next read', async () => {
     const client = createOverlayClient({
       mode: 'fs',

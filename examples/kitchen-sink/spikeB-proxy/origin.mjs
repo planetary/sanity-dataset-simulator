@@ -60,6 +60,7 @@ import {
   discardDraft,
   isForbiddenKey,
   publish,
+  recordFromIntent,
   resolveVersionBatch,
   toPublishedId,
   unpublish,
@@ -297,9 +298,14 @@ function assertWriteIsNotForged(request, allowed) {
       {origin: origin ?? null},
     )
 
+  /* A granted Origin decides first. Page JS cannot forge `Origin`, and a stock
+   * Studio on `http://localhost` writing to `https://<project>.localhost` is
+   * always labelled `cross-site` (scheme and site both differ), so checking the
+   * label first refused every legitimate write. `cross-site` still refuses
+   * whenever no granted Origin vouches for the request. */
+  if (typeof origin === 'string' && origin !== '' && isGrantedOrigin(origin, allowed)) return
   if (site === 'cross-site') throw forbidden()
   if (typeof origin !== 'string' || origin === '') return
-  if (isGrantedOrigin(origin, allowed)) return
   throw forbidden()
 }
 
@@ -975,7 +981,25 @@ export async function createOriginHandler(options = {}) {
     const heads = await theStore.listChangedDocuments(theManifest.overlayId, {includeUnchanged: true})
     for (const head of heads) {
       const read = await theStore.readDocumentByLogicalId(theManifest.overlayId, head.logicalId)
-      if (read?.record) documents[read.record.logicalId] = read.record
+      if (read?.record) {
+        documents[read.record.logicalId] = read.record
+        continue
+      }
+      /* The fresh-clone path — `.runtime/` is gitignored, so a cloned overlay
+       * has intents and snapshots but no records. Same rebuild the overlay API
+       * does (see `hydrateState` in sanity-overlay-next): `recordFromIntent`
+       * refuses anything it cannot rebuild honestly, and refused documents
+       * stay unserved rather than guessed at. */
+      if (read?.intent) {
+        const rebuilt = recordFromIntent(read.intent, {
+          overlayId: theManifest.overlayId,
+          baseSnapshot: read.baseSnapshot,
+          runtimeRevision: read.head.runtimeRevision,
+          createdAt: read.head.updatedAt,
+          updatedAt: read.head.updatedAt,
+        })
+        if (rebuilt !== null) documents[rebuilt.logicalId] = rebuilt
+      }
     }
     return createOverlayState({
       overlayId: theManifest.overlayId,

@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media Library (sanity-sim)</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<!--
+  The local stand-in for media.sanity.io. Studio frames it, through
+  mediaLibrary.__internal.frontendHost (set by sanity-sim's Studio wiring), as:
+    <host>/<organizationId>/<libraryId>/assets[/<assetId>]?createPluginView=<base64url JSON>   picker
+    <host>/plugin/v1/library/<libraryId>/upload?auth=…                                         hidden uploader
+  and talks to it with Studio's postMessage protocol: assetSelection (picker → Studio);
+  pageLoaded, uploadRequest, uploadProgress, uploadResponse (uploader ↔ Studio).
+-->
+<style>
+  :root { --bg: #fff; --fg: #1d2129; --muted: #6e7683; --line: #e3e4e8; --card: #f6f6f8; --accent: #6a3fd4; --accent-contrast: #fff; --error: #d13a3a; }
+  :root[data-scheme="dark"] { --bg: #101112; --fg: #e3e4e8; --muted: #8a919c; --line: #2a2c30; --card: #1b1c1f; --accent: #b49cff; --accent-contrast: #170f2e; --error: #ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 1; }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  header .note { color: var(--muted); font-size: 12px; flex: 1; }
+  input[type="search"] { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); min-width: 180px; }
+  button, label.button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast); cursor: pointer; }
+  main { padding: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .asset { border: 2px solid transparent; border-radius: 8px; background: var(--card); cursor: pointer; overflow: hidden; text-align: left; padding: 0; color: inherit; font: inherit; }
+  .asset:hover { border-color: var(--line); }
+  .asset[aria-pressed="true"] { border-color: var(--accent); }
+  .thumb { aspect-ratio: 4 / 3; display: grid; place-items: center; background: var(--line); color: var(--muted); font-size: 12px; text-transform: uppercase; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .meta { padding: 8px; }
+  .meta .title { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta .sub { font-size: 11px; color: var(--muted); }
+  .empty, .status { color: var(--muted); padding: 32px 0; text-align: center; }
+  .status.error { color: var(--error); }
+  input[type="file"] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Media Library</h1>
+  <span class="note" id="note">Local library (sanity-sim)</span>
+  <input type="search" id="search" placeholder="Filter by name" aria-label="Filter by name">
+  <label class="button" for="file">Upload</label>
+  <input type="file" id="file" multiple>
+</header>
+<main>
+  <div class="status" id="status">Loading…</div>
+  <div class="grid" id="grid"></div>
+</main>
+<script>
+(() => {
+  const BASE = location.pathname.slice(0, location.pathname.indexOf('/_sim/media-library') + '/_sim/media-library'.length)
+  const rest = location.pathname.slice(BASE.length).split('/').filter(Boolean)
+  const TYPE_NAMES = {image: 'sanity.imageAsset', file: 'sanity.fileAsset', video: 'sanity.videoAsset'}
+  const post = (message) => window.parent !== window && window.parent.postMessage(message, '*')
+  const api = (libraryId, tail) => `/vX/media-libraries/${encodeURIComponent(libraryId)}${tail}`
+
+  function decodeParams(value) {
+    if (!value) return {}
+    try {
+      const base64 = value.replace(/-/g, '+').replace(/_/g, '/')
+      return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))))
+    } catch {
+      try { return JSON.parse(value) } catch { return {} }
+    }
+  }
+
+  async function upload(libraryId, file) {
+    const params = new URLSearchParams({filename: file.name, title: file.name})
+    const response = await fetch(api(libraryId, `/upload?${params}`), {method: 'POST', headers: {'content-type': file.type || 'application/octet-stream'}, body: file})
+    const body = await response.json()
+    if (!response.ok) throw new Error(body?.error?.description ?? `upload failed (${response.status})`)
+    return body
+  }
+
+  /* -------------------------------------------------------------- hidden uploader */
+  if (rest[0] === 'plugin') {
+    const libraryId = rest[3]
+    document.body.hidden = true
+    window.addEventListener('message', async (event) => {
+      if (event.source !== window.parent || event.data?.type !== 'uploadRequest') return
+      const files = event.data.files ?? []
+      const progress = (id, status, value, error) => post({type: 'uploadProgress', files: [{id, status, progress: value, ...(error ? {error} : {})}]})
+      const assets = []
+      for (const {id, file} of files) {
+        progress(id, 'uploading', 0)
+        try {
+          const result = await upload(libraryId, file)
+          progress(id, result.uploadSession?.status === 'alreadyExists' ? 'alreadyExists' : 'complete', 1)
+          assets.push({asset: result.asset, assetId: result.asset._id, assetType: result.asset.assetType, assetInstanceId: result.assetInstance._id})
+        } catch (error) {
+          progress(id, 'error', 0, {message: error.message})
+        }
+      }
+      post({type: 'uploadResponse', assets})
+    })
+    window.addEventListener('pagehide', () => post({type: 'pageUnloaded', page: 'upload'}))
+    post({type: 'pageLoaded', page: 'upload'})
+    return
+  }
+
+  /* -------------------------------------------------------------- picker */
+  const [organizationId, libraryId, view, focusId] = rest
+  const params = decodeParams(new URLSearchParams(location.search).get('createPluginView'))
+  document.documentElement.dataset.scheme = params.scheme === 'dark' ? 'dark' : 'light'
+  const types = (params.selectAssetTypes ?? []).map((type) => TYPE_NAMES[type]).filter(Boolean)
+  const grid = document.getElementById('grid')
+  const status = document.getElementById('status')
+  const search = document.getElementById('search')
+  document.getElementById('note').textContent = `Local library ${libraryId ?? ''} (sanity-sim)${types.length ? ` · ${(params.selectAssetTypes ?? []).join(', ')}` : ''}`
+  if (organizationId === undefined || view !== 'assets') {
+    status.textContent = 'This page is opened by Studio as its Media Library picker.'
+    return
+  }
+
+  let assets = []
+  let selected = null
+
+  const QUERY = `*[_type == "sanity.asset" && (count($types) == 0 || assetType in $types) && (!defined($focus) || _id == $focus)] | order(_updatedAt desc) {
+    ..., "instance": currentVersion->{_id, _type, url, originalFilename, mimeType, size, extension, metadata{dimensions}}
+  }`
+
+  async function load() {
+    const search = new URLSearchParams({query: QUERY, '$types': JSON.stringify(types), '$focus': JSON.stringify(focusId ?? null)})
+    const response = await fetch(api(libraryId, `/query?${search}`))
+    const body = await response.json()
+    if (!response.ok) throw new Error(body?.error?.description ?? `query failed (${response.status})`)
+    assets = body.result ?? []
+    render()
+  }
+
+  function describe(asset) {
+    const instance = asset.instance ?? {}
+    const dims = instance.metadata?.dimensions
+    const size = instance.size ? `${Math.max(1, Math.round(instance.size / 1024))} KB` : ''
+    return [dims ? `${dims.width}×${dims.height}` : instance.extension?.toUpperCase(), size].filter(Boolean).join(' · ')
+  }
+
+  function render() {
+    const term = search.value.trim().toLowerCase()
+    const shown = assets.filter((asset) => !term || `${asset.title ?? ''} ${asset.instance?.originalFilename ?? ''}`.toLowerCase().includes(term))
+    grid.replaceChildren(...shown.map((asset) => {
+      const card = document.createElement('button')
+      card.className = 'asset'
+      card.type = 'button'
+      card.setAttribute('aria-pressed', String(selected === asset._id))
+      const thumb = document.createElement('div')
+      thumb.className = 'thumb'
+      if (asset.instance?._type === 'sanity.imageAsset') {
+        const img = document.createElement('img')
+        img.src = `${asset.instance.url}?w=400&h=300&fit=crop`
+        img.alt = ''
+        img.loading = 'lazy'
+        thumb.append(img)
+      } else {
+        thumb.textContent = asset.instance?.extension ?? 'file'
+      }
+      const meta = document.createElement('div')
+      meta.className = 'meta'
+      const title = document.createElement('div')
+      title.className = 'title'
+      title.textContent = asset.title ?? asset.instance?.originalFilename ?? asset._id
+      const sub = document.createElement('div')
+      sub.className = 'sub'
+      sub.textContent = describe(asset)
+      meta.append(title, sub)
+      card.append(thumb, meta)
+      card.addEventListener('click', () => select(asset))
+      return card
+    }))
+    status.hidden = shown.length > 0
+    status.className = 'status'
+    if (shown.length === 0) status.textContent = assets.length === 0 ? 'The library is empty. Upload a file to start.' : 'Nothing matches the filter.'
+  }
+
+  function select(asset) {
+    selected = selected === asset._id ? null : asset._id
+    const {instance, ...container} = asset
+    post({
+      type: 'assetSelection',
+      selection: selected ? [{asset: container, assetId: container._id, assetType: container.assetType, assetInstanceId: instance?._id ?? container.currentVersion?._ref}] : [],
+    })
+    render()
+  }
+
+  function fail(error) {
+    status.hidden = false
+    status.className = 'status error'
+    status.textContent = error.message
+  }
+
+  search.addEventListener('input', render)
+  document.getElementById('file').addEventListener('change', async (event) => {
+    const files = [...event.target.files]
+    event.target.value = ''
+    if (files.length === 0) return
+    status.hidden = false
+    status.className = 'status'
+    status.textContent = `Uploading ${files.length === 1 ? files[0].name : `${files.length} files`}…`
+    try {
+      let last
+      for (const file of files) last = await upload(libraryId, file)
+      await load()
+      const uploaded = assets.find((asset) => asset._id === last?.asset?._id)
+      if (uploaded && files.length === 1) select(uploaded)
+    } catch (error) {
+      fail(error)
+    }
+  })
+  load().catch(fail)
+})()
+</script>
+</body>
+</html>

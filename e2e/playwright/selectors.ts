@@ -40,6 +40,14 @@ export const OVERLAY_BANNER = 'overlay-status-banner'
 /** `statusLayout.ts:172`. Replaces the whole Studio in a fatal state. */
 export const OVERLAY_FATAL = 'overlay-fatal'
 
+/**
+ * The 2026-08-11 two-tier banner: revision and blocking facts stay on the
+ * always-visible line; identity/storage/base/checkpoint/API live behind this
+ * toggle, in this region.
+ */
+export const OVERLAY_BANNER_DETAILS_TOGGLE = 'overlay-banner-details-toggle'
+export const OVERLAY_BANNER_DETAILS = 'overlay-banner-details'
+
 /** `status.ts` — the value of `data-overlay-state` on the banner. */
 export type OverlayBannerState =
   | 'healthy'
@@ -114,7 +122,40 @@ export const STUDIO = {
   globalPerspectiveMenuButton: 'global-perspective-menu-button',
   formView: 'form-view',
   stringInput: 'string-input',
+  numberInput: 'number-input',
   ptEditor: 'pt-editor',
+  /**
+   * The Portable Text editor renders inert until clicked — a full-size
+   * "Click to activate" overlay (`ActivateOnFocus` in the dist) sits over the
+   * contenteditable. Typing without dismissing it goes nowhere, silently.
+   */
+  ptActivateOverlay: 'activate-overlay',
+  ptInputPlaceholder: 'pt-input-placeholder',
+
+  /**
+   * Array inputs. `single` vs `multiple` is the number of MEMBER TYPES the
+   * schema declares, not the number of items: `tags` (one member type) gets
+   * `add-single-primitive-button`; `sections` (quoteSection | statsSection)
+   * gets `add-multiple-object-button`, which opens a menu of member types.
+   */
+  addSingleObjectButton: 'add-single-object-button',
+  addMultipleObjectButton: 'add-multiple-object-button',
+  arrayItemMenuButton: 'array-item-menu-button',
+  /**
+   * The modal a keyed-array object item's fields are edited in. THREE ids,
+   * because which one this build renders depends on the opening path: the
+   * kitchen-sink sections array actually produced `nested-object-dialog`
+   * (confirmed by DOM dump on a real run); `edit-portal-dialog` and
+   * `default-edit-object-dialog` are the dist's other two edit-dialog
+   * spellings. `objectEditDialog()` in `interactions.ts` accepts any of them.
+   *
+   * NOTE: the enabled "Add item" button of a PRIMITIVE array carries NO test
+   * id in this build (`add-single-primitive-button` exists only on a disabled
+   * placeholder), so primitive appends locate by role + label.
+   */
+  editObjectDialog: 'default-edit-object-dialog',
+  editPortalDialog: 'edit-portal-dialog',
+  nestedObjectDialog: 'nested-object-dialog',
   previewHeading: 'default-preview__heading',
   newDocumentButton: 'new-document-button',
   actionMenuButton: 'action-menu-button',
@@ -147,6 +188,19 @@ export const STUDIO = {
  */
 export function actionTestId(label: string): string {
   return `action-${label.toLowerCase().replace(/\s+/g, '')}`
+}
+
+/**
+ * The per-field wrapper.
+ *
+ * The dist builds it as `field-${PathUtils.toString(path)}` (change-indicator
+ * wrapper), so a top-level field is `field-sections` and a nested one is the
+ * dotted path. This is the only stable way to scope an array's Add-item button
+ * to ITS field — `add-single-primitive-button` identifies the widget kind, and
+ * a document with two arrays has two of them.
+ */
+export function fieldTestId(name: string): string {
+  return `field-${name}`
 }
 
 /* ═════════════════════════════════════════════════════════ locators ══ */

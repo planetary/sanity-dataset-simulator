@@ -101,10 +101,20 @@ test.describe('Studio boots on the product path', () => {
     const banner = page.getByTestId(OVERLAY_BANNER)
     /* §21.3 requires storage and revision on the banner. The revision is read
      * off the manifest the SERVER wrote, so agreement here is the banner
-     * reporting the world rather than reporting itself. */
-    await expect(banner).toContainText('Storage:')
+     * reporting the world rather than reporting itself.
+     *
+     * Two tiers since the 2026-08-11 redesign: the revision stays on the
+     * always-visible line; storage and the conflict summary are context and
+     * live behind the Details toggle — so this spec now drives the toggle the
+     * way a person reaches those facts. */
     await expect(banner).toContainText(`Overlay revision: ${manifest!.revision}`)
-    await expect(banner).toContainText('Conflicts: 0 soft, 0 hard')
+    await expect(banner.getByTestId('overlay-banner-details')).toHaveCount(0)
+
+    await banner.getByTestId('overlay-banner-details-toggle').click()
+    const details = banner.getByTestId('overlay-banner-details')
+    await expect(details).toBeVisible()
+    await expect(details).toContainText('Storage:')
+    await expect(details).toContainText('Conflicts: 0 soft, 0 hard')
   })
 
   test('the banner is on every screen, not just the first one', async ({page, studio}) => {

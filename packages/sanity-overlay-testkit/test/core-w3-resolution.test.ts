@@ -14,9 +14,11 @@ import {
   createConflict,
   isAcknowledgementValid,
   resolveConflict,
+  resolveRecordConflict,
   summarizeConflicts,
 } from '../../sanity-overlay-core/src/conflicts/index'
 import type {ResolveConflictRequest} from '../../sanity-overlay-core/src/conflicts/index'
+import type {OverlayDocumentRecord} from '../../sanity-overlay-core/src/index'
 import {ANCESTOR_ARTICLE, clone, localVariant, variant} from '../src/mergeFixtures'
 
 // Phase 2 workstream W3 — PRD §28.3 document conflict panel actions mapped to the
@@ -321,5 +323,202 @@ describe('§28.6 conflict acknowledgement', () => {
         localRevision: 'overlay.5.0123456789ab',
       }),
     ).toBe(false)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * resolveRecordConflict — the record-level wrapper (PRD §28.1, §28.3)
+ * ------------------------------------------------------------------ *
+ *
+ * `resolveConflict` is pure and version-scoped; nothing applied it to an
+ * OverlayDocumentRecord, so no server or CLI could resolve anything — the
+ * Studio's fully-built resolution UI POSTed a `conflictResolution` commit and
+ * got 400 INVALid_REQUEST (found live 2026-08-11, against the two false
+ * BASE_DOCUMENT_DELETED conflicts of the same day). This wrapper is the
+ * shared record mapper the API commit kind and the CLI verb both call.
+ */
+
+function conflictedRecord(
+  overrides: Partial<OverlayDocumentRecord> = {},
+): OverlayDocumentRecord {
+  const materialized = clone(LOCAL)
+  return {
+    formatVersion: 1,
+    overlayId: 'overlay-w3',
+    logicalId: 'article-1',
+    schemaType: 'article',
+    origin: 'base',
+    base: {
+      firstTouchedAt: NOW,
+      published: {
+        revision: 'base-rev-1',
+        snapshot: clone(ANCESTOR_ARTICLE),
+        checksum: 'checksum-base',
+        capturedAt: NOW,
+      },
+      draft: null,
+      baseStatus: 'present',
+    },
+    local: {
+      draft: {
+        materialized,
+        touchedPaths: [['title']],
+        operations: [{type: 'set', path: ['title'], value: 'Branch title'}],
+        ancestorKind: 'base-published',
+        ancestorRevision: 'base-rev-1',
+        overlayRevision: '7',
+        createdAt: NOW,
+        updatedAt: NOW,
+      },
+      published: null,
+      draftTombstone: false,
+      publishedTombstone: false,
+    },
+    conflicts: [conflict('BASE_DOCUMENT_DELETED', null)],
+    runtimeRevision: 'overlay.7.abcdef012345',
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  }
+}
+
+const LATER = '2026-08-11T21:00:00.000Z'
+
+describe('resolveRecordConflict — record-level resolution', () => {
+  it('keep-as-branch-created drops the base ancestry and keeps the content', () => {
+    const record = conflictedRecord()
+    const result = resolveRecordConflict({
+      record,
+      conflictId: record.conflicts[0]!.id,
+      action: 'keep-as-branch-created',
+      now: LATER,
+      transactionId: 'txn-r1',
+      actor: ACTOR,
+      currentBase: null,
+    })
+
+    expect(result.record.origin).toBe('branch')
+    /* The whole point of the action: no ancestor remains to conflict with. */
+    expect(result.record.base).toBeNull()
+    expect(result.record.local.draft?.ancestorKind).toBe('branch-created')
+    expect(result.record.local.draft?.materialized.title).toBe('Branch title')
+    expect(result.record.local.draftTombstone).toBe(false)
+    expect(result.record.updatedAt).toBe(LATER)
+
+    const resolved = result.record.conflicts.find((c) => c.id === record.conflicts[0]!.id)
+    expect(resolved?.resolution?.type).toBe('keep-local')
+    expect(resolved?.resolution?.resolvedAt).toBe(LATER)
+    expect(result.transaction.type).toBe('conflict-resolution')
+    expect(result.transaction.action).toBe('keep-as-branch-created')
+  })
+
+  it('accept-base-deletion tombstones both perspectives', () => {
+    const record = conflictedRecord()
+    const result = resolveRecordConflict({
+      record,
+      conflictId: record.conflicts[0]!.id,
+      action: 'accept-base-deletion',
+      now: LATER,
+      transactionId: 'txn-r2',
+      actor: ACTOR,
+      currentBase: null,
+    })
+
+    expect(result.record.local.draft).toBeNull()
+    expect(result.record.local.draftTombstone).toBe(true)
+    expect(result.record.local.publishedTombstone).toBe(true)
+    expect(
+      result.record.conflicts.find((c) => c.id === record.conflicts[0]!.id)?.resolution?.type,
+    ).toBe('delete-local')
+  })
+
+  it('a path action rewrites the draft through the same version semantics', () => {
+    const record = conflictedRecord({conflicts: [conflict('SAME_PATH_CHANGED', ['title'])]})
+    const result = resolveRecordConflict({
+      record,
+      conflictId: record.conflicts[0]!.id,
+      action: 'accept-current-staging',
+      now: LATER,
+      transactionId: 'txn-r3',
+      actor: ACTOR,
+      currentBase: BASE,
+    })
+
+    expect(result.record.local.draft?.materialized.title).toBe('Upstream title')
+    expect(result.record.local.draft?.touchedPaths).toEqual([])
+    expect(result.record.conflicts[0]?.resolution?.type).toBe('accept-base')
+  })
+
+  it('refuses an unknown conflict id', () => {
+    const record = conflictedRecord()
+    expect(() =>
+      resolveRecordConflict({
+        record,
+        conflictId: 'no-such-conflict',
+        action: 'keep-as-branch-created',
+        now: LATER,
+        transactionId: 'txn-r4',
+        actor: ACTOR,
+        currentBase: null,
+      }),
+    ).toThrow(/no-such-conflict/)
+  })
+
+  it('refuses to resolve an already-resolved conflict a second time', () => {
+    const record = conflictedRecord()
+    const first = resolveRecordConflict({
+      record,
+      conflictId: record.conflicts[0]!.id,
+      action: 'keep-as-branch-created',
+      now: LATER,
+      transactionId: 'txn-r5',
+      actor: ACTOR,
+      currentBase: null,
+    })
+    expect(() =>
+      resolveRecordConflict({
+        record: first.record,
+        conflictId: record.conflicts[0]!.id,
+        action: 'accept-base-deletion',
+        now: LATER,
+        transactionId: 'txn-r6',
+        actor: ACTOR,
+        currentBase: null,
+      }),
+    ).toThrow(/already resolved/i)
+  })
+
+  it('refuses an action the conflict type does not offer', () => {
+    const record = conflictedRecord()
+    expect(() =>
+      resolveRecordConflict({
+        record,
+        conflictId: record.conflicts[0]!.id,
+        action: 'remove-local-override',
+        now: LATER,
+        transactionId: 'txn-r7',
+        actor: ACTOR,
+        currentBase: null,
+      }),
+    ).toThrow(/not applicable|does not offer/i)
+  })
+
+  it('refuses rename-branch-id at the record level, by name', () => {
+    /* Renaming moves the manifest head to a new logical id — store surgery this
+     * record-scoped wrapper must not pretend to do. Refused loudly until a
+     * store-level rename exists. */
+    const record = conflictedRecord({conflicts: [conflict('LOCAL_ID_COLLISION', null)]})
+    expect(() =>
+      resolveRecordConflict({
+        record,
+        conflictId: record.conflicts[0]!.id,
+        action: 'rename-branch-id',
+        now: LATER,
+        transactionId: 'txn-r8',
+        actor: ACTOR,
+        currentBase: null,
+        newId: 'article-1-branch',
+      }),
+    ).toThrow(/rename/i)
   })
 })

@@ -1024,6 +1024,11 @@ describe('the typecheck gate covers every package it can', () => {
    *                           core-boundaries, and the untyped .mjs imports
    *                           from examples/kitchen-sink.
    *
+   *   sanity-sim              Plain ESM JavaScript by design (`npx` runs it with
+   *                           no build step); there is no TypeScript to check.
+   *                           Covered instead by its own node:test job
+   *                           (`sanity-sim` in .github/workflows/ci.yml).
+   *
    * CLEARED 2026-08-07: `sanity-overlay-cli` and `sanity-overlay-studio` were
    * both listed here as STALE exclusions -- the comment already said so, and
    * said the remedy (@types/node in the lockfile for the cli, a declared
@@ -1033,7 +1038,7 @@ describe('the typecheck gate covers every package it can', () => {
    * with cli and studio appearing on both sides. Both re-measured at 0 errors
    * on 2026-08-07 before being removed from here.
    */
-  const EXCLUDED = ['sanity-overlay-client', 'sanity-overlay-testkit']
+  const EXCLUDED = ['sanity-overlay-client', 'sanity-overlay-testkit', 'sanity-sim']
 
   /*
    * Anchored at `run:` so a COMMENTED step cannot count. The previous version

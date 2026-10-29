@@ -16,7 +16,7 @@
  */
 import {watch as fsWatch, type FSWatcher} from 'node:fs'
 import {isAbsolute, join, resolve} from 'node:path'
-import {isOverlayStoreError} from 'sanity-overlay-core'
+import {isOverlayStoreError, recordFromIntent} from 'sanity-overlay-core'
 import {FsOverlayStore, OVERLAY_DIR} from 'sanity-overlay-store-fs'
 import type {OverlayRecordMap} from 'sanity-overlay-core'
 import type {OverlayStateLoader, OverlayStateSnapshot} from './types'
@@ -73,11 +73,28 @@ export function createFsOverlayStateLoader(
       const heads = await store.listChangedDocuments(manifest.overlayId, {includeUnchanged: true})
       for (const head of heads) {
         const read = await store.readDocumentByLogicalId(manifest.overlayId, head.logicalId)
+        if (read?.record) {
+          records[read.record.logicalId] = read.record
+          continue
+        }
         /* `record === null` is a fresh clone where `.runtime/` was never
-         * committed: the review surface survives but the replayable record does
-         * not. Rebuilding it needs the three-way merge engine and is not a read
-         * client's job — the document is skipped, never faked from `intent`. */
-        if (read?.record) records[read.record.logicalId] = read.record
+         * committed: the review surface survives but the replayable record
+         * does not. `recordFromIntent` (core) rebuilds it from the committed
+         * intent + base snapshot — §14.4 step 6 — and refuses (`null`)
+         * anything it cannot rebuild honestly (a patch layer with no
+         * snapshot, unresolved conflicts); refused documents stay skipped.
+         * Before this branch existed the SITE rendered the base value of a
+         * branch-edited document (found live 2026-08-11). */
+        if (read?.intent) {
+          const rebuilt = recordFromIntent(read.intent, {
+            overlayId: manifest.overlayId,
+            baseSnapshot: read.baseSnapshot,
+            runtimeRevision: read.head.runtimeRevision,
+            createdAt: read.head.updatedAt,
+            updatedAt: read.head.updatedAt,
+          })
+          if (rebuilt !== null) records[rebuilt.logicalId] = rebuilt
+        }
       }
 
       return {

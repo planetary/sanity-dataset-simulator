@@ -305,6 +305,99 @@ describe('§35.2 core merge unit tests', () => {
     })
   })
 
+  /**
+   * AN UNOBSERVABLE BASE IS NOT A DELETED BASE.
+   *
+   * Found live, 2026-08-11, in Mode 2 (origin — no base plane exists): every
+   * commit that touched a base-ancestored record arrived with no
+   * `baseDocuments`, so `currentBase` was `null`, and the old inference
+   * `base === null && (baseStatus === 'deleted' || ancestor !== null)`
+   * flagged BASE_DOCUMENT_DELETED — a hard conflict, publish blocked — for a
+   * base nobody observed to be gone. Nothing in production ever sets
+   * `baseStatus: 'deleted'`, so the ancestor disjunct was the ONLY live
+   * detector, and it cannot distinguish "deleted" from "not looked at".
+   *
+   * PRD §16.1 pins the rule these tests enforce: deletion is detected by
+   * DIRECT BASE READS ("Use direct base reads as the source of truth"), so the
+   * merge engine may conclude deletion only from an explicit
+   * `baseStatus: 'deleted'` — an assertion by a caller that observed it —
+   * never from the mere absence of base documents in one commit's request.
+   */
+  it('does NOT flag deletion when the base is merely unobservable (ancestor present, baseStatus present)', () => {
+    const local = localVariant(ANCESTOR_ARTICLE, (document) => {
+      document.title = 'Branch title'
+    })
+
+    const result = mergeDocument(
+      request({
+        documentId: 'article-1',
+        ancestor: ANCESTOR_ARTICLE,
+        currentBase: null,
+        baseStatus: 'present',
+        localMaterialized: local,
+        localTouchedPaths: [['title']],
+      }),
+    )
+
+    expect(result.document?.title).toBe('Branch title')
+    expect(result.conflicts).toEqual([])
+  })
+
+  it('does NOT flag deletion when baseStatus is absent entirely', () => {
+    const local = localVariant(ANCESTOR_ARTICLE, (document) => {
+      document.title = 'Branch title'
+    })
+
+    const result = mergeDocument(
+      request({
+        documentId: 'article-1',
+        ancestor: ANCESTOR_ARTICLE,
+        currentBase: null,
+        localMaterialized: local,
+        localTouchedPaths: [['title']],
+      }),
+    )
+
+    expect(result.document?.title).toBe('Branch title')
+    expect(result.conflicts).toEqual([])
+  })
+
+  it('reports an untouched document with an unobservable base as missing, not base-deleted', () => {
+    const result = mergeDocument(
+      request({
+        documentId: 'article-1',
+        ancestor: ANCESTOR_ARTICLE,
+        currentBase: null,
+        baseStatus: 'present',
+        localMaterialized: null,
+      }),
+    )
+
+    expect(result.document).toBeNull()
+    expect(result.absence).toBe('missing')
+  })
+
+  it('still flags deletion on the EXPLICIT signal alone — no ancestor required', () => {
+    const local = localVariant(ANCESTOR_ARTICLE, (document) => {
+      document.title = 'Branch title'
+    })
+
+    const result = mergeDocument(
+      request({
+        documentId: 'article-1',
+        ancestor: null,
+        currentBase: null,
+        baseStatus: 'deleted',
+        localMaterialized: local,
+        localTouchedPaths: [['title']],
+      }),
+    )
+
+    expect(result.document?.title).toBe('Branch title')
+    const conflict = conflictAt(result.conflicts, 'BASE_DOCUMENT_DELETED')
+    expect(conflict?.severity).toBe('hard')
+  })
+
   it('Base document deletion returns local materialized document', () => {
     const local = localVariant(ANCESTOR_ARTICLE, (document) => {
       document.title = 'Branch title'

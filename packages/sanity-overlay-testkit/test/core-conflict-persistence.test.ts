@@ -493,15 +493,31 @@ describe('detection requires a current base view (PRD §16.1 — core never fetc
     expect(blind.conflicts.map((conflict) => conflict.type)).toEqual(['SAME_PATH_CHANGED'])
   })
 
-  it('does detect BASE_DOCUMENT_DELETED when a base view is supplied and the document is gone', () => {
+  /**
+   * REVERSED 2026-08-11 — this test used to pin the OPPOSITE: that an empty
+   * base source at commit time detects BASE_DOCUMENT_DELETED. That reading is
+   * the exact inference that manufactured two hard conflicts in a live Mode 2
+   * session: the Studio facade sends `baseDocuments: []` whenever it observed
+   * nothing from the base plane (captured on the wire), and Content-free "[]"
+   * is byte-identical between "I looked and it is gone" and "I could not
+   * look". §16.1 makes DIRECT BASE READS the source of truth for deletion, so
+   * the commit boundary — which only ever relays what a client happened to
+   * carry — may never conclude deletion from an absent document in its view.
+   * The explicit `baseStatus: 'deleted'` signal (a §16.6 drift-scan or
+   * first-touch §16.3 assertion) is the only path to the conflict now, and
+   * the merge suite pins that signal working with and without an ancestor.
+   */
+  it('does NOT manufacture BASE_DOCUMENT_DELETED from an empty commit-time base view', () => {
     const anchored = editTitle(emptyState())
     const result = edit(
       anchored,
       {id: 'article-1', operations: [{type: 'set', path: ['title'], value: 'Local title v2'}]},
       options({base: createBaseSource([])}),
     )
-    expect(result.conflicts.map((conflict) => conflict.type)).toEqual(['BASE_DOCUMENT_DELETED'])
-    expect(result.conflictSummary).toEqual({total: 1, hard: 1, soft: 0})
+    expect(result.conflicts).toEqual([])
+    expect(result.conflictSummary).toEqual({total: 0, hard: 0, soft: 0})
+    /* And the branch edit itself landed untouched. */
+    expect(recordOf(result.state).local.draft?.materialized.title).toBe('Local title v2')
   })
 })
 

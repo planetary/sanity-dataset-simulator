@@ -21,6 +21,7 @@
   "dependencies": {
     "sanity-overlay-client": "workspace:*",
     "sanity-overlay-core": "workspace:*",
+    "sanity-overlay-next": "workspace:*",
     "sanity-overlay-query": "workspace:*",
     "sanity-overlay-store-fs": "workspace:*",
     "sanity-overlay-studio": "workspace:*"
