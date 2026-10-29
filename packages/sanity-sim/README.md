@@ -196,3 +196,5 @@ Verified against **Sanity Studio 6.20**, **@sanity/client 8.13**, **next-sanity 
 ## License
 
 MIT
+
+The dashboard's test-tube mark uses "Test Tube Bold Duotone" from [Solar](https://www.figma.com/community/file/1166831539721848736) by 480 Design, licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

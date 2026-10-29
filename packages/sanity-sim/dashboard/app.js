@@ -168,7 +168,7 @@ async function render() {
   const top = h(
     'header',
     {class: 'topbar'},
-    h('div', {class: 'brand'}, h('span', {class: 'brand-mark', 'aria-hidden': 'true'}, 's'), 'sanity-sim'),
+    h('div', {class: 'brand'}, h('img', {class: 'brand-mark', src: '/icon.svg', alt: ''}), 'sanity-sim'),
     projectPicker,
     datasetSelect,
     current?.synced ? h('span', {class: 'pill'}, `synced from ${current.synced.projectId}/${current.synced.dataset} · ${ago(current.synced.syncedAt)}`) : null,

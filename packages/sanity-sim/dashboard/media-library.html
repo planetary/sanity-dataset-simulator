@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Media Library (sanity-sim)</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <!--
   The local stand-in for media.sanity.io. Studio frames it, through
   mediaLibrary.__internal.frontendHost (set by sanity-sim's Studio wiring), as:
@@ -13,15 +14,15 @@
   pageLoaded, uploadRequest, uploadProgress, uploadResponse (uploader ↔ Studio).
 -->
 <style>
-  :root { --bg: #fff; --fg: #1d2129; --muted: #6e7683; --line: #e3e4e8; --card: #f6f6f8; --accent: #2276fc; --error: #d13a3a; }
-  :root[data-scheme="dark"] { --bg: #101112; --fg: #e3e4e8; --muted: #8a919c; --line: #2a2c30; --card: #1b1c1f; --accent: #5a9bff; --error: #ff6b6b; }
+  :root { --bg: #fff; --fg: #1d2129; --muted: #6e7683; --line: #e3e4e8; --card: #f6f6f8; --accent: #6a3fd4; --accent-contrast: #fff; --error: #d13a3a; }
+  :root[data-scheme="dark"] { --bg: #101112; --fg: #e3e4e8; --muted: #8a919c; --line: #2a2c30; --card: #1b1c1f; --accent: #b49cff; --accent-contrast: #170f2e; --error: #ff6b6b; }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.4 system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg); }
   header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 1; }
   header h1 { font-size: 14px; margin: 0; font-weight: 600; }
   header .note { color: var(--muted); font-size: 12px; flex: 1; }
   input[type="search"] { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); min-width: 180px; }
-  button, label.button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button, label.button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-contrast); cursor: pointer; }
   main { padding: 16px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
   .asset { border: 2px solid transparent; border-radius: 8px; background: var(--card); cursor: pointer; overflow: hidden; text-align: left; padding: 0; color: inherit; font: inherit; }

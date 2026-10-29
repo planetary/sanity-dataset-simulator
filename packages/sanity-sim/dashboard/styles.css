@@ -5,8 +5,9 @@
   --border: #e3e2dd;
   --text: #1c1c1a;
   --muted: #6b6a64;
-  --accent: #0f766e;
-  --accent-soft: #ccebe7;
+  --accent: #6a3fd4;
+  --accent-soft: #ece5fd;
+  --accent-contrast: #ffffff;
   --danger: #b42318;
   --danger-soft: #fde4e1;
   --warn: #9a6700;
@@ -26,8 +27,9 @@
     --border: #2f2f2c;
     --text: #ecebe6;
     --muted: #9b9a93;
-    --accent: #2dd4bf;
-    --accent-soft: #123b37;
+    --accent: #b49cff;
+    --accent-soft: #2a2244;
+    --accent-contrast: #170f2e;
     --danger: #ff8a7a;
     --danger-soft: #3b1714;
     --warn: #f5c451;
@@ -49,7 +51,7 @@ code, pre, .mono { font-family: var(--mono); font-size: 12px; }
 
 .topbar { display: flex; align-items: center; gap: 14px; padding: 0 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: -0.01em; }
-.brand-mark { width: 20px; height: 20px; border-radius: 5px; background: var(--accent); display: grid; place-items: center; color: white; font-size: 12px; }
+.brand-mark { width: 22px; height: 22px; display: block; }
 .topbar .spacer { flex: 1; }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); font-size: 12px; white-space: nowrap; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
@@ -70,7 +72,7 @@ h2 { font-size: 13px; margin: 18px 0 8px; text-transform: uppercase; letter-spac
 
 .btn { border: 1px solid var(--border); background: var(--panel); border-radius: 6px; padding: 5px 10px; cursor: pointer; white-space: nowrap; }
 .btn:hover { background: var(--panel-2); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); }
 .btn.primary:hover { filter: brightness(1.08); }
 .btn.danger { color: var(--danger); }
 .btn.small { padding: 2px 8px; font-size: 12px; }
