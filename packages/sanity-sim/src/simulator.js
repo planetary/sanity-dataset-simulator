@@ -93,6 +93,7 @@ export class Simulator {
   record(entry) {
     this.requests.push(entry)
     if (this.requests.length > 1000) this.requests.shift()
+    for (const listener of this.requestListeners ?? []) listener(entry)
     if (entry.unsupported) {
       const key = `${entry.method} ${entry.route}`
       this.unsupported.set(key, (this.unsupported.get(key) ?? 0) + 1)

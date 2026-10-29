@@ -37,9 +37,9 @@ const VERSIONED = /^\/v(\d{4}-\d{2}-\d{2}|X|x|1)(\/.*)?$/
  *
  * @returns {Promise<{port: number, close: () => Promise<void>, origin: string, httpOrigin: string}>}
  */
-export async function startServer(sim, {port = 3939, host = '127.0.0.1', tls = null, extraOrigins = []}) {
+export async function startServer(sim, {port = 3939, host = '127.0.0.1', tls = null, extraOrigins = [], project = null}) {
   const allowedOrigins = new Set(extraOrigins)
-  const context = {sim, allowedOrigins, tls: Boolean(tls), port}
+  const context = {sim, allowedOrigins, tls: Boolean(tls), port, project, wired: []}
   const handler = (req, res) => handle(context, req, res)
 
   const plain = http.createServer(handler)
@@ -98,6 +98,7 @@ export async function startServer(sim, {port = 3939, host = '127.0.0.1', tls = n
     port: actualPort,
     origin: context.publicBase,
     httpOrigin: `http://localhost:${actualPort}`,
+    context,
     close: async () => {
       for (const socket of sockets) socket.destroy()
       await Promise.all(servers.map((server) => new Promise((resolve) => server.close(() => resolve()))))

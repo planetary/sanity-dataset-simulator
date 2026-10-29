@@ -115,7 +115,7 @@ async function dev(root, project, flags, {runDev}) {
       log('warn', `${error.message}\nfalling back to plain HTTP`)
     }
   }
-  const server = await startServer(sim, {port, tls, extraOrigins: [].concat(flags.origin ?? [])})
+  const server = await startServer(sim, {port, tls, extraOrigins: [].concat(flags.origin ?? []), project})
   sim.startScheduler()
 
   /* Wire the Studio and app clients (marked, reversible, inert without our env). */
@@ -129,6 +129,7 @@ async function dev(root, project, flags, {runDev}) {
     for (const file of wireClients(root, project.frameworks, {studioDir: project.studioDir})) wired.push(`client ${rel(root, file)}`)
   }
 
+  server.context.wired = wired
   const browserBase = server.origin
   const env = {
     SANITY_SIM_URL: server.httpOrigin.replace('localhost', '127.0.0.1'),
@@ -179,7 +180,7 @@ function banner({sim, project, root, server, tls, datasetName, wired, runDev}) {
     '',
     `${bold('sanity-sim')} ${VERSION} ${dim(`· project ${sim.projectId} · dataset ${datasetName}`)}`,
     '',
-    `  Dashboard  ${bold(server.origin + '/')}`,
+    `  Dashboard  ${bold(server.httpOrigin + '/')}`,
     `  API        ${server.origin}${tls ? dim(`  (Node/curl: ${server.httpOrigin})`) : ''}`,
     `  Data       ${rel(root, sim.dir)}/ ${dim(`(${remote}${dataset.local.size} local, ${dataset.tombstones.size} deleted locally)`)}`,
   ]
