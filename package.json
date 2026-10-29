@@ -1,6 +1,7 @@
 {
-  "name": "sanity-branch-overlay",
+  "name": "sanity-sim",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "pnpm -r test",
