@@ -24,7 +24,7 @@ importers:
         specifier: 6.6.0
         version: 6.6.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
     devDependencies:
-      sanity-sim:
+      '@planetary/sanity-sim':
         specifier: link:../../packages/sanity-sim
         version: link:../../packages/sanity-sim
       typescript:

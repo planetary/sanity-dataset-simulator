@@ -1,5 +1,5 @@
 /**
- * Node preload: `node --import sanity-sim/register` (sanity-sim sets this in
+ * Node preload: `node --import @planetary/sanity-sim/register` (sanity-sim sets this in
  * NODE_OPTIONS for the dev processes it starts).
  *
  * Rewrites every request to Sanity's hosts — `<project>.api.sanity.io`,

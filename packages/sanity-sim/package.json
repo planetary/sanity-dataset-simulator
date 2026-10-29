@@ -1,8 +1,21 @@
 {
-  "name": "sanity-sim",
+  "name": "@planetary/sanity-sim",
   "version": "0.1.0",
-  "description": "A local Sanity Content Lake simulator. Run `npx sanity-sim` in a project: Studio and your app work against local data, with a dashboard at the server root.",
+  "description": "A local Sanity Content Lake simulator. Run `npx @planetary/sanity-sim` in a project: your Studio and app work against local data, with a dashboard at the server root.",
   "license": "MIT",
+  "author": "Planetary (https://planetary.co)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/planetary/sanity-dataset-simulator.git",
+    "directory": "packages/sanity-sim"
+  },
+  "homepage": "https://github.com/planetary/sanity-dataset-simulator#readme",
+  "bugs": {
+    "url": "https://github.com/planetary/sanity-dataset-simulator/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "sanity-sim": "./bin/sanity-sim.js"
@@ -23,7 +36,9 @@
     "node": ">=22.12"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
+    "readme": "node scripts/readme.mjs",
+    "prepack": "node scripts/readme.mjs"
   },
   "keywords": [
     "sanity",

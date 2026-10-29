@@ -227,7 +227,7 @@ function banner({sim, project, root, server, tls, datasetName, wired, runDev}) {
     lines.push('', `  ${bold('!')} The HTTPS certificate is not trusted by this machine yet. Browsers will refuse the API until it is.`)
     lines.push(`    Run once: ${bold('npx sanity-sim trust')}   ${dim(`(or open ${server.origin.replace('://localhost', `://${sim.projectId}.localhost`)}/ and accept it)`)}`)
   }
-  if (!runDev) lines.push('', dim(`  Point other tools at it: SANITY_SIM_URL=${server.httpOrigin} node --import sanity-sim/register …`))
+  if (!runDev) lines.push('', dim(`  Point other tools at it: SANITY_SIM_URL=${server.httpOrigin} node --import @planetary/sanity-sim/register …`))
   lines.push('')
   process.stdout.write(lines.join('\n') + '\n')
 }

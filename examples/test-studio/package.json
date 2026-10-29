@@ -14,7 +14,7 @@
     "styled-components": "6.6.0"
   },
   "devDependencies": {
-    "sanity-sim": "link:../../packages/sanity-sim",
+    "@planetary/sanity-sim": "link:../../packages/sanity-sim",
     "typescript": "5.9.3"
   },
   "packageManager": "pnpm@10.33.2"
